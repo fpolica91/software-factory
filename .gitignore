@@ -1,0 +1,12 @@
+.env
+secrets/
+context-library/
+.hatchet-token
+.env.local
+
+# Build artifacts
+**/node_modules/
+
+# session backups (may contain secrets) — never commit
+*.bak
+*.bak-*

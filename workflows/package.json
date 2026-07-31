@@ -1,0 +1,27 @@
+{
+  "name": "@software-factory/workflows",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dispatch": "tsx src/dispatch.ts",
+    "fixture:integration-lifecycle": "npm run build && npm run build --prefix ../integrations && node scripts/integration-lifecycle-fixture.mjs",
+    "fixture:scheduled-job": "npm run build && node scripts/scheduled-job-fixture.mjs",
+    "fixture:scheduled-job-idempotency": "npm run build && node scripts/scheduled-job-idempotency-fixture.mjs",
+    "fixture:state-gates": "npm run build && node scripts/factory-state-gates-fixture.mjs",
+    "run": "tsx src/run.ts",
+    "schedule": "tsx src/schedule.ts",
+    "worker": "tsx src/worker.ts"
+  },
+  "dependencies": {
+    "@hatchet-dev/typescript-sdk": "1.28.0",
+    "@software-factory/harness-client": "file:../harness-client",
+    "@software-factory/integrations": "file:../integrations"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3"
+  }
+}

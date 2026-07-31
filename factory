@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly FACTORY_PROJECT_NAME='software-factory'
+readonly HATCHET_TENANT_ID='707d0855-80ab-4e1f-a156-f1c4546cbf52'
+
+resolve_product_root() {
+  local source_path=${BASH_SOURCE[0]}
+  local source_dir link_target
+
+  while [[ -L "$source_path" ]]; do
+    source_dir=$(cd -P -- "$(dirname -- "$source_path")" && pwd)
+    link_target=$(readlink -- "$source_path")
+    if [[ "$link_target" == /* ]]; then
+      source_path=$link_target
+    else
+      source_path=$source_dir/$link_target
+    fi
+  done
+
+  cd -P -- "$(dirname -- "$source_path")" && pwd
+}
+
+find_project_dir() {
+  local start current parent git_root
+  start=$(pwd -P)
+
+  if command -v git >/dev/null 2>&1; then
+    if git_root=$(git -C "$start" rev-parse --show-toplevel 2>/dev/null); then
+      cd -P -- "$git_root" && pwd
+      return
+    fi
+  fi
+
+  current=$start
+  while :; do
+    if [[ -e "$current/.git" ]]; then
+      printf '%s\n' "$current"
+      return
+    fi
+    [[ "$current" == / ]] && break
+    parent=${current%/*}
+    [[ -n "$parent" ]] || parent=/
+    current=$parent
+  done
+
+  printf '%s\n' "$start"
+}
+
+readonly PRODUCT_ROOT=$(resolve_product_root)
+readonly COMPOSE_FILE=$PRODUCT_ROOT/docker-compose.yml
+readonly ENV_FILE=$PRODUCT_ROOT/.env
+readonly ENV_EXAMPLE=$PRODUCT_ROOT/.env.example
+readonly PROJECT_DIR=$(find_project_dir)
+readonly HOST_UID=$(id -u)
+readonly HOST_GID=$(id -g)
+
+export FACTORY_PROJECT_DIR=$PROJECT_DIR
+export FACTORY_RUN_AS_UID=$HOST_UID
+export FACTORY_RUN_AS_GID=$HOST_GID
+
+COMPOSE=(
+  docker compose
+  --project-directory "$PRODUCT_ROOT"
+  --env-file "$ENV_FILE"
+  --file "$COMPOSE_FILE"
+  --project-name "$FACTORY_PROJECT_NAME"
+)
+
+die() {
+  printf 'factory: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Software Factory CLI
+
+Usage:
+  factory run [--detach] <task>  Run any task against the current Git repository
+  factory attach <job-id>        Attach to a durable job
+  factory status <job-id>        Show durable job and stage status
+  factory logs                   Follow Factory service logs
+  factory stop <job-id>          Stop a durable job
+  factory up                     Start the local Factory stack
+  factory down                   Stop the stack and preserve all durable data
+  factory build                  Build the Factory image
+  factory install                Install `factory` in ~/.local/bin
+  factory help                   Show this help
+
+Examples:
+  factory run "implement authentication"
+  factory run --detach "review this codebase"
+  factory attach JOB_ID
+EOF
+}
+
+install_cli() {
+  local install_dir=${FACTORY_INSTALL_DIR:-$HOME/.local/bin}
+  local target=$install_dir/factory
+  local expected=$PRODUCT_ROOT/factory
+
+  mkdir -p -- "$install_dir"
+  if [[ -L "$target" ]]; then
+    if [[ "$(readlink -- "$target")" == "$expected" ]]; then
+      printf 'factory is already installed at %s\n' "$target"
+      return
+    fi
+    die "$target is already a symlink to a different file"
+  fi
+  [[ ! -e "$target" ]] || die "$target already exists"
+  ln -s -- "$expected" "$target"
+  printf 'Installed factory at %s\n' "$target"
+  case ":$PATH:" in
+    *":$install_dir:"*) ;;
+    *) printf 'Add %s to PATH before using `factory` from another repository.\n' "$install_dir" ;;
+  esac
+}
+
+ensure_env_file() {
+  [[ -f "$ENV_FILE" ]] && return
+  [[ -f "$ENV_EXAMPLE" ]] || die "missing $ENV_EXAMPLE"
+  cp -- "$ENV_EXAMPLE" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+env_file_value() {
+  local key=$1 line value=''
+  [[ -f "$ENV_FILE" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$key="* ]]; then
+      value=${line#*=}
+    fi
+  done < "$ENV_FILE"
+
+  if [[ ${#value} -ge 2 ]]; then
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value=${value:1:${#value}-2}
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+      value=${value:1:${#value}-2}
+    fi
+  fi
+  printf '%s' "$value"
+}
+
+configured_value() {
+  local key=$1
+  if [[ -n ${!key-} ]]; then
+    printf '%s' "${!key}"
+  else
+    env_file_value "$key"
+  fi
+}
+
+write_env_value() {
+  local key=$1 value=$2 line
+  local found=0
+  local temporary=$ENV_FILE.tmp.$$
+
+  : > "$temporary"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$key="* ]]; then
+      printf '%s=%s\n' "$key" "$value" >> "$temporary"
+      found=1
+    else
+      printf '%s\n' "$line" >> "$temporary"
+    fi
+  done < "$ENV_FILE"
+  if (( found == 0 )); then
+    printf '\n%s=%s\n' "$key" "$value" >> "$temporary"
+  fi
+  chmod 600 "$temporary"
+  mv -- "$temporary" "$ENV_FILE"
+}
+
+export_default() {
+  local key=$1 fallback=$2 current
+  current=$(configured_value "$key")
+  if [[ -z "$current" ]]; then
+    printf -v "$key" '%s' "$fallback"
+    export "$key"
+  fi
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die 'Docker is required'
+  docker compose version >/dev/null 2>&1 || die 'Docker Compose is required'
+  docker info >/dev/null 2>&1 || die 'Docker is not running'
+  [[ -f "$COMPOSE_FILE" ]] || die "missing $COMPOSE_FILE"
+}
+
+ZAI_ENABLED=0
+configure_provider() {
+  local provider base_url key
+  provider=$(configured_value FACTORY_MODEL_PROVIDER)
+  base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
+  key=$(configured_value ZAI_API_KEY)
+
+  if [[ -n "$key" || -z "$provider" || "$provider" == factory-provider || "$base_url" == *zai-provider* ]]; then
+    ZAI_ENABLED=1
+    if [[ -z "$key" ]]; then
+      if [[ -t 0 && -t 2 ]]; then
+        read -r -s -p 'Z.AI API key: ' key
+        printf '\n' >&2
+        [[ -n "$key" ]] || die 'a Z.AI API key is required'
+        [[ "$key" != *$'\n'* && "$key" != *$'\r'* ]] || die 'invalid Z.AI API key'
+        write_env_value ZAI_API_KEY "$key"
+      else
+        die "ZAI_API_KEY is not configured; run '$0 up' in a terminal or set it in $ENV_FILE"
+      fi
+    fi
+
+    export ZAI_API_KEY=$key
+    export_default FACTORY_MODEL glm-5.2
+    export_default FACTORY_MODEL_PROVIDER factory-provider
+    export_default FACTORY_PROVIDER_BASE_URL http://zai-provider:10101/v1
+    export_default FACTORY_MODEL_CATALOG_JSON /var/lib/software-factory/provider/codex-models.json
+  fi
+}
+
+compose() {
+  "${COMPOSE[@]}" "$@"
+}
+
+bootstrap_hatchet_token() {
+  local token output attempt first rest second third extra
+  token=$(configured_value HATCHET_CLIENT_TOKEN)
+  [[ -n "$token" ]] && return
+
+  for (( attempt = 1; attempt <= 60; attempt++ )); do
+    if output=$(compose exec -T hatchet \
+      ./hatchet-admin token create \
+      --config ./config \
+      --tenant-id "$HATCHET_TENANT_ID" \
+      --expiresIn 876000h0m0s \
+      --name software-factory-cli 2>/dev/null); then
+      token=${output//$'\r'/}
+      token=${token//$'\n'/}
+      IFS=. read -r first second third extra <<< "$token"
+      if [[ -n "$first" && -n "$second" && -n "$third" && -z "${extra:-}" &&
+            "$token" != *[[:space:]]* ]]; then
+        break
+      fi
+      token=''
+    fi
+    sleep 2
+  done
+
+  [[ -n "$token" ]] || die 'Hatchet did not become ready in time'
+  write_env_value HATCHET_CLIENT_TOKEN "$token"
+  export HATCHET_CLIENT_TOKEN=$token
+}
+
+up_stack() {
+  local profile=()
+  local services=(postgres hatchet qdrant factoryd)
+  ensure_env_file
+  require_docker
+  configure_provider
+  compose build workflow-worker >&2
+  if (( ZAI_ENABLED == 1 )); then
+    profile=(--profile zai)
+    services+=(zai-provider)
+  fi
+
+  compose "${profile[@]}" up -d --wait --wait-timeout 180 \
+    "${services[@]}"
+  bootstrap_hatchet_token
+  guard_project_mount
+  compose "${profile[@]}" up -d --wait --wait-timeout 180 workflow-worker
+  printf 'Factory is ready for %s\n' "$PROJECT_DIR" >&2
+}
+
+require_service() {
+  local service=$1 container_id
+  container_id=$(compose ps --status running --quiet "$service" 2>/dev/null || true)
+  [[ -n "$container_id" ]] || die "$service is not running; run '$0 up' first"
+}
+
+exec_run_cli() {
+  local tty=()
+  [[ -t 0 && -t 1 ]] || tty=(-T)
+  require_service workflow-worker
+
+  exec "${COMPOSE[@]}" exec "${tty[@]}" \
+    --user "$HOST_UID:$HOST_GID" \
+    --workdir /workspace/project \
+    --env HOME=/var/lib/software-factory/codex \
+    --env XDG_CACHE_HOME=/var/lib/software-factory/codex/.cache \
+    --env FACTORY_PROJECT_ID="$PROJECT_DIR" \
+    workflow-worker node /opt/software-factory/workflows/dist/cli.js "$@"
+}
+
+exec_control_cli() {
+  local tty=()
+  [[ -t 0 && -t 1 ]] || tty=(-T)
+  require_service factoryd
+
+  exec "${COMPOSE[@]}" exec "${tty[@]}" \
+    --user "$HOST_UID:$HOST_GID" \
+    --workdir /opt/software-factory/workflows \
+    --env FACTORYD_URL=http://127.0.0.1:8787/v1 \
+    factoryd node /opt/software-factory/workflows/dist/cli.js "$@"
+}
+
+guard_project_mount() {
+  require_service factoryd
+  compose exec -T \
+    --user "$HOST_UID:$HOST_GID" \
+    --workdir /opt/software-factory/workflows \
+    --env FACTORYD_URL=http://127.0.0.1:8787/v1 \
+    factoryd node /opt/software-factory/workflows/dist/cli.js \
+    guard-project "$PROJECT_DIR"
+}
+
+main() {
+  local command=${1:-help}
+  if (( $# > 0 )); then
+    shift
+  fi
+
+  case "$command" in
+    help | --help | -h)
+      usage
+      ;;
+    run)
+      up_stack
+      exec_run_cli run "$@"
+      ;;
+    attach | status | stop)
+      ensure_env_file
+      require_docker
+      exec_control_cli "$command" "$@"
+      ;;
+    logs)
+      (( $# == 0 )) || die 'usage: factory logs'
+      ensure_env_file
+      require_docker
+      compose logs --follow factoryd workflow-worker
+      ;;
+    up)
+      (( $# == 0 )) || die 'usage: factory up'
+      up_stack
+      ;;
+    down)
+      (( $# == 0 )) || die 'usage: factory down'
+      ensure_env_file
+      require_docker
+      compose --profile '*' down --remove-orphans
+      ;;
+    build)
+      ensure_env_file
+      require_docker
+      compose build workflow-worker
+      ;;
+    install)
+      (( $# == 0 )) || die 'usage: factory install'
+      install_cli
+      ;;
+    *)
+      printf 'factory: unknown command: %s\n\n' "$command" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

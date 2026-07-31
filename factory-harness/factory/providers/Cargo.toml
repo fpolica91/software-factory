@@ -1,0 +1,17 @@
+[package]
+name = "factory-providers"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+codex-models-manager = { path = "../../codex-rs/models-manager" }
+codex-protocol = { path = "../../codex-rs/protocol" }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+
+[[bin]]
+name = "factory-provider-bridge"
+path = "src/bin/factory-provider-bridge.rs"
