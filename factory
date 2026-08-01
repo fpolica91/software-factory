@@ -154,7 +154,7 @@ env_file_value() {
 
 configured_value() {
   local key=$1
-  if [[ -v $key ]]; then
+  if declare -p "$key" >/dev/null 2>&1; then
     printf '%s' "${!key}"
   else
     env_file_value "$key"
@@ -463,11 +463,12 @@ resolve_provider_environment() {
 
   if [[ "$adapter" == responses ]]; then
     file_adapter=$(env_file_value FACTORY_PROVIDER_ADAPTER)
-    if [[ -v FACTORY_PROVIDER_ADAPTER && "$file_adapter" != responses ]]; then
-      if [[ ! -v FACTORY_PROVIDER_NAME ]]; then
+    if declare -p FACTORY_PROVIDER_ADAPTER >/dev/null 2>&1 &&
+      [[ "$file_adapter" != responses ]]; then
+      if ! declare -p FACTORY_PROVIDER_NAME >/dev/null 2>&1; then
         export FACTORY_PROVIDER_NAME='Software Factory deployment provider'
       fi
-      if [[ ! -v FACTORY_MODEL_CATALOG_JSON ]]; then
+      if ! declare -p FACTORY_MODEL_CATALOG_JSON >/dev/null 2>&1; then
         export FACTORY_MODEL_CATALOG_JSON=''
       fi
     fi
