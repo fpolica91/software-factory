@@ -1018,11 +1018,18 @@ require_service() {
 }
 
 exec_run_cli() {
-  local tty=()
-  [[ -t 0 && -t 1 ]] || tty=(-T)
   require_service workflow-worker
 
-  exec "${COMPOSE[@]}" exec "${tty[@]}" \
+  if [[ -t 0 && -t 1 ]]; then
+    exec "${COMPOSE[@]}" exec \
+      --user "$HOST_UID:$HOST_GID" \
+      --workdir /workspace/project \
+      --env HOME=/var/lib/software-factory/codex \
+      --env XDG_CACHE_HOME=/var/lib/software-factory/codex/.cache \
+      --env FACTORY_PROJECT_ID="$PROJECT_DIR" \
+      workflow-worker node /opt/software-factory/workflows/dist/cli.js "$@"
+  fi
+  exec "${COMPOSE[@]}" exec -T \
     --user "$HOST_UID:$HOST_GID" \
     --workdir /workspace/project \
     --env HOME=/var/lib/software-factory/codex \
@@ -1032,11 +1039,16 @@ exec_run_cli() {
 }
 
 exec_control_cli() {
-  local tty=()
-  [[ -t 0 && -t 1 ]] || tty=(-T)
   require_service factoryd
 
-  exec "${COMPOSE[@]}" exec "${tty[@]}" \
+  if [[ -t 0 && -t 1 ]]; then
+    exec "${COMPOSE[@]}" exec \
+      --user "$HOST_UID:$HOST_GID" \
+      --workdir /opt/software-factory/workflows \
+      --env FACTORYD_URL=http://127.0.0.1:8787/v1 \
+      factoryd node /opt/software-factory/workflows/dist/cli.js "$@"
+  fi
+  exec "${COMPOSE[@]}" exec -T \
     --user "$HOST_UID:$HOST_GID" \
     --workdir /opt/software-factory/workflows \
     --env FACTORYD_URL=http://127.0.0.1:8787/v1 \
