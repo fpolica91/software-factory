@@ -13,6 +13,7 @@ import {
   executeCodexOperation,
   hasCompletedStageCheckpoint,
 } from './lifecycle.js';
+import { deploymentCodexDefaults } from './provider-config.js';
 import {
   OPERATION_KINDS,
   type CodexOperationInput,
@@ -90,43 +91,6 @@ function object(value: JsonValue, label: string): Record<string, JsonValue> {
 function operationKind(value: string): OperationKind {
   if ((OPERATION_KINDS as readonly string[]).includes(value)) return value as OperationKind;
   throw new TerminalOperationError(`unsupported factory operation kind ${value}`);
-}
-
-function deploymentCodexDefaults(): Record<string, JsonValue> {
-  const defaults: Record<string, JsonValue> = {};
-  const environmentFields = {
-    runtimePath: process.env.FACTORY_RUNTIME_PATH,
-    codexHome: process.env.FACTORY_CODEX_HOME,
-    model: process.env.FACTORY_MODEL,
-    modelProvider: process.env.FACTORY_MODEL_PROVIDER,
-  };
-  for (const [field, value] of Object.entries(environmentFields)) {
-    if (value) defaults[field] = value;
-  }
-
-  const config: Record<string, JsonValue> = {};
-  const catalog = process.env.FACTORY_MODEL_CATALOG_JSON;
-  if (catalog) config.model_catalog_json = catalog;
-  const providerId = process.env.FACTORY_MODEL_PROVIDER;
-  const providerBaseUrl = process.env.FACTORY_PROVIDER_BASE_URL;
-  if (providerId && providerBaseUrl) {
-    config[`model_providers.${providerId}`] = {
-      name: process.env.FACTORY_PROVIDER_NAME ?? 'Software Factory deployment provider',
-      base_url: providerBaseUrl,
-      wire_api: 'responses',
-      requires_openai_auth: false,
-      supports_websockets: false,
-      ...(providerId === 'factory-provider'
-        ? {
-            env_http_headers: {
-              'X-OpenCodex-API-Key': 'FACTORY_PROVIDER_AUTH_TOKEN',
-            },
-          }
-        : {}),
-    };
-  }
-  if (Object.keys(config).length > 0) defaults.config = config;
-  return defaults;
 }
 
 function workspaceRequest(

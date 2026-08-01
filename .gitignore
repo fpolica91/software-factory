@@ -1,5 +1,5 @@
 .env
-secrets/
+/secrets/
 context-library/
 .hatchet-token
 .env.local

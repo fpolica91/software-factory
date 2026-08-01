@@ -1,8 +1,18 @@
 # Z.AI GLM 5.2
 
-Software Factory routes Codex Responses traffic through the Factory provider
-bridge and selects the OpenAI-compatible Z.AI Chat API. Use the endpoint that
-matches the API-key plan:
+Z.AI GLM 5.2 is an optional translation adapter, not Software Factory's default
+provider. Select it explicitly from the product checkout, then run a task from
+the target Git repository:
+
+```sh
+./factory configure --preset zai
+factory run "Review this codebase"
+```
+
+The preset prompts for `ZAI_API_KEY`, configures the bridge, and fixes the model
+to `glm-5.2`. The bridge translates native Codex Responses traffic to Z.AI's
+OpenAI-compatible Chat API. Use the upstream endpoint matching the API-key
+plan:
 
 | Profile | Base URL |
 | --- | --- |
@@ -11,7 +21,7 @@ matches the API-key plan:
 
 Both profiles use the exact model identifier `glm-5.2`. The documented key
 variable is `ZAI_API_KEY`; `FACTORY_ZAI_API_KEY_ENV` may point the bridge at a
-different variable when required by a host. See Z.AI's
+different variable for an advanced manual deployment. See Z.AI's
 [HTTP endpoint guide](https://docs.z.ai/guides/develop/http/introduction) and
 [OpenAI Python SDK guide](https://docs.z.ai/guides/develop/openai/python).
 
@@ -32,16 +42,16 @@ response = client.chat.completions.create(
 )
 ```
 
-This Python example documents provider compatibility; it is not another
-Factory runtime. The shipped integration keeps the complete Codex harness and
-uses the pinned provider bridge under
+This Python example documents the upstream API; it is not another Factory
+runtime. The shipped integration keeps the complete Codex harness and uses the
+pinned provider bridge under
 `factory-harness/factory/providers/bridge/`.
 
 After starting that bridge, run the complete harness acceptance:
 
 ```sh
 cd harness-client
-FACTORY_PROVIDER_BASE_URL=http://127.0.0.1:18101/v1 npm run smoke:glm
+FACTORY_PROVIDER_BASE_URL=http://127.0.0.1:10101/v1 npm run smoke:glm
 ```
 
 That flow verifies a real GLM tool call, Codex compaction, runtime restart,

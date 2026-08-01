@@ -11,7 +11,7 @@
 *.bak-*
 worker
 docs
-secrets
+secrets/**
 context-library
 factory-harness/sdk
 factory-harness/scripts

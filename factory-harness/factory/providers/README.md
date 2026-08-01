@@ -1,11 +1,12 @@
 # Factory Provider Bridge
 
-This crate owns the provider boundary between the Codex Responses API and model
-providers that expose another wire protocol. Codex core remains unchanged and
-continues to use `wire_api = "responses"`.
+This crate contains optional translation adapters between the Codex Responses
+API and providers that expose another wire protocol. Direct
+Responses-compatible providers do not use this crate. Codex core remains
+unchanged and continues to use `wire_api = "responses"`.
 
-The first profile is Z.AI GLM 5.2 through the Coding Plan endpoint. Protocol
-translation is delegated to the maintained MIT-licensed
+The first optional profile is Z.AI GLM 5.2 through the Coding Plan endpoint.
+Protocol translation is delegated to the maintained MIT-licensed
 [`@bitkyc08/opencodex`](https://github.com/lidge-jun/opencodex) package, pinned
 to version 2.8.0. Factory starts its public server API in an isolated state
 directory. It does not run the `ocx` CLI, modify a user's Codex configuration,
@@ -14,7 +15,7 @@ or enable unrelated provider adapters.
 Install the pinned bridge dependency once:
 
 ```sh
-cd factory/providers/bridge
+cd factory-harness/factory/providers/bridge
 npm ci
 ```
 
@@ -33,14 +34,15 @@ layout. A container-facing deployment can bind and advertise different URLs:
 FACTORY_PROVIDER_BIND_HOST=0.0.0.0 \
 FACTORY_PROVIDER_ADVERTISED_URL=http://zai-provider:10101/v1 \
 FACTORY_PROVIDER_STATE_DIR=/var/lib/software-factory/provider \
-FACTORY_PROVIDER_AUTH_TOKEN=replace-this-local-default \
+FACTORY_PROVIDER_BRIDGE_TOKEN=replace-this-local-token \
 factory-provider-bridge
 ```
 
 The advertised URL is the full Responses API base used in Codex thread config.
-Non-loopback binds require `FACTORY_PROVIDER_AUTH_TOKEN`; Codex reads it through
-the generated `X-OpenCodex-API-Key` environment-header mapping. This admission
-credential is separate from `ZAI_API_KEY` and is not forwarded upstream.
+Non-loopback binds require `FACTORY_PROVIDER_BRIDGE_TOKEN`; Codex reads it
+through the generated `X-OpenCodex-API-Key` environment-header mapping. This
+adapter-local token is separate from `ZAI_API_KEY` and is not forwarded
+upstream. `factory configure --preset zai` generates it automatically.
 The state directory contains `codex-models.json`; mount it into workers at the
 same absolute path advertised by the deployment.
 
@@ -51,9 +53,10 @@ configuration needed by `thread/start`. This preserves the upstream Codex base
 instructions and enables its shell, parallel tool calling, and freeform
 `apply_patch` tools without modifying Codex core or user configuration.
 
-Both official Z.AI OpenAI-compatible profiles are explicit:
+Both official Z.AI OpenAI-compatible endpoint choices are explicit:
 
-- Coding Developer Plan (default): `https://api.z.ai/api/coding/paas/v4`
+- Coding Developer Plan (default within the `zai` preset):
+  `https://api.z.ai/api/coding/paas/v4`
 - Standard API: `https://api.z.ai/api/paas/v4/`
 
 Both use model `glm-5.2`. Select the standard API without changing code:

@@ -25,9 +25,9 @@ if (!/^[A-Z_][A-Z0-9_]*$/.test(apiKeyEnv)) {
 if (!process.env[apiKeyEnv]) {
   throw new Error(`${apiKeyEnv} is required to start the Z.AI provider bridge`);
 }
-const admissionToken = process.env.FACTORY_PROVIDER_AUTH_TOKEN?.trim();
+const admissionToken = process.env.FACTORY_PROVIDER_BRIDGE_TOKEN?.trim();
 if (hostname !== '127.0.0.1' && hostname !== 'localhost' && !admissionToken) {
-  throw new Error('FACTORY_PROVIDER_AUTH_TOKEN is required for a non-loopback provider bind');
+  throw new Error('FACTORY_PROVIDER_BRIDGE_TOKEN is required for a non-loopback provider bind');
 }
 if (admissionToken) {
   process.env.OPENCODEX_API_AUTH_TOKEN = admissionToken;

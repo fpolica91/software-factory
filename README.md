@@ -21,17 +21,19 @@ required.
 ```sh
 git clone https://github.com/fpolica91/software-factory.git
 cd software-factory
+./factory configure
 ./factory install
 cd /path/to/your/project
 factory run "Review this codebase and explain its architecture"
 ```
 
-Installation creates a symlink in `~/.local/bin`; add that directory to `PATH`
-if the command reports it is missing. After that, `factory run` is the only
-command needed: it creates local configuration, builds the image when needed,
-starts the durable services, mounts the current Git repository, submits the
-task, and attaches to it. On first use it asks for the configured provider key;
-automation can pass `ZAI_API_KEY` in the environment instead.
+`./factory configure` asks for a provider ID, Responses API base URL, model,
+authentication mode, and API key. Installation then creates a symlink in
+`~/.local/bin`; add that directory to `PATH` if the command reports it is
+missing. From any Git repository, `factory run` builds the image when needed,
+starts the durable services, mounts that repository, submits the task, and
+attaches to it. Running `factory run` without saved provider configuration
+opens the same neutral configuration prompts when a terminal is available.
 
 The CLI is interactive when attached but does not require an interactive shell:
 
@@ -51,24 +53,44 @@ different repository while that job is active.
 
 ## Model Providers
 
-The local CLI configures the pinned Z.AI profile on first use. For an unattended
-first run, export `ZAI_API_KEY` or put it in the ignored `.env` file. The full
-provider settings are:
+The direct path supports providers that expose an OpenAI-compatible Responses
+API. It uses Codex's native provider configuration and agent loop; Software
+Factory does not invoke the Claude Code or Cursor SDK/harness. Review saved
+settings without exposing key values:
 
-```dotenv
-ZAI_API_KEY=...
-FACTORY_PROVIDER_AUTH_TOKEN=replace-this-local-default
-FACTORY_MODEL=glm-5.2
-FACTORY_MODEL_PROVIDER=factory-provider
-FACTORY_PROVIDER_BASE_URL=http://zai-provider:10101/v1
-FACTORY_MODEL_CATALOG_JSON=/var/lib/software-factory/provider/codex-models.json
+```sh
+factory configure --show
 ```
 
-The bridge fixes the model to exact `glm-5.2` and defaults to the Coding Plan
-endpoint. Set `FACTORY_ZAI_BASE_URL=https://api.z.ai/api/paas/v4/` to select the
-standard API. `ZAI_API_KEY` is read by the provider service.
-`FACTORY_PROVIDER_AUTH_TOKEN` is the adapter's required internal API key used
-by workflow runtimes to call the bridge.
+For an unattended first run, export the neutral provider settings before
+calling `factory run --detach`, or put them in the product checkout's ignored
+`.env` file:
+
+```dotenv
+FACTORY_PROVIDER_ADAPTER=responses
+FACTORY_MODEL_PROVIDER=configured-provider
+FACTORY_PROVIDER_BASE_URL=https://provider.example/v1
+FACTORY_MODEL=provider-model-id
+FACTORY_PROVIDER_AUTH=key
+FACTORY_PROVIDER_API_KEY=...
+```
+
+Set `FACTORY_PROVIDER_AUTH=none` and omit the key only for an endpoint that does
+not require authentication. Providers using Chat, Anthropic, or another wire
+protocol require an explicitly selected translation adapter; they are not
+silently treated as Responses endpoints.
+
+Z.AI GLM 5.2 is one optional translated profile. Select it explicitly:
+
+```sh
+factory configure --preset zai
+factory run "Review this codebase"
+```
+
+The preset asks for `ZAI_API_KEY`, generates its internal bridge token, and
+selects the Coding Developer Plan URL. See
+[`docs/providers/zai-glm-5.2.md`](docs/providers/zai-glm-5.2.md) for the
+standard API alternative and adapter details.
 
 ## Durable Jobs and Workspaces
 

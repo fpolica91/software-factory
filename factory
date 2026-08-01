@@ -78,6 +78,9 @@ Software Factory CLI
 
 Usage:
   factory run [--detach] <task>  Run any task against the current Git repository
+  factory configure              Configure a Responses-compatible model provider
+  factory configure --show       Show active provider settings (never secret values)
+  factory configure --preset zai Configure the optional Z.AI adapter
   factory attach <job-id>        Attach to a durable job
   factory status <job-id>        Show durable job and stage status
   factory logs                   Follow Factory service logs
@@ -146,7 +149,7 @@ env_file_value() {
 
 configured_value() {
   local key=$1
-  if [[ -n ${!key-} ]]; then
+  if [[ -v $key ]]; then
     printf '%s' "${!key}"
   else
     env_file_value "$key"
@@ -174,15 +177,6 @@ write_env_value() {
   mv -- "$temporary" "$ENV_FILE"
 }
 
-export_default() {
-  local key=$1 fallback=$2 current
-  current=$(configured_value "$key")
-  if [[ -z "$current" ]]; then
-    printf -v "$key" '%s' "$fallback"
-    export "$key"
-  fi
-}
-
 require_docker() {
   command -v docker >/dev/null 2>&1 || die 'Docker is required'
   docker compose version >/dev/null 2>&1 || die 'Docker Compose is required'
@@ -190,37 +184,308 @@ require_docker() {
   [[ -f "$COMPOSE_FILE" ]] || die "missing $COMPOSE_FILE"
 }
 
-ZAI_ENABLED=0
-configure_provider() {
-  local provider base_url key
-  provider=$(configured_value FACTORY_MODEL_PROVIDER)
-  base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
-  key=$(configured_value ZAI_API_KEY)
+value_is_blank() {
+  local value=$1
+  [[ ! "$value" =~ [^[:space:]] ]]
+}
 
-  if [[ -n "$key" || -z "$provider" || "$provider" == factory-provider || "$base_url" == *zai-provider* ]]; then
-    ZAI_ENABLED=1
-    if [[ -z "$key" ]]; then
-      if [[ -t 0 && -t 2 ]]; then
-        read -r -s -p 'Z.AI API key: ' key
-        printf '\n' >&2
-        [[ -n "$key" ]] || die 'a Z.AI API key is required'
-        [[ "$key" != *$'\n'* && "$key" != *$'\r'* ]] || die 'invalid Z.AI API key'
-        write_env_value ZAI_API_KEY "$key"
-      else
-        die "ZAI_API_KEY is not configured; run '$0 up' in a terminal or set it in $ENV_FILE"
+PROVIDER_CONFIG_ERRORS=()
+validate_provider_configuration() {
+  local adapter provider base_url model authentication api_key bridge_token catalog
+  PROVIDER_CONFIG_ERRORS=()
+  adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
+
+  if [[ -z "$adapter" ]]; then
+    PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER is required")
+  elif [[ "$adapter" != responses && "$adapter" != zai ]]; then
+    PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER must be one of: responses, zai")
+    return 1
+  fi
+
+  if [[ -z "$adapter" || "$adapter" == responses ]]; then
+    provider=$(configured_value FACTORY_MODEL_PROVIDER)
+    base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
+    model=$(configured_value FACTORY_MODEL)
+    authentication=$(configured_value FACTORY_PROVIDER_AUTH)
+    api_key=$(configured_value FACTORY_PROVIDER_API_KEY)
+
+    if value_is_blank "$provider"; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_PROVIDER is required")
+    elif [[ ! "$provider" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_PROVIDER must start with an alphanumeric character and contain only alphanumeric characters, hyphens, or underscores")
+    fi
+    if value_is_blank "$base_url"; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL is required")
+    elif [[ "$base_url" != http://* && "$base_url" != https://* ]]; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL must start with http:// or https://")
+    elif [[ "$base_url" == *[[:space:]]* ]]; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL must not contain whitespace")
+    fi
+    if value_is_blank "$model"; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL is required")
+    elif [[ "$model" == *$'\n'* || "$model" == *$'\r'* ]]; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL must be a single line")
+    fi
+    if [[ -z "$authentication" ]]; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH is required")
+    elif [[ "$authentication" != key && "$authentication" != none ]]; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH must be one of: key, none when FACTORY_PROVIDER_ADAPTER=responses")
+    elif [[ "$authentication" == key ]] && value_is_blank "$api_key"; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_API_KEY is required when FACTORY_PROVIDER_AUTH=key")
+    fi
+  elif [[ "$adapter" == zai ]]; then
+    provider=$(configured_value FACTORY_MODEL_PROVIDER)
+    base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
+    model=$(configured_value FACTORY_MODEL)
+    authentication=$(configured_value FACTORY_PROVIDER_AUTH)
+    api_key=$(configured_value ZAI_API_KEY)
+    bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
+    catalog=$(configured_value FACTORY_MODEL_CATALOG_JSON)
+
+    [[ "$provider" == factory-provider ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_PROVIDER must be factory-provider when FACTORY_PROVIDER_ADAPTER=zai")
+    [[ "$base_url" == http://zai-provider:10101/v1 ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL must be http://zai-provider:10101/v1 when FACTORY_PROVIDER_ADAPTER=zai")
+    [[ "$model" == glm-5.2 ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL must be glm-5.2 when FACTORY_PROVIDER_ADAPTER=zai")
+    [[ "$authentication" == bridge ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH must be bridge when FACTORY_PROVIDER_ADAPTER=zai")
+    if value_is_blank "$api_key"; then
+      PROVIDER_CONFIG_ERRORS+=("ZAI_API_KEY is required when FACTORY_PROVIDER_ADAPTER=zai")
+    fi
+    if value_is_blank "$bridge_token"; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BRIDGE_TOKEN is required when FACTORY_PROVIDER_ADAPTER=zai")
+    fi
+    [[ "$catalog" == /var/lib/software-factory/provider/codex-models.json ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_CATALOG_JSON must be /var/lib/software-factory/provider/codex-models.json when FACTORY_PROVIDER_ADAPTER=zai")
+  fi
+
+  (( ${#PROVIDER_CONFIG_ERRORS[@]} == 0 ))
+}
+
+report_provider_configuration_errors() {
+  local error
+  printf 'factory: provider configuration is incomplete or invalid:\n' >&2
+  for error in "${PROVIDER_CONFIG_ERRORS[@]}"; do
+    printf '  - %s\n' "$error" >&2
+  done
+  printf "Run '%s configure' in a terminal or set the listed variables.\n" "$0" >&2
+}
+
+PROMPT_VALUE=''
+prompt_value() {
+  local label=$1 default=${2-} answer
+  if [[ -n "$default" ]]; then
+    read -r -p "$label [$default]: " answer || die 'provider configuration cancelled'
+    PROMPT_VALUE=${answer:-$default}
+  else
+    read -r -p "$label: " answer || die 'provider configuration cancelled'
+    PROMPT_VALUE=$answer
+  fi
+}
+
+prompt_secret() {
+  local label=$1 current=${2-} answer
+  if [[ -n "$current" ]]; then
+    read -r -s -p "$label [configured; leave blank to keep]: " answer || die 'provider configuration cancelled'
+    PROMPT_VALUE=${answer:-$current}
+  else
+    read -r -s -p "$label: " answer || die 'provider configuration cancelled'
+    PROMPT_VALUE=$answer
+  fi
+  printf '\n' >&2
+}
+
+persist_responses_configuration() {
+  local provider base_url model authentication api_key
+  local current_adapter
+  current_adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
+  if [[ "$current_adapter" == responses ]]; then
+    provider=$(configured_value FACTORY_MODEL_PROVIDER)
+    base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
+    model=$(configured_value FACTORY_MODEL)
+    authentication=$(configured_value FACTORY_PROVIDER_AUTH)
+    api_key=$(configured_value FACTORY_PROVIDER_API_KEY)
+  else
+    provider=''
+    base_url=''
+    model=''
+    authentication=''
+    api_key=''
+  fi
+
+  if [[ -t 0 && -t 2 ]]; then
+    prompt_value 'Provider ID' "${provider:-configured-provider}"
+    provider=$PROMPT_VALUE
+    prompt_value 'Responses API base URL' "$base_url"
+    base_url=$PROMPT_VALUE
+    prompt_value 'Model' "$model"
+    model=$PROMPT_VALUE
+    prompt_value 'Authentication (key|none)' "${authentication:-key}"
+    authentication=$PROMPT_VALUE
+    if [[ "$authentication" == key ]]; then
+      prompt_secret 'Provider API key' "$api_key"
+      api_key=$PROMPT_VALUE
+    else
+      api_key=''
+    fi
+  fi
+
+  write_env_value FACTORY_PROVIDER_ADAPTER responses
+  write_env_value FACTORY_MODEL_PROVIDER "$provider"
+  write_env_value FACTORY_PROVIDER_BASE_URL "$base_url"
+  write_env_value FACTORY_MODEL "$model"
+  write_env_value FACTORY_PROVIDER_AUTH "$authentication"
+  write_env_value FACTORY_PROVIDER_API_KEY "$api_key"
+  write_env_value FACTORY_PROVIDER_NAME 'Software Factory deployment provider'
+  write_env_value FACTORY_MODEL_CATALOG_JSON ''
+  write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN ''
+  write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
+  write_env_value ZAI_API_KEY ''
+}
+
+generate_bridge_token() {
+  LC_ALL=C od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+persist_zai_preset() {
+  local api_key bridge_token legacy_bridge_token
+  api_key=$(configured_value ZAI_API_KEY)
+  bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
+  legacy_bridge_token=$(configured_value FACTORY_PROVIDER_AUTH_TOKEN)
+
+  if value_is_blank "$api_key"; then
+    if [[ -t 0 && -t 2 ]]; then
+      prompt_secret 'Z.AI API key'
+      api_key=$PROMPT_VALUE
+    else
+      PROVIDER_CONFIG_ERRORS=('ZAI_API_KEY is required for preset zai')
+      report_provider_configuration_errors
+      return 1
+    fi
+  fi
+  if value_is_blank "$bridge_token"; then
+    if value_is_blank "$legacy_bridge_token"; then
+      bridge_token=$(generate_bridge_token)
+    else
+      bridge_token=$legacy_bridge_token
+    fi
+  fi
+
+  write_env_value FACTORY_PROVIDER_ADAPTER zai
+  write_env_value FACTORY_MODEL_PROVIDER factory-provider
+  write_env_value FACTORY_PROVIDER_BASE_URL http://zai-provider:10101/v1
+  write_env_value FACTORY_PROVIDER_NAME 'Z.AI GLM provider'
+  write_env_value FACTORY_MODEL glm-5.2
+  write_env_value FACTORY_PROVIDER_AUTH bridge
+  write_env_value FACTORY_PROVIDER_API_KEY ''
+  write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN "$bridge_token"
+  write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
+  write_env_value FACTORY_MODEL_CATALOG_JSON /var/lib/software-factory/provider/codex-models.json
+  write_env_value ZAI_API_KEY "$api_key"
+}
+
+resolve_provider_environment() {
+  local adapter file_adapter
+  adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
+
+  if [[ "$adapter" == responses ]]; then
+    file_adapter=$(env_file_value FACTORY_PROVIDER_ADAPTER)
+    if [[ -v FACTORY_PROVIDER_ADAPTER && "$file_adapter" != responses ]]; then
+      if [[ ! -v FACTORY_PROVIDER_NAME ]]; then
+        export FACTORY_PROVIDER_NAME='Software Factory deployment provider'
+      fi
+      if [[ ! -v FACTORY_MODEL_CATALOG_JSON ]]; then
+        export FACTORY_MODEL_CATALOG_JSON=''
       fi
     fi
-
-    export ZAI_API_KEY=$key
-    export_default FACTORY_MODEL glm-5.2
-    export_default FACTORY_MODEL_PROVIDER factory-provider
-    export_default FACTORY_PROVIDER_BASE_URL http://zai-provider:10101/v1
-    export_default FACTORY_MODEL_CATALOG_JSON /var/lib/software-factory/provider/codex-models.json
+    export FACTORY_PROVIDER_BRIDGE_TOKEN=''
+    export FACTORY_PROVIDER_AUTH_TOKEN=''
+    export ZAI_API_KEY=''
+  elif [[ "$adapter" == zai ]]; then
+    export FACTORY_PROVIDER_API_KEY=''
+    export FACTORY_PROVIDER_AUTH_TOKEN=''
   fi
+}
+
+show_provider_configuration() {
+  local adapter authentication provider provider_name provider_url model catalog provider_key bridge_key
+  resolve_provider_environment
+  adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
+  authentication=$(configured_value FACTORY_PROVIDER_AUTH)
+  provider=$(configured_value FACTORY_MODEL_PROVIDER)
+  provider_name=$(configured_value FACTORY_PROVIDER_NAME)
+  provider_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
+  model=$(configured_value FACTORY_MODEL)
+  catalog=$(configured_value FACTORY_MODEL_CATALOG_JSON)
+  provider_key=$(configured_value FACTORY_PROVIDER_API_KEY)
+  bridge_key=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
+
+  printf 'Active provider configuration:\n'
+  printf '  adapter: %s\n' "${adapter:-<unset>}"
+  printf '  provider ID: %s\n' "${provider:-<unset>}"
+  printf '  provider name: %s\n' "${provider_name:-<default>}"
+  printf '  base URL: %s\n' "${provider_url:-<unset>}"
+  printf '  model: %s\n' "${model:-<unset>}"
+  printf '  model catalog: %s\n' "${catalog:-<none>}"
+  printf '  authentication: %s\n' "${authentication:-<unset>}"
+  if [[ "$adapter" == zai ]]; then
+    printf '  provider API key: %s\n' "$([[ -n "$(configured_value ZAI_API_KEY)" ]] && printf set || printf unset)"
+    printf '  bridge token: %s\n' "$([[ -n "$bridge_key" ]] && printf set || printf unset)"
+  else
+    printf '  provider API key: %s\n' "$([[ -n "$provider_key" ]] && printf set || printf unset)"
+  fi
+}
+
+configure_command() {
+  ensure_env_file
+  case ${1-} in
+    '')
+      (( $# == 0 )) || die 'usage: factory configure [--show | --preset zai]'
+      persist_responses_configuration
+      ;;
+    --show)
+      (( $# == 1 )) || die 'usage: factory configure --show'
+      show_provider_configuration
+      return
+      ;;
+    --preset)
+      [[ $# == 2 && ${2-} == zai ]] || die 'usage: factory configure --preset zai'
+      persist_zai_preset
+      ;;
+    *)
+      die 'usage: factory configure [--show | --preset zai]'
+      ;;
+  esac
+
+  if ! validate_provider_configuration; then
+    report_provider_configuration_errors
+    return 1
+  fi
+  printf 'Saved provider configuration to %s\n' "$ENV_FILE"
+  show_provider_configuration
+}
+
+ensure_provider_configuration() {
+  if validate_provider_configuration; then
+    return
+  fi
+  if [[ -t 0 && -t 2 ]]; then
+    persist_responses_configuration
+    if validate_provider_configuration; then
+      printf 'Saved provider configuration to %s\n' "$ENV_FILE" >&2
+      return
+    fi
+  fi
+  report_provider_configuration_errors
+  return 1
 }
 
 compose() {
   "${COMPOSE[@]}" "$@"
+}
+
+reconcile_provider_services() {
+  local provider_adapter=$1
+
+  if [[ "$provider_adapter" == responses ]]; then
+    compose --profile zai rm --stop --force zai-provider >/dev/null
+  fi
 }
 
 bootstrap_hatchet_token() {
@@ -255,11 +520,15 @@ bootstrap_hatchet_token() {
 up_stack() {
   local profile=()
   local services=(postgres hatchet qdrant factoryd)
+  local provider_adapter
   ensure_env_file
+  ensure_provider_configuration
+  provider_adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
+  resolve_provider_environment
   require_docker
-  configure_provider
+  reconcile_provider_services "$provider_adapter"
   compose build workflow-worker >&2
-  if (( ZAI_ENABLED == 1 )); then
+  if [[ "$provider_adapter" == zai ]]; then
     profile=(--profile zai)
     services+=(zai-provider)
   fi
@@ -327,6 +596,9 @@ main() {
     run)
       up_stack
       exec_run_cli run "$@"
+      ;;
+    configure)
+      configure_command "$@"
       ;;
     attach | status | stop)
       ensure_env_file

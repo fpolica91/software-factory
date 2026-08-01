@@ -7,6 +7,7 @@ FROM rust:${RUST_VERSION}-bookworm AS rust-builder
 WORKDIR /build
 COPY factory-harness/codex-rs/ factory-harness/codex-rs/
 COPY factory-harness/factory/ factory-harness/factory/
+RUN test -f factory-harness/codex-rs/secrets/Cargo.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/factory-harness/factory/target,sharing=locked \

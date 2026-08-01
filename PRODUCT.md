@@ -60,8 +60,9 @@ the durable `factoryd` lifecycle, never by Codex core or Factory runtime.
 - Incrementally remove only Cursor, Boss/Hydra assumptions, and Linear/GitLab
   coupling. Do not remove the Factory capabilities behind those integrations.
 - Retain RAG and long-term memory, with Qdrant as the current vector index.
-- Provide a generic model-provider boundary and prove GLM 5.2 through the
-  complete harness with a real tool-using turn.
+- Provide a generic direct boundary for Responses-compatible model providers.
+  Keep protocol translation in explicit optional adapters and prove GLM 5.2
+  through one such adapter with a real tool-using turn.
 - Disable unintended Codex external analytics, feedback, OTel, and log
   exporters while retaining functional model/tool traffic and any explicitly
   configured Factory observability profile.

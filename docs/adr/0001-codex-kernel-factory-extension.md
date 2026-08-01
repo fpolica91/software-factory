@@ -161,22 +161,26 @@ Codex owns context compaction inside its thread/history machinery.
 ## Providers and observability
 
 Define a generic model-provider boundary rather than a vendor-specific harness.
-GLM 5.2 must be functionally proven through the complete Codex kernel,
-including a real turn that invokes a tool and consumes its result. Disable
-unintended Codex external analytics, feedback uploads, OTel export, and log
-exporters. This does not disable an operator's explicitly configured Factory
-observability profile: `factoryd` may send intentional Factory lifecycle and
-trace data to Langfuse/ClickHouse through that profile. Model API calls,
-explicit tool traffic, and explicitly configured Factory observability are
-distinct from unintended Codex export.
+The default direct path accepts any Responses-compatible endpoint, provider ID,
+model, and optional API key through Codex's native provider configuration.
+Providers using another wire protocol require an explicitly selected
+translation adapter. Factory does not invoke the Claude Code or Cursor
+SDK/harness. GLM 5.2 must be functionally proven through the complete Codex
+kernel, including a real turn that invokes a tool and consumes its result.
+Disable unintended Codex external analytics, feedback uploads, OTel export, and
+log exporters. This does not disable an operator's explicitly configured
+Factory observability profile: `factoryd` may send intentional Factory
+lifecycle and trace data to Langfuse/ClickHouse through that profile. Model API
+calls, explicit tool traffic, and explicitly configured Factory observability
+are distinct from unintended Codex export.
 
-The initial GLM adapter is the MIT-licensed `@bitkyc08/opencodex` 2.8.0 public
+The optional GLM adapter is the MIT-licensed `@bitkyc08/opencodex` 2.8.0 public
 `startServer()` API, supervised as an isolated Bun sidecar and pinned through
 the package lock. Factory never invokes its CLI or lets it rewrite a user's
-Codex configuration. The default profile targets Z.AI's Coding Developer Plan
-at `https://api.z.ai/api/coding/paas/v4`; the standard API profile targets
-`https://api.z.ai/api/paas/v4/`. Both select `glm-5.2` and remain behind the same
-generic Codex Responses provider boundary.
+Codex configuration. The explicit `zai` preset targets Z.AI's Coding Developer
+Plan at `https://api.z.ai/api/coding/paas/v4`; its standard API alternative is
+`https://api.z.ai/api/paas/v4/`. Both select `glm-5.2` behind the same generic
+Codex Responses provider boundary. Neither Z.AI nor GLM is a product default.
 
 Acceptance on 2026-07-31 proved a hidden-value round trip through five
 successful Codex shell-tool executions across two GLM turns, explicit
