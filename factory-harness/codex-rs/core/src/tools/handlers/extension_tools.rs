@@ -119,7 +119,7 @@ async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall {
     let codex_turn_metadata = invocation
         .turn
         .turn_metadata_state
-        .current_meta_value_for_mcp_request(McpTurnMetadataContext {
+        .current_meta_value_for_extension_tool(McpTurnMetadataContext {
             model: invocation.turn.model_info.slug.as_str(),
             reasoning_effort: invocation.turn.effective_reasoning_effort(),
         })

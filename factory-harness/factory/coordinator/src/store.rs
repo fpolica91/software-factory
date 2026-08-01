@@ -466,7 +466,12 @@ impl CoordinatorStore {
             JOIN factory_checkpoints AS checkpoint
               ON checkpoint.attempt_id = attempt.attempt_id
             WHERE operation.job_id = $1
+              AND operation.status = 'succeeded'
               AND checkpoint.kind = operation.kind || '.completed'
+              AND (
+                    operation.kind <> 'codex.remediate'
+                    OR checkpoint.payload ->> 'reviewLoopComplete' = 'true'
+                  )
             ORDER BY operation.operation_id,
                      attempt.attempt_number DESC,
                      checkpoint.sequence DESC

@@ -212,6 +212,22 @@ impl FactoryToolExecutor {
     }
 
     async fn review(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+        let recorded_turn_id = call.turn_id.clone();
+        let turn_metadata = call
+            .codex_turn_metadata
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok());
+        let metadata_text = |key: &str| {
+            turn_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(key))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        };
+        let recorded_thread_id = metadata_text("thread_id");
+        let recorded_parent_thread_id = metadata_text("parent_thread_id");
+        let recorded_parent_turn_id = metadata_text("parent_turn_id");
+        let recorded_subagent_kind = metadata_text("subagent_kind");
         let args: ReviewArgs = parse_args(&call)?;
         validate_review(
             &args,
@@ -222,15 +238,27 @@ impl FactoryToolExecutor {
                 .map_err(|error| respond(error.to_string()))?,
         )
         .map_err(respond)?;
-        let report = FactoryReviewReport {
-            verdict: args.verdict,
-            summary: args.summary,
-            findings: args.findings,
-        };
+        let verdict = args.verdict;
+        let summary = args.summary;
+        let findings = args.findings;
         let state = self
             .state
             .update(move |state| {
-                state.review = Some(report);
+                let generation = state
+                    .review
+                    .as_ref()
+                    .map_or(1, |review| review.generation.saturating_add(1));
+                state.review = Some(FactoryReviewReport {
+                    generation,
+                    recorded_turn_id: Some(recorded_turn_id),
+                    recorded_thread_id,
+                    recorded_parent_thread_id,
+                    recorded_parent_turn_id,
+                    recorded_subagent_kind,
+                    verdict,
+                    summary,
+                    findings,
+                });
                 state.remediations.clear();
                 Ok(())
             })

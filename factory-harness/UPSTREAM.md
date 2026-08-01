@@ -97,3 +97,12 @@ subagents. This is the implementation described by
   `CollabAgentToolCall` and `SubAgentActivity` lifecycle to downstream
   extensions without adding any Factory dependency, type, tool, or agent loop
   to Codex core.
+
+### Native extension tool turn ancestry
+
+- `codex-rs/core/src/turn_metadata.rs` exposes extension-tool metadata that
+  retains the active parent turn identifier while leaving Codex's MCP metadata
+  unchanged.
+- `codex-rs/core/src/tools/handlers/extension_tools.rs` passes that scoped
+  metadata to native extension tools. Factory review records use it to prove
+  that an independent review child belongs to the exact durable review turn.

@@ -204,14 +204,15 @@ directly demonstrate:
 - generic-provider behavior and GLM 5.2;
 - durable checkpoint/retry/crash recovery;
 - decomposition and Factory subagent behavior;
-- review followed by remediation; and
+- autonomous review, remediation, and approving re-review; and
 - long-term memory retrieval through Qdrant.
 
 V1 does not include security architecture, hardening, threat modeling,
 isolation design, mount/trust verification, credential-broker work,
 egress-control work, container-security work, or security-only tests. Do not
-create or run mechanical/security suites. The only baseline in scope is normal
-Codex access/approval requests, disabling unintended external telemetry and
+create or run mechanical/security suites. The only baseline in scope is
+autonomous direct-job execution with the Codex approval protocol retained for
+explicit supervised clients, disabling unintended external telemetry and
 logging, and preserving inherited safeguards against obviously destructive
 commands.
 

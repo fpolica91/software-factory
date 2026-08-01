@@ -86,6 +86,29 @@ function userInputAutoResolutionMs(request: FactoryRawServerRequest): number | u
     : undefined;
 }
 
+function autonomousServerRequestResponse(
+  request: FactoryRawServerRequest,
+): JsonValue | undefined {
+  switch (request.method) {
+    case 'item/commandExecution/requestApproval':
+    case 'item/fileChange/requestApproval':
+      return { decision: 'accept' };
+    case 'item/tool/requestUserInput':
+      return { answers: {} };
+    case 'mcpServer/elicitation/request':
+      return { action: 'decline', content: null, _meta: null };
+    case 'item/permissions/requestApproval': {
+      const params = typeof request.params === 'object' && request.params !== null &&
+        !Array.isArray(request.params)
+        ? request.params as Record<string, JsonValue>
+        : {};
+      return { permissions: params.permissions ?? {}, scope: 'session' };
+    }
+    default:
+      return undefined;
+  }
+}
+
 async function waitForJobCancellation(
   isCancelled: () => Promise<boolean>,
   signal: AbortSignal,
@@ -120,12 +143,13 @@ async function withCoordinatorRetry<T>(
 function durableCodexServerRequestHandler(options: {
   coordinator: CoordinatorClient;
   attemptId: string;
+  autonomous: boolean;
   signal: AbortSignal;
   log(message: string): Promise<void>;
 }): (
   event: Extract<CodexServerRequestEvent, { kind: 'known' }>,
 ) => Promise<CodexServerRequestResponse> | undefined {
-  const { coordinator, attemptId, signal, log } = options;
+  const { coordinator, attemptId, autonomous, signal, log } = options;
   return (event) => {
     const { request } = event;
     if (!HUMAN_SERVER_REQUEST_METHODS.has(request.method)) return undefined;
@@ -139,6 +163,40 @@ function durableCodexServerRequestHandler(options: {
         () => coordinator.registerPendingRequest({ attemptId, request: rawRequest }),
         signal,
       );
+      const autonomousResponse = autonomous
+        ? autonomousServerRequestResponse(rawRequest)
+        : undefined;
+      if (autonomousResponse !== undefined) {
+        let response = autonomousResponse;
+        try {
+          await withCoordinatorRetry(
+            () => coordinator.resolvePendingRequest(pending.pendingRequestId, {
+              response: {
+                id: rawRequest.id,
+                method: rawRequest.method,
+                response: autonomousResponse,
+              },
+            }),
+            signal,
+          );
+        } catch (error) {
+          if (!(error instanceof CoordinatorHttpError) || error.status !== 409) throw error;
+          const current = await withCoordinatorRetry(
+            () => coordinator.loadPendingRequest(pending.pendingRequestId),
+            signal,
+          );
+          if (current.state !== 'resolved' || !current.response ||
+            current.response.id !== rawRequest.id ||
+            current.response.method !== rawRequest.method) {
+            throw new TerminalOperationError(
+              `pending request ${current.pendingRequestId} conflicted without a related resolution`,
+            );
+          }
+          response = current.response.response;
+        }
+        await log(`auto-resolved ${request.method} as ${pending.pendingRequestId}`);
+        return { result: response };
+      }
       const autoResolutionMs = userInputAutoResolutionMs(rawRequest);
       const autoResolutionAt = autoResolutionMs === undefined
         ? undefined
@@ -310,7 +368,8 @@ export function hasCompletedStageCheckpoint(lease: RecoveryLease, kind: Operatio
   if (!checkpoint || checkpoint.kind !== `${kind}.completed`) return false;
   if (typeof checkpoint.payload !== 'object' || checkpoint.payload === null) return false;
   const payload = checkpoint.payload as Record<string, JsonValue>;
-  return payload.stage === kind && payload.turnStatus === 'completed';
+  if (payload.stage !== kind || payload.turnStatus !== 'completed') return false;
+  return kind !== 'codex.remediate' || payload.reviewLoopComplete === true;
 }
 
 function threadStartRequest(input: CodexOperationInput): ThreadStartParams {
@@ -359,6 +418,8 @@ export async function executeCodexOperation(options: {
   kind: OperationKind;
   input: CodexOperationInput;
   correlation: FactoryCorrelationSeed;
+  checkpointMetadata?: Record<string, JsonValue>;
+  completionCheckpointKind?: string;
   expectedThreadId?: string;
   refreshWorkspaceRevision?(): Promise<string>;
   isCancelled?(): Promise<boolean>;
@@ -370,6 +431,8 @@ export async function executeCodexOperation(options: {
     kind,
     input,
     correlation,
+    checkpointMetadata,
+    completionCheckpointKind,
     expectedThreadId,
     refreshWorkspaceRevision,
     isCancelled,
@@ -390,6 +453,7 @@ export async function executeCodexOperation(options: {
     onCodexServerRequest: durableCodexServerRequestHandler({
       coordinator,
       attemptId: lease.attempt.attemptId,
+      autonomous: input.approvalPolicy === 'never',
       signal: pendingRequestAbort.signal,
       log,
     }),
@@ -424,6 +488,7 @@ export async function executeCodexOperation(options: {
         attemptId: lease.attempt.attemptId,
         kind: `${kind}.thread-bound`,
         payload: {
+          ...checkpointMetadata,
           stage: kind,
           phase: 'threadBound',
           threadId: activeThreadId,
@@ -449,6 +514,7 @@ export async function executeCodexOperation(options: {
         attemptId: lease.attempt.attemptId,
         kind: `${kind}.thread-bound`,
         payload: {
+          ...checkpointMetadata,
           stage: kind,
           phase: 'threadBound',
           threadId: activeThreadId,
@@ -552,8 +618,9 @@ export async function executeCodexOperation(options: {
       : input.workspaceRevision;
     const checkpoint = await coordinator.saveCheckpoint({
       attemptId: lease.attempt.attemptId,
-      kind: `${kind}.completed`,
+      kind: completionCheckpointKind ?? `${kind}.completed`,
       payload: {
+        ...checkpointMetadata,
         stage: kind,
         mode,
         phase: 'completed',

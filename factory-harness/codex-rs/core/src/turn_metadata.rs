@@ -194,6 +194,22 @@ impl TurnMetadataState {
         Some(Value::Object(metadata))
     }
 
+    pub(crate) fn current_meta_value_for_extension_tool(
+        &self,
+        context: McpTurnMetadataContext<'_>,
+    ) -> Option<serde_json::Value> {
+        let Value::Object(mut metadata) = self.current_meta_value_for_mcp_request(context)? else {
+            return None;
+        };
+        if let Some(parent_turn_id) = self.parent_turn_id.get() {
+            metadata.insert(
+                PARENT_TURN_ID_KEY.to_string(),
+                Value::String(parent_turn_id.clone()),
+            );
+        }
+        Some(Value::Object(metadata))
+    }
+
     pub(crate) fn to_responses_metadata(
         &self,
         installation_id: String,

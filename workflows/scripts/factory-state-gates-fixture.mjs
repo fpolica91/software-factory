@@ -38,6 +38,12 @@ const validState = {
     ],
   },
   review: {
+    generation: 1,
+    recorded_turn_id: 'review-turn-1',
+    recorded_thread_id: 'review-thread-1',
+    recorded_parent_thread_id: 'factory-thread',
+    recorded_parent_turn_id: 'factory-review-turn-1',
+    recorded_subagent_kind: 'review',
     verdict: 'request_changes',
     summary: 'Two concrete findings require dispositions.',
     findings: [
@@ -114,11 +120,27 @@ expectGateFailure('codex.remediate', incompleteRemediation, /missing findings: F
 
 const approvedState = clone(validState);
 approvedState.review = {
+  generation: 2,
+  recorded_turn_id: 'review-turn-2',
+  recorded_thread_id: 'review-thread-2',
+  recorded_parent_thread_id: 'factory-thread',
+  recorded_parent_turn_id: 'factory-review-turn-2',
+  recorded_subagent_kind: 'review',
   verdict: 'approve',
   summary: 'The work is approved.',
   findings: [],
 };
 delete approvedState.remediation;
 assert.doesNotThrow(() => assertFactoryStageState('codex.remediate', approvedState));
+
+const legacyReview = clone(validState);
+delete legacyReview.review.generation;
+delete legacyReview.review.recorded_turn_id;
+delete legacyReview.review.recorded_thread_id;
+delete legacyReview.review.recorded_parent_thread_id;
+delete legacyReview.review.recorded_parent_turn_id;
+delete legacyReview.review.recorded_subagent_kind;
+assert.doesNotThrow(() => assertFactoryStageState('codex.remediate', legacyReview));
+expectGateFailure('codex.review', legacyReview, /review.generation must be a positive integer/);
 
 console.log('factory state gates fixture passed');

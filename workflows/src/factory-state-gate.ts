@@ -4,24 +4,31 @@ import type { FactoryThreadStateDocument, OperationKind } from './types.js';
 export const FACTORY_STAGE_CONTRACT: Record<OperationKind, string> = {
   'codex.plan': [
     'This Factory plan stage is incomplete until durable decomposition is recorded.',
+    'Decompose only the implementation and verification work that must happen before independent review.',
+    'Do not create work units for review, remediation, or re-review because Factory runs those as separate stages.',
     'Before the final response, call factory_decompose with a nonempty valid DAG of actionable work units.',
   ].join(' '),
   'codex.execute': [
+    'Perform only the planned implementation and verification work in this stage.',
+    'Do not conduct or record review, remediation, or re-review; Factory runs those independently after execution.',
     'Use factory_update_progress while executing the durable decomposition.',
     'Do not finish this stage until every current Factory work unit has status completed.',
   ].join(' '),
   'codex.review': [
+    'Review the current workspace independently without editing files or remediating findings.',
     'Before the final response, call factory_record_review with the current structured verdict, summary, and findings.',
     'Every finding must reference an existing Factory work unit.',
   ].join(' '),
   'codex.remediate': [
     'Inspect the current durable Factory review before finishing this stage.',
     'When its verdict is not approve, call factory_record_remediation with exactly one disposition for every current finding; an approved review needs no remediation mutation.',
+    'Fix and verify the findings, but do not record a new review or self-approve; Factory launches an independent re-review after remediation.',
   ].join(' '),
 };
 
 const PROGRESS_STATUSES = ['pending', 'in_progress', 'completed', 'blocked'] as const;
 const REVIEW_VERDICTS = ['approve', 'request_changes', 'blocked'] as const;
+export type FactoryReviewVerdict = (typeof REVIEW_VERDICTS)[number];
 const FINDING_SEVERITIES = ['critical', 'major', 'minor'] as const;
 const REMEDIATION_DISPOSITIONS = ['accepted', 'rejected', 'deferred', 'resolved'] as const;
 
@@ -31,8 +38,91 @@ interface FactoryWorkUnitDefinition {
 }
 
 interface FactoryReviewState {
-  verdict: (typeof REVIEW_VERDICTS)[number];
+  generation: number;
+  recordedTurnId?: string;
+  recordedThreadId?: string;
+  recordedParentThreadId?: string;
+  recordedParentTurnId?: string;
+  recordedSubagentKind?: string;
+  verdict: FactoryReviewVerdict;
   findings: Map<string, { unitId: string }>;
+}
+
+function reviewGeneration(
+  stage: OperationKind,
+  state: FactoryThreadStateDocument,
+  allowMissing: boolean,
+): number {
+  if (state.review === undefined) return 0;
+  const review = stateObject(stage, state.review, 'review');
+  if (review.generation === undefined && allowMissing) return 0;
+  if (
+    typeof review.generation !== 'number' ||
+    !Number.isSafeInteger(review.generation) ||
+    review.generation < 1
+  ) {
+    return gateError(stage, 'review.generation must be a positive integer');
+  }
+  return review.generation;
+}
+
+export function factoryReviewGeneration(state: FactoryThreadStateDocument): number {
+  return reviewGeneration('codex.review', state, true);
+}
+
+function reviewRecordedText(
+  stage: OperationKind,
+  state: FactoryThreadStateDocument,
+  key: string,
+  label: string,
+  allowMissing: boolean,
+): string | undefined {
+  if (state.review === undefined) return undefined;
+  const review = stateObject(stage, state.review, 'review');
+  if (review[key] === undefined && allowMissing) return undefined;
+  return stateText(stage, review[key], label);
+}
+
+export function factoryReviewTurnId(
+  state: FactoryThreadStateDocument,
+): string | undefined {
+  return reviewRecordedText(
+    'codex.review',
+    state,
+    'recorded_turn_id',
+    'review.recorded_turn_id',
+    true,
+  );
+}
+
+export function factoryReviewParentThreadId(
+  state: FactoryThreadStateDocument,
+): string | undefined {
+  return reviewRecordedText(
+    'codex.review',
+    state,
+    'recorded_parent_thread_id',
+    'review.recorded_parent_thread_id',
+    true,
+  );
+}
+
+export function factoryReviewParentTurnId(
+  state: FactoryThreadStateDocument,
+): string | undefined {
+  return reviewRecordedText(
+    'codex.review',
+    state,
+    'recorded_parent_turn_id',
+    'review.recorded_parent_turn_id',
+    true,
+  );
+}
+
+export function factoryReviewVerdict(
+  state: FactoryThreadStateDocument,
+): FactoryReviewVerdict {
+  return reviewState('codex.review', state, false).verdict;
 }
 
 export class FactoryStateGateError extends Error {
@@ -197,9 +287,50 @@ function requireCompletedProgress(
 function reviewState(
   stage: OperationKind,
   state: FactoryThreadStateDocument,
+  requireGeneration = stage === 'codex.review',
 ): FactoryReviewState {
   const units = decomposition(stage, state);
   const review = stateObject(stage, state.review, 'review');
+  const generation = reviewGeneration(stage, state, !requireGeneration);
+  const allowMissingProvenance = !requireGeneration;
+  const recordedTurnId = reviewRecordedText(
+    stage,
+    state,
+    'recorded_turn_id',
+    'review.recorded_turn_id',
+    allowMissingProvenance,
+  );
+  const recordedThreadId = reviewRecordedText(
+    stage,
+    state,
+    'recorded_thread_id',
+    'review.recorded_thread_id',
+    allowMissingProvenance,
+  );
+  const recordedParentThreadId = reviewRecordedText(
+    stage,
+    state,
+    'recorded_parent_thread_id',
+    'review.recorded_parent_thread_id',
+    allowMissingProvenance,
+  );
+  const recordedParentTurnId = reviewRecordedText(
+    stage,
+    state,
+    'recorded_parent_turn_id',
+    'review.recorded_parent_turn_id',
+    allowMissingProvenance,
+  );
+  const recordedSubagentKind = reviewRecordedText(
+    stage,
+    state,
+    'recorded_subagent_kind',
+    'review.recorded_subagent_kind',
+    allowMissingProvenance,
+  );
+  if (requireGeneration && recordedSubagentKind !== 'review') {
+    gateError(stage, 'review.recorded_subagent_kind must be review');
+  }
   const verdict = stateEnum(stage, review.verdict, 'review.verdict', REVIEW_VERDICTS);
   stateText(stage, review.summary, 'review.summary');
   const values = stateArray(stage, review.findings, 'review.findings');
@@ -219,7 +350,16 @@ function reviewState(
     stateText(stage, finding.recommendation, `review finding ${id} recommendation`);
     findings.set(id, { unitId });
   }
-  return { verdict, findings };
+  return {
+    generation,
+    ...(recordedTurnId ? { recordedTurnId } : {}),
+    ...(recordedThreadId ? { recordedThreadId } : {}),
+    ...(recordedParentThreadId ? { recordedParentThreadId } : {}),
+    ...(recordedParentTurnId ? { recordedParentTurnId } : {}),
+    ...(recordedSubagentKind ? { recordedSubagentKind } : {}),
+    verdict,
+    findings,
+  };
 }
 
 function requireCompleteRemediation(
@@ -260,6 +400,7 @@ function requireCompleteRemediation(
 export function assertFactoryStageState(
   stage: OperationKind,
   state: FactoryThreadStateDocument,
+  options: { allowLegacyReview?: boolean } = {},
 ): void {
   switch (stage) {
     case 'codex.plan':
@@ -269,7 +410,7 @@ export function assertFactoryStageState(
       requireCompletedProgress(stage, state);
       return;
     case 'codex.review':
-      reviewState(stage, state);
+      reviewState(stage, state, options.allowLegacyReview !== true);
       return;
     case 'codex.remediate':
       requireCompleteRemediation(stage, state);

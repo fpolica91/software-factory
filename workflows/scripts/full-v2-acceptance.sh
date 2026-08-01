@@ -218,12 +218,37 @@ try {
   assert.equal(threadIds.size, 1, 'all stages must retain one root thread lineage');
   const threadId = result.stages[0].threadId;
   const durable = await coordinator.getThreadState(threadId);
-  assert.equal(durable.revision, 4);
+  assert.ok(durable.revision >= 5);
   assert.equal(durable.state.decomposition?.work_units?.[0]?.id, 'proof-fixture');
   assert.equal(durable.state.progress?.work_units?.[0]?.status, 'completed');
-  assert.equal(durable.state.review?.verdict, 'request_changes');
-  assert.equal(durable.state.review?.findings?.[0]?.id, 'MISSING-REMEDIATED-MARKER');
-  assert.equal(durable.state.remediation?.records?.[0]?.disposition, 'resolved');
+  assert.ok(durable.state.review?.generation >= 2);
+  assert.equal(typeof durable.state.review?.recorded_turn_id, 'string');
+  assert.equal(typeof durable.state.review?.recorded_parent_turn_id, 'string');
+  assert.equal(durable.state.review?.recorded_parent_thread_id, threadId);
+  assert.equal(durable.state.review?.recorded_subagent_kind, 'review');
+  assert.notEqual(durable.state.review?.recorded_thread_id, threadId);
+  assert.equal(durable.state.review?.verdict, 'approve');
+  assert.deepEqual(durable.state.review?.findings, []);
+  assert.deepEqual(durable.state.remediation?.records, []);
+  const stageCheckpoints = await coordinator.listStageCheckpoints(created.job.jobId);
+  const remediationCheckpoint = stageCheckpoints.find(
+    (record) => record.operationKind === 'codex.remediate',
+  )?.checkpoint;
+  assert.equal(remediationCheckpoint?.payload?.reviewLoopComplete, true);
+  assert.equal(remediationCheckpoint?.payload?.finalReviewVerdict, 'approve');
+  assert.equal(remediationCheckpoint?.payload?.reviewCycles, 1);
+  assert.equal(
+    remediationCheckpoint?.payload?.reviewedReviewGeneration,
+    durable.state.review?.generation,
+  );
+  assert.equal(
+    remediationCheckpoint?.payload?.reviewedReviewTurnId,
+    durable.state.review?.recorded_turn_id,
+  );
+  assert.equal(
+    remediationCheckpoint?.payload?.reviewedReviewParentTurnId,
+    durable.state.review?.recorded_parent_turn_id,
+  );
 
   const workspace = await coordinator.loadWorkspace(created.job.jobId);
   assert.equal(await readFile(resolve(workspace.root, 'factory-v2-proof.txt'), 'utf8'), 'EXECUTED\nREMEDIATED_OK\n');

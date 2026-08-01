@@ -32,16 +32,19 @@ authentication mode, and API key. Installation then creates a symlink in
 `~/.local/bin`; add that directory to `PATH` if the command reports it is
 missing. From any Git repository, `factory run` builds the image when needed,
 starts the durable services, mounts that repository, submits the task, and
-attaches to it. Running `factory run` without saved provider configuration
+attaches to its live output. Running `factory run` without saved provider configuration
 opens the same neutral configuration prompts when a terminal is available.
 
-The CLI is interactive when attached but does not require an interactive shell:
+Jobs are autonomous by default. Codex may execute repository tools without
+command approvals, and Factory resolves model clarification requests without
+waiting for a terminal. Attachment is for observation and control, not required
+supervision:
 
 ```sh
 factory run "Implement authentication"             # submit and attach
 factory run --detach "Implement authentication"    # print the job ID and exit
 factory status JOB_ID                              # one-shot status
-factory attach JOB_ID                              # reconnect and handle approvals
+factory attach JOB_ID                              # reconnect and watch progress
 factory stop JOB_ID                                # durably cancel the job
 ```
 
@@ -116,7 +119,10 @@ override details.
 
 CLI jobs operate directly on the Git repository from which `factory` is called.
 The same job keeps one native Codex thread across planning, execution, review,
-and remediation, with durable checkpoints between stages. The coordinator also
+and remediation. A requested-change review triggers remediation followed by a
+fresh independent review, repeating up to `FACTORY_MAX_REVIEW_CYCLES` (default
+`5`). Phase-aware checkpoints resume the current cycle after a worker crash.
+The coordinator also
 supports remote repositories as managed worktrees under `/workspaces` for API
 clients and future integrations.
 

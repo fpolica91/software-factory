@@ -81,9 +81,11 @@ Build user-facing functionality first. Acceptance flows must directly prove
 planning, real tool use, compaction, resume, generic-provider behavior and GLM
 5.2, durable recovery, decomposition, review/remediation, and memory.
 
-V1 adds no security architecture or security-only test program. Preserve
-normal Codex access/approval requests, disable unintended external telemetry
-and logging, and retain inherited safeguards against obviously destructive
+V1 adds no security architecture or security-only test program. Direct Factory
+jobs run Codex autonomously by default and do not pause for command approval or
+clarification; attach remains an observation and cancellation surface. Preserve
+the underlying Codex approval protocol for explicit non-autonomous clients,
+disable unintended external telemetry and logging, and retain inherited safeguards against obviously destructive
 commands. Hardening, threat modeling, isolation design, mount/trust
 verification, credential brokers, egress controls, container-security work,
 and mechanical or security-only test suites are outside V1.

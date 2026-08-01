@@ -16,6 +16,12 @@ import type {
 } from './types.js';
 
 const POLL_INTERVAL_MS = 1_000;
+const AUTONOMOUS_DEVELOPER_INSTRUCTIONS = [
+  'Operate autonomously until the Factory stage is complete.',
+  'Do not ask the user questions or wait for clarification.',
+  'Make reasonable assumptions from the repository and task, execute the required tools, and verify the result.',
+  'If one approach is unavailable, choose another and continue.',
+].join(' ');
 const TERMINAL_JOB_STATES = new Set<JobState>([
   'succeeded',
   'failed',
@@ -194,8 +200,9 @@ function jobDefinition(options: RunOptions): JobDefinition {
       ...(process.env.FACTORY_PROJECT_ID
         ? { projectId: process.env.FACTORY_PROJECT_ID }
         : {}),
-      approvalPolicy: 'on-request',
-      sandbox: 'workspace-write',
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      developerInstructions: AUTONOMOUS_DEVELOPER_INSTRUCTIONS,
     },
     operations: [
       {
@@ -644,6 +651,33 @@ function pendingSummary(pending: PendingRequestRecord[]): Array<Record<string, J
     }));
 }
 
+function autonomousRequest(job: DurableJob, pending: PendingRequestRecord): boolean {
+  const jobInput = record(job.job.input) ?? {};
+  const operation = job.operations.find((candidate) => (
+    candidate.operationId === pending.operationId
+  ));
+  if (!operation) return false;
+  const operationInput = record(operation.input) ?? {};
+  const approvalPolicy = Object.prototype.hasOwnProperty.call(
+    operationInput,
+    'approvalPolicy',
+  )
+    ? operationInput.approvalPolicy
+    : Object.prototype.hasOwnProperty.call(jobInput, 'approvalPolicy')
+      ? jobInput.approvalPolicy
+      : 'never';
+  return approvalPolicy === 'never';
+}
+
+function actionableRequests(
+  job: DurableJob,
+  requests: PendingRequestRecord[],
+): PendingRequestRecord[] {
+  return requests.filter((request) => (
+    request.state === 'pending' && !autonomousRequest(job, request)
+  ));
+}
+
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return;
   await new Promise<void>((resolve) => {
@@ -683,7 +717,7 @@ async function attachJob(
       if (!options.json && snapshot !== previousSnapshot) printProgress(job);
       previousSnapshot = snapshot;
 
-      const actionable = requests.filter((request) => request.state === 'pending');
+      const actionable = actionableRequests(job, requests);
       if (actionable.length > 0 && (!stdin.isTTY || !stdout.isTTY)) {
         if (options.json) {
           console.log(JSON.stringify({
@@ -720,7 +754,7 @@ async function attachJob(
         if (options.json) {
           console.log(JSON.stringify({
             job,
-            pendingRequests: pendingSummary(requests),
+            pendingRequests: pendingSummary(actionableRequests(job, requests)),
             stageCheckpoints: stages,
             attempts,
           }));
@@ -797,25 +831,26 @@ async function statusCommand(jobId: string, options: OutputOptions): Promise<Att
     coordinator.listStageCheckpoints(jobId),
     coordinator.listJobAttempts(jobId),
   ]);
+  const actionable = actionableRequests(job, requests);
   if (options.json || !stdout.isTTY) {
     console.log(JSON.stringify({
       job,
-      pendingRequests: pendingSummary(requests),
+      pendingRequests: pendingSummary(actionable),
       stageCheckpoints: stages,
       attempts,
     }));
   } else {
     printProgress(job);
-    const actionable = pendingSummary(requests);
-    if (actionable.length > 0) {
-      console.log(`\nNeeds input: ${actionable.length}. Run: factory attach ${jobId}`);
+    const summary = pendingSummary(actionable);
+    if (summary.length > 0) {
+      console.log(`\nNeeds input: ${summary.length}. Run: factory attach ${jobId}`);
     }
     if (terminal(job.job.state)) {
       printStageOutputs(stages);
       printAttemptFailures(attempts);
     }
   }
-  return { state: job.job.state, needsInput: pendingSummary(requests).length > 0 };
+  return { state: job.job.state, needsInput: actionable.length > 0 };
 }
 
 async function stopCommand(jobId: string, options: OutputOptions): Promise<AttachResult> {

@@ -29,6 +29,21 @@ durable native Factory state from `factoryd` and enforces these contracts:
 - remediation covers every current finding exactly once when review requests
   changes (an approved review requires no remediation write).
 
+Planning creates implementation/verification units only; review and remediation
+remain independent Factory stages. After remediation, the workflow launches a
+fresh native review and repeats remediation/re-review until approval, bounded by
+`FACTORY_MAX_REVIEW_CYCLES` (default `5`). Every nested turn records its phase,
+cycle, remediation-state baseline, and review generation so crash recovery
+resumes the current phase. Each review records the exact native review-child
+turn that called `factory_record_review` and verifies both its parent Factory
+thread and parent `review/start` turn, so stale or unrelated review state cannot
+satisfy a new review.
+
+CLI-created jobs default to Codex `approvalPolicy = "never"` and
+`sandbox = "danger-full-access"`. Any approval request is accepted, clarification
+is answered with an empty response, and MCP elicitation is declined without
+blocking. `attach` remains useful for progress and cancellation.
+
 The runner injects the matching native-tool instruction for each stage. A
 semantic miss writes a `<stage>.semantic-gate-failed` checkpoint and remains
 retryable; integrations are notified only after the state gate passes.

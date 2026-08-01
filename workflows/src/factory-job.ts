@@ -4,6 +4,12 @@ import {
   FACTORY_STAGE_CONTRACT,
   FactoryStateGateError,
   assertFactoryStageState,
+  factoryReviewGeneration,
+  factoryReviewParentTurnId,
+  factoryReviewParentThreadId,
+  factoryReviewTurnId,
+  factoryReviewVerdict,
+  type FactoryReviewVerdict,
 } from './factory-state-gate.js';
 import { IntegrationLifecyclePublisher } from './integration-lifecycle.js';
 import {
@@ -33,6 +39,21 @@ import {
 const KIND_ORDER = new Map<OperationKind, number>(OPERATION_KINDS.map((kind, index) => [kind, index]));
 const DEFAULT_LEASE_SECONDS = 15 * 60;
 const DEFAULT_CLAIM_POLL_SECONDS = 5;
+const DEFAULT_MAX_REVIEW_CYCLES = 5;
+const AUTONOMOUS_JOB_INSTRUCTIONS = [
+  'Operate autonomously through the current Factory stage.',
+  'Never ask for user input; make reasonable repository-grounded assumptions.',
+  'Use the available tools, verify the work, and continue until the stage contract is satisfied.',
+].join(' ');
+
+interface ValidatedFactoryState {
+  state: FactoryThreadStateDocument;
+  revision: number;
+  reviewGeneration: number;
+  reviewTurnId?: string;
+  reviewParentThreadId?: string;
+  reviewParentTurnId?: string;
+}
 
 async function enforceFactoryStageState(options: {
   coordinator: CoordinatorClient;
@@ -41,8 +62,14 @@ async function enforceFactoryStageState(options: {
   threadId: string;
   workspaceRoot?: string;
   workspaceRevision?: string;
+  minimumRevisionExclusive?: number;
+  minimumReviewGenerationExclusive?: number;
+  expectedReviewTurnId?: string;
+  expectedReviewParentTurnId?: string;
+  allowLegacyReview?: boolean;
+  checkpointMetadata?: Record<string, JsonValue>;
   log(message: string): Promise<void>;
-}): Promise<void> {
+}): Promise<ValidatedFactoryState> {
   const {
     coordinator,
     lease,
@@ -50,24 +77,75 @@ async function enforceFactoryStageState(options: {
     threadId,
     workspaceRoot,
     workspaceRevision,
+    minimumRevisionExclusive,
+    minimumReviewGenerationExclusive,
+    expectedReviewTurnId,
+    expectedReviewParentTurnId,
+    allowLegacyReview,
+    checkpointMetadata,
     log,
   } = options;
   let state: FactoryThreadStateDocument;
+  let revision = 0;
+  let reviewGeneration = 0;
+  let reviewTurnId: string | undefined;
+  let reviewParentThreadId: string | undefined;
+  let reviewParentTurnId: string | undefined;
   try {
-    state = (await coordinator.getThreadState(threadId)).state;
+    const record = await coordinator.getThreadState(threadId);
+    state = record.state;
+    revision = record.revision;
   } catch (error) {
     if (!(error instanceof CoordinatorHttpError) || error.status !== 404) throw error;
     state = {};
   }
 
   try {
-    assertFactoryStageState(stage, state);
+    reviewGeneration = factoryReviewGeneration(state);
+    reviewTurnId = factoryReviewTurnId(state);
+    reviewParentThreadId = factoryReviewParentThreadId(state);
+    reviewParentTurnId = factoryReviewParentTurnId(state);
+    if (minimumRevisionExclusive !== undefined && revision <= minimumRevisionExclusive) {
+      throw new FactoryStateGateError(
+        stage,
+        `thread state revision ${revision} did not advance beyond ${minimumRevisionExclusive}`,
+      );
+    }
+    if (minimumReviewGenerationExclusive !== undefined &&
+      reviewGeneration <= minimumReviewGenerationExclusive) {
+      throw new FactoryStateGateError(
+        stage,
+        `review generation ${reviewGeneration} did not advance beyond ${minimumReviewGenerationExclusive}`,
+      );
+    }
+    if (expectedReviewTurnId !== undefined && reviewTurnId !== expectedReviewTurnId) {
+      throw new FactoryStateGateError(
+        stage,
+        `review was recorded by turn ${reviewTurnId ?? 'none'}, expected ${expectedReviewTurnId}`,
+      );
+    }
+    if (expectedReviewParentTurnId !== undefined &&
+      reviewParentTurnId !== expectedReviewParentTurnId) {
+      throw new FactoryStateGateError(
+        stage,
+        `review parent turn is ${reviewParentTurnId ?? 'none'}, expected ${expectedReviewParentTurnId}`,
+      );
+    }
+    if (stage === 'codex.review' && allowLegacyReview !== true &&
+      reviewParentThreadId !== threadId) {
+      throw new FactoryStateGateError(
+        stage,
+        `review parent thread is ${reviewParentThreadId ?? 'none'}, expected ${threadId}`,
+      );
+    }
+    assertFactoryStageState(stage, state, { allowLegacyReview });
   } catch (error) {
     if (!(error instanceof FactoryStateGateError)) throw error;
     await coordinator.saveCheckpoint({
       attemptId: lease.attempt.attemptId,
       kind: `${stage}.semantic-gate-failed`,
       payload: {
+        ...checkpointMetadata,
         stage,
         phase: 'semanticGateFailed',
         threadId,
@@ -79,6 +157,188 @@ async function enforceFactoryStageState(options: {
     await log(error.message);
     throw error;
   }
+  return {
+    state,
+    revision,
+    reviewGeneration,
+    ...(reviewTurnId ? { reviewTurnId } : {}),
+    ...(reviewParentThreadId ? { reviewParentThreadId } : {}),
+    ...(reviewParentTurnId ? { reviewParentTurnId } : {}),
+  };
+}
+
+async function currentFactoryReviewGeneration(
+  coordinator: CoordinatorClient,
+  threadId: string,
+): Promise<number> {
+  try {
+    return factoryReviewGeneration((await coordinator.getThreadState(threadId)).state);
+  } catch (error) {
+    if (error instanceof CoordinatorHttpError && error.status === 404) return 0;
+    throw error;
+  }
+}
+
+function maxReviewCycles(): number {
+  const value = Number(process.env.FACTORY_MAX_REVIEW_CYCLES ?? DEFAULT_MAX_REVIEW_CYCLES);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TerminalOperationError('FACTORY_MAX_REVIEW_CYCLES must be a positive integer');
+  }
+  return value;
+}
+
+function reReviewPrompt(cycle: number): string {
+  return [
+    `Perform autonomous post-remediation review cycle ${cycle}.`,
+    'Inspect the actual diff and run the relevant tests or verification commands.',
+    'Call factory_record_review with approve only when the original task is fully satisfied and verification passes.',
+    'Otherwise record concrete findings tied to the current Factory work units so another remediation cycle can fix them.',
+    'Do not ask the user for input.',
+  ].join(' ');
+}
+
+function repeatedRemediationPrompt(cycle: number): string {
+  return [
+    `Perform autonomous remediation cycle ${cycle}.`,
+    'Inspect every finding in the current Factory review, fix the underlying code, and run the relevant tests.',
+    'Call factory_record_remediation with exactly one disposition for every current finding.',
+    'Do not ask the user for input and do not stop at an explanation when a code or test change is required.',
+  ].join(' ');
+}
+
+function developerInstructionsForStage(
+  input: CodexOperationInput,
+  currentStage: OperationKind,
+  targetStage: OperationKind,
+): string {
+  const currentContract = FACTORY_STAGE_CONTRACT[currentStage];
+  const instructions = input.developerInstructions?.trim() ?? '';
+  const base = instructions.endsWith(currentContract)
+    ? instructions.slice(0, -currentContract.length).trim()
+    : instructions;
+  return base
+    ? `${base}\n\n${FACTORY_STAGE_CONTRACT[targetStage]}`
+    : FACTORY_STAGE_CONTRACT[targetStage];
+}
+
+type ReviewLoopResume =
+  | { phase: 'remediate'; cycle: number }
+  | { phase: 'review'; cycle: number; minimumRevisionExclusive?: number }
+  | {
+      phase: 'reviewed';
+      cycle: number;
+      validated: boolean;
+      verdict?: FactoryReviewVerdict;
+      minimumReviewGenerationExclusive?: number;
+      expectedReviewGeneration?: number;
+      expectedReviewTurnId?: string;
+      expectedReviewParentTurnId?: string;
+    };
+
+function reviewLoopCheckpointPayload(lease: RecoveryLease): Record<string, JsonValue> {
+  if (lease.selection.resume.kind !== 'fromCheckpoint') return {};
+  const { payload } = lease.selection.resume.checkpoint;
+  return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+    ? payload as Record<string, JsonValue>
+    : {};
+}
+
+function reviewLoopCycle(value: JsonValue | undefined, fallback = 1): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
+    ? value
+    : fallback;
+}
+
+function reviewLoopResume(lease: RecoveryLease): ReviewLoopResume {
+  if (lease.selection.resume.kind !== 'fromCheckpoint') {
+    return { phase: 'remediate', cycle: 1 };
+  }
+  const checkpoint = lease.selection.resume.checkpoint;
+  const payload = reviewLoopCheckpointPayload(lease);
+  const cycle = reviewLoopCycle(payload.reviewLoopCycle ?? payload.cycle);
+  const step = payload.reviewLoopStep;
+
+  if (step === 'remediation') {
+    if (checkpoint.kind !== 'codex.remediate.turn-completed' &&
+      checkpoint.kind !== 'codex.remediate.completed') {
+      return { phase: 'remediate', cycle };
+    }
+    const baseline = payload.factoryStateRevisionBefore;
+    return {
+      phase: 'review',
+      cycle,
+      ...(typeof baseline === 'number' && Number.isSafeInteger(baseline) && baseline >= 0
+        ? { minimumRevisionExclusive: baseline }
+        : {}),
+    };
+  }
+  if (step === 'review') {
+    if (checkpoint.kind !== 'codex.review.completed') {
+      return { phase: 'review', cycle };
+    }
+    const baseline = payload.factoryReviewGenerationBefore;
+    return {
+      phase: 'reviewed',
+      cycle,
+      validated: false,
+      ...(typeof baseline === 'number' && Number.isSafeInteger(baseline) && baseline >= 0
+        ? { minimumReviewGenerationExclusive: baseline }
+        : {}),
+    };
+  }
+  if (checkpoint.kind === 'codex.remediate.cycle-remediated') {
+    return { phase: 'review', cycle };
+  }
+  if (checkpoint.kind === 'codex.remediate.cycle-reviewed') {
+    const value = payload.verdict;
+    const verdict = value === 'approve' || value === 'request_changes' || value === 'blocked'
+      ? value
+      : undefined;
+    const reviewGeneration = payload.reviewGeneration;
+    const reviewTurnId = payload.reviewTurnId;
+    const reviewParentTurnId = payload.reviewParentTurnId;
+    return {
+      phase: 'reviewed',
+      cycle,
+      validated: true,
+      ...(verdict ? { verdict } : {}),
+      ...(typeof reviewGeneration === 'number' && Number.isSafeInteger(reviewGeneration) &&
+        reviewGeneration >= 1
+        ? { expectedReviewGeneration: reviewGeneration }
+        : {}),
+      ...(typeof reviewTurnId === 'string' && reviewTurnId !== ''
+        ? { expectedReviewTurnId: reviewTurnId }
+        : {}),
+      ...(typeof reviewParentTurnId === 'string' && reviewParentTurnId !== ''
+        ? { expectedReviewParentTurnId: reviewParentTurnId }
+        : {}),
+    };
+  }
+  if (checkpoint.kind === 'codex.remediate.completed' &&
+    payload.reviewLoopComplete !== true) {
+    return { phase: 'review', cycle };
+  }
+  return { phase: 'remediate', cycle: 1 };
+}
+
+function resultFromResumeCheckpoint(lease: RecoveryLease): OperationResult {
+  if (lease.selection.resume.kind !== 'fromCheckpoint') {
+    throw new TerminalOperationError('review-loop recovery requires a checkpoint');
+  }
+  const checkpoint = lease.selection.resume.checkpoint;
+  const payload = reviewLoopCheckpointPayload(lease);
+  const threadId = typeof payload.threadId === 'string'
+    ? payload.threadId
+    : checkpointThreadId(lease);
+  if (!threadId) throw new TerminalOperationError('review-loop checkpoint has no Codex thread');
+  return {
+    threadId,
+    ...(typeof payload.turnId === 'string' ? { turnId: payload.turnId } : {}),
+    ...(checkpoint.workspaceRevision
+      ? { workspaceRevision: checkpoint.workspaceRevision }
+      : {}),
+    recoveredFromCheckpoint: true,
+  };
 }
 
 function object(value: JsonValue, label: string): Record<string, JsonValue> {
@@ -131,6 +391,9 @@ function codexInput(
   const stageInput = object(operation.input, `operation ${operation.operationId} input`);
   const { workspace: _workspace, ...sharedJobInput } = jobInput;
   const merged = {
+    approvalPolicy: 'never',
+    sandbox: 'danger-full-access',
+    developerInstructions: AUTONOMOUS_JOB_INSTRUCTIONS,
     ...defaults,
     ...sharedJobInput,
     ...stageInput,
@@ -335,8 +598,17 @@ export async function executeFactoryJob(
           const sourceCheckpoint = lease.selection.resume.kind === 'fromCheckpoint'
             ? lease.selection.resume.checkpoint
             : undefined;
+          const sourcePayload = sourceCheckpoint &&
+            typeof sourceCheckpoint.payload === 'object' &&
+            sourceCheckpoint.payload !== null &&
+            !Array.isArray(sourceCheckpoint.payload)
+            ? sourceCheckpoint.payload as Record<string, JsonValue>
+            : {};
           const recoveredResult: OperationResult = {
             threadId,
+            ...(typeof sourcePayload.turnId === 'string'
+              ? { turnId: sourcePayload.turnId }
+              : {}),
             ...(sourceCheckpoint?.workspaceRevision
               ? { workspaceRevision: sourceCheckpoint.workspaceRevision }
               : {}),
@@ -353,8 +625,80 @@ export async function executeFactoryJob(
             ...(sourceCheckpoint?.workspaceRevision
               ? { workspaceRevision: sourceCheckpoint.workspaceRevision }
               : {}),
+            ...(kind === 'codex.review' &&
+              typeof sourcePayload.factoryReviewGenerationBefore === 'number'
+              ? {
+                  minimumReviewGenerationExclusive:
+                    sourcePayload.factoryReviewGenerationBefore,
+                }
+              : {}),
+            ...(kind === 'codex.review'
+              ? {
+                  expectedReviewParentTurnId: typeof sourcePayload.turnId === 'string'
+                    ? sourcePayload.turnId
+                    : '',
+                }
+              : {}),
             log: (message) => context.log(message),
           });
+          if (kind === 'codex.remediate') {
+            const reviewed = await enforceFactoryStageState({
+              coordinator,
+              lease,
+              stage: 'codex.review',
+              threadId,
+              ...(sourceCheckpoint?.workspaceRoot
+                ? { workspaceRoot: sourceCheckpoint.workspaceRoot }
+                : {}),
+              ...(sourceCheckpoint?.workspaceRevision
+                ? { workspaceRevision: sourceCheckpoint.workspaceRevision }
+                : {}),
+              ...(typeof sourcePayload.reviewedReviewTurnId === 'string'
+                ? { expectedReviewTurnId: sourcePayload.reviewedReviewTurnId }
+                : {}),
+              ...(typeof sourcePayload.reviewedReviewParentTurnId === 'string'
+                ? {
+                    expectedReviewParentTurnId:
+                      sourcePayload.reviewedReviewParentTurnId,
+                  }
+                : {}),
+              log: (message) => context.log(message),
+            });
+            const recoveredVerdict = factoryReviewVerdict(reviewed.state);
+            if (recoveredVerdict !== 'approve') {
+              throw new TerminalOperationError(
+                `completed remediation checkpoint has review verdict ${recoveredVerdict}`,
+              );
+            }
+            const reviewedStateRevision = sourcePayload.reviewedStateRevision;
+            if (typeof reviewedStateRevision === 'number' &&
+              reviewed.revision !== reviewedStateRevision) {
+              throw new TerminalOperationError(
+                `completed remediation checkpoint reviewed state revision ${reviewedStateRevision}, current revision is ${reviewed.revision}`,
+              );
+            }
+            const reviewedReviewGeneration = sourcePayload.reviewedReviewGeneration;
+            if (typeof reviewedReviewGeneration === 'number' &&
+              reviewed.reviewGeneration !== reviewedReviewGeneration) {
+              throw new TerminalOperationError(
+                `completed remediation checkpoint reviewed generation ${reviewedReviewGeneration}, current generation is ${reviewed.reviewGeneration}`,
+              );
+            }
+            const reviewedReviewTurnId = sourcePayload.reviewedReviewTurnId;
+            if (typeof reviewedReviewTurnId === 'string' &&
+              reviewed.reviewTurnId !== reviewedReviewTurnId) {
+              throw new TerminalOperationError(
+                `completed remediation checkpoint reviewed turn ${reviewedReviewTurnId}, current review turn is ${reviewed.reviewTurnId ?? 'none'}`,
+              );
+            }
+            const reviewedReviewParentTurnId = sourcePayload.reviewedReviewParentTurnId;
+            if (typeof reviewedReviewParentTurnId === 'string' &&
+              reviewed.reviewParentTurnId !== reviewedReviewParentTurnId) {
+              throw new TerminalOperationError(
+                `completed remediation checkpoint reviewed parent turn ${reviewedReviewParentTurnId}, current review parent turn is ${reviewed.reviewParentTurnId ?? 'none'}`,
+              );
+            }
+          }
           if (integration) {
             await integration.stageCompleted({
               jobId: input.jobId,
@@ -370,11 +714,14 @@ export async function executeFactoryJob(
           }
           await coordinator.saveCheckpoint({
             attemptId: lease.attempt.attemptId,
-            kind: `${kind}.recovered-completion`,
+            kind: `${kind}.completed`,
             payload: {
+              ...sourcePayload,
               stage: kind,
               phase: 'recoveredCompletion',
               threadId,
+              turnStatus: 'completed',
+              recoveredFromCheckpoint: true,
               sourceCheckpointId: lease.selection.resume.kind === 'fromCheckpoint'
                 ? lease.selection.resume.checkpoint.checkpointId
                 : null,
@@ -406,52 +753,431 @@ export async function executeFactoryJob(
         await context.log(
           `running ${kind} attempt ${lease.attempt.attemptNumber}/${lease.selection.maxAttempts}`,
         );
-        const result = await executeCodexOperation({
-          coordinator,
-          lease,
-          kind,
-          input: stageInput,
-          correlation: {
-            jobId: lease.selection.jobId,
-            operationId: lease.selection.operationId,
-            attemptId: lease.attempt.attemptId,
-            ...(context.workflowRunId ? { workflowRunId: context.workflowRunId } : {}),
-            ...(context.taskRunExternalId
-              ? { taskRunExternalId: context.taskRunExternalId }
+        const correlation = {
+          jobId: lease.selection.jobId,
+          operationId: lease.selection.operationId,
+          attemptId: lease.attempt.attemptId,
+          ...(context.workflowRunId ? { workflowRunId: context.workflowRunId } : {}),
+          ...(context.taskRunExternalId
+            ? { taskRunExternalId: context.taskRunExternalId }
+            : {}),
+        };
+        const refreshWorkspaceRevision = resolvedInput.usesManagedWorkspace
+          ? async () => {
+              managedWorkspace = await coordinator.refreshWorkspaceRevision(input.jobId);
+              return managedWorkspace.revision;
+            }
+          : undefined;
+        const isCancelled = async () =>
+          (await coordinator.loadJob(input.jobId)).job.state === 'cancelled';
+        const runCodexStage = async (
+          runKind: OperationKind,
+          runInput: CodexOperationInput,
+          expectedThreadId?: string,
+          checkpointMetadata?: Record<string, JsonValue>,
+          completionCheckpointKind?: string,
+        ): Promise<OperationResult> => {
+          const output = await executeCodexOperation({
+            coordinator,
+            lease,
+            kind: runKind,
+            input: runInput,
+            correlation,
+            ...(checkpointMetadata ? { checkpointMetadata } : {}),
+            ...(completionCheckpointKind ? { completionCheckpointKind } : {}),
+            ...(expectedThreadId ? { expectedThreadId } : {}),
+            ...(refreshWorkspaceRevision ? { refreshWorkspaceRevision } : {}),
+            isCancelled,
+            log: (message) => context.log(message),
+          });
+          renewer.assertHealthy();
+          if (lineageThreadId && output.threadId !== lineageThreadId) {
+            throw new TerminalOperationError(
+              `stage ${runKind} returned unrelated thread ${output.threadId}; expected ${lineageThreadId}`,
+            );
+          }
+          return output;
+        };
+
+        let result: OperationResult;
+        if (kind !== 'codex.remediate') {
+          const expectedThreadId = checkpointLineage ?? lineageThreadId;
+          const reviewGenerationBefore = kind === 'codex.review' && expectedThreadId
+            ? await currentFactoryReviewGeneration(coordinator, expectedThreadId)
+            : undefined;
+          result = await runCodexStage(
+            kind,
+            stageInput,
+            expectedThreadId,
+            reviewGenerationBefore === undefined
+              ? undefined
+              : { factoryReviewGenerationBefore: reviewGenerationBefore },
+          );
+          await enforceFactoryStageState({
+            coordinator,
+            lease,
+            stage: kind,
+            threadId: result.threadId,
+            workspaceRoot: stageInput.cwd,
+            ...(result.workspaceRevision
+              ? { workspaceRevision: result.workspaceRevision }
               : {}),
-          },
-          ...(checkpointLineage || lineageThreadId
-            ? { expectedThreadId: checkpointLineage ?? lineageThreadId }
-            : {}),
-          ...(resolvedInput.usesManagedWorkspace
-            ? {
-                refreshWorkspaceRevision: async () => {
-                  managedWorkspace = await coordinator.refreshWorkspaceRevision(input.jobId);
-                  return managedWorkspace.revision;
+            ...(reviewGenerationBefore === undefined
+              ? {}
+              : { minimumReviewGenerationExclusive: reviewGenerationBefore }),
+            ...(kind === 'codex.review'
+              ? { expectedReviewParentTurnId: result.turnId ?? '' }
+              : {}),
+            ...(reviewGenerationBefore === undefined
+              ? {}
+              : {
+                  checkpointMetadata: {
+                    factoryReviewGenerationBefore: reviewGenerationBefore,
+                  },
+                }),
+            log: (message) => context.log(message),
+          });
+        } else {
+          const maximumReviewCycles = maxReviewCycles();
+          const resumed = reviewLoopResume(lease);
+          let phase: ReviewLoopResume['phase'] = resumed.phase;
+          let cycle = resumed.cycle;
+          let reviewCycles = Math.max(0, cycle - 1);
+          let verdict: FactoryReviewVerdict | undefined = resumed.phase === 'reviewed'
+            ? resumed.verdict
+            : undefined;
+          let factoryState: ValidatedFactoryState | undefined;
+          let loopResult: OperationResult | undefined = resumed.phase === 'remediate'
+            ? undefined
+            : resultFromResumeCheckpoint(lease);
+
+          if (resumed.phase === 'reviewed') {
+            if (!loopResult) {
+              throw new TerminalOperationError('review-loop checkpoint has no result');
+            }
+            factoryState = await enforceFactoryStageState({
+              coordinator,
+              lease,
+              stage: 'codex.review',
+              threadId: loopResult.threadId,
+              workspaceRoot: stageInput.cwd,
+              ...(!resumed.validated &&
+                resumed.minimumReviewGenerationExclusive !== undefined
+                ? {
+                    minimumReviewGenerationExclusive:
+                      resumed.minimumReviewGenerationExclusive,
+                  }
+                : {}),
+              ...(resumed.validated
+                ? { expectedReviewTurnId: resumed.expectedReviewTurnId ?? '' }
+                : {}),
+              expectedReviewParentTurnId: resumed.validated
+                ? (resumed.expectedReviewParentTurnId ?? '')
+                : (loopResult.turnId ?? ''),
+              checkpointMetadata: {
+                reviewLoopStep: 'review',
+                reviewLoopCycle: cycle,
+                ...(!resumed.validated &&
+                  resumed.minimumReviewGenerationExclusive !== undefined
+                  ? {
+                      factoryReviewGenerationBefore:
+                        resumed.minimumReviewGenerationExclusive,
+                    }
+                  : {}),
+              },
+              log: (message) => context.log(message),
+            });
+            const persistedVerdict = factoryReviewVerdict(factoryState.state);
+            if (resumed.validated && resumed.expectedReviewGeneration !== undefined &&
+              factoryState.reviewGeneration !== resumed.expectedReviewGeneration) {
+              throw new TerminalOperationError(
+                `review-loop checkpoint generation ${resumed.expectedReviewGeneration} does not match current review generation ${factoryState.reviewGeneration}`,
+              );
+            }
+            if (verdict && verdict !== persistedVerdict) {
+              throw new TerminalOperationError(
+                `review-loop checkpoint verdict ${verdict} does not match Factory state ${persistedVerdict}`,
+              );
+            }
+            verdict = persistedVerdict;
+            reviewCycles = cycle;
+            if (!resumed.validated) {
+              await coordinator.saveCheckpoint({
+                attemptId: lease.attempt.attemptId,
+                kind: 'codex.remediate.cycle-reviewed',
+                payload: {
+                  stage: kind,
+                  phase: 'cycleReviewed',
+                  threadId: loopResult.threadId,
+                  cycle,
+                  verdict,
+                  stateRevision: factoryState.revision,
+                  reviewGeneration: factoryState.reviewGeneration,
+                  reviewTurnId: factoryState.reviewTurnId ?? null,
+                  reviewParentTurnId: factoryState.reviewParentTurnId ?? null,
+                  factoryState: factoryState.state as unknown as JsonValue,
                 },
+                workspaceRoot: stageInput.cwd,
+                ...(loopResult.workspaceRevision
+                  ? { workspaceRevision: loopResult.workspaceRevision }
+                  : {}),
+              });
+            }
+          }
+
+          while (true) {
+            if (phase === 'reviewed') {
+              if (verdict === 'approve') break;
+              if (cycle >= maximumReviewCycles) {
+                throw new TerminalOperationError(
+                  `review still requires changes after ${maximumReviewCycles} remediation cycles`,
+                );
               }
-            : {}),
-          isCancelled: async () =>
-            (await coordinator.loadJob(input.jobId)).job.state === 'cancelled',
-          log: (message) => context.log(message),
-        });
-        renewer.assertHealthy();
-        if (lineageThreadId && result.threadId !== lineageThreadId) {
-          throw new TerminalOperationError(
-            `stage ${kind} returned unrelated thread ${result.threadId}; expected ${lineageThreadId}`,
+              cycle += 1;
+              phase = 'remediate';
+              continue;
+            }
+
+            if (phase === 'remediate') {
+              if (cycle > maximumReviewCycles) {
+                throw new TerminalOperationError(
+                  `review still requires changes after ${maximumReviewCycles} remediation cycles`,
+                );
+              }
+              const threadId = loopResult?.threadId ?? checkpointLineage ?? lineageThreadId;
+              if (!threadId) {
+                throw new TerminalOperationError('remediation stage has no Codex thread lineage');
+              }
+              const reviewBeforeRemediation = await enforceFactoryStageState({
+                coordinator,
+                lease,
+                stage: 'codex.review',
+                threadId,
+                workspaceRoot: stageInput.cwd,
+                allowLegacyReview: true,
+                log: (message) => context.log(message),
+              });
+              const verdictBeforeRemediation = factoryReviewVerdict(
+                reviewBeforeRemediation.state,
+              );
+              if (verdictBeforeRemediation === 'approve') {
+                loopResult ??= resultFromResumeCheckpoint(lease);
+                factoryState = reviewBeforeRemediation;
+                if (reviewBeforeRemediation.reviewGeneration > 0 &&
+                  reviewBeforeRemediation.reviewParentThreadId === threadId &&
+                  reviewBeforeRemediation.reviewParentTurnId) {
+                  verdict = 'approve';
+                  reviewCycles = Math.max(0, cycle - 1);
+                  break;
+                }
+                phase = 'review';
+              } else {
+                const remediationInput: CodexOperationInput = cycle === 1
+                  ? stageInput
+                  : {
+                      ...stageInput,
+                      prompt: repeatedRemediationPrompt(cycle),
+                      developerInstructions: developerInstructionsForStage(
+                        stageInput,
+                        kind,
+                        'codex.remediate',
+                      ),
+                      ...(loopResult?.workspaceRevision
+                        ? { workspaceRevision: loopResult.workspaceRevision }
+                        : {}),
+                    };
+                loopResult = await runCodexStage(
+                  'codex.remediate',
+                  remediationInput,
+                  threadId,
+                  {
+                    reviewLoopStep: 'remediation',
+                    reviewLoopCycle: cycle,
+                    factoryStateRevisionBefore: reviewBeforeRemediation.revision,
+                  },
+                  'codex.remediate.turn-completed',
+                );
+                factoryState = await enforceFactoryStageState({
+                  coordinator,
+                  lease,
+                  stage: 'codex.remediate',
+                  threadId: loopResult.threadId,
+                  workspaceRoot: stageInput.cwd,
+                  ...(loopResult.workspaceRevision
+                    ? { workspaceRevision: loopResult.workspaceRevision }
+                    : {}),
+                  minimumRevisionExclusive: reviewBeforeRemediation.revision,
+                  checkpointMetadata: {
+                    reviewLoopStep: 'remediation',
+                    reviewLoopCycle: cycle,
+                    factoryStateRevisionBefore: reviewBeforeRemediation.revision,
+                  },
+                  log: (message) => context.log(message),
+                });
+                await coordinator.saveCheckpoint({
+                  attemptId: lease.attempt.attemptId,
+                  kind: 'codex.remediate.cycle-remediated',
+                  payload: {
+                    stage: kind,
+                    phase: 'cycleRemediated',
+                    threadId: loopResult.threadId,
+                    cycle,
+                    stateRevision: factoryState.revision,
+                    factoryState: factoryState.state as unknown as JsonValue,
+                  },
+                  workspaceRoot: stageInput.cwd,
+                  ...(loopResult.workspaceRevision
+                    ? { workspaceRevision: loopResult.workspaceRevision }
+                    : {}),
+                });
+                phase = 'review';
+              }
+            } else {
+              loopResult ??= resultFromResumeCheckpoint(lease);
+              factoryState = await enforceFactoryStageState({
+                coordinator,
+                lease,
+                stage: 'codex.remediate',
+                threadId: loopResult.threadId,
+                workspaceRoot: stageInput.cwd,
+                ...('minimumRevisionExclusive' in resumed &&
+                  resumed.minimumRevisionExclusive !== undefined
+                  ? { minimumRevisionExclusive: resumed.minimumRevisionExclusive }
+                  : {}),
+                checkpointMetadata: {
+                  reviewLoopStep: 'remediation',
+                  reviewLoopCycle: cycle,
+                  ...('minimumRevisionExclusive' in resumed &&
+                    resumed.minimumRevisionExclusive !== undefined
+                    ? { factoryStateRevisionBefore: resumed.minimumRevisionExclusive }
+                    : {}),
+                },
+                log: (message) => context.log(message),
+              });
+            }
+
+            const reviewGenerationBefore = await currentFactoryReviewGeneration(
+              coordinator,
+              loopResult.threadId,
+            );
+            const reviewInput: CodexOperationInput = {
+              ...stageInput,
+              prompt: reReviewPrompt(cycle),
+              developerInstructions: developerInstructionsForStage(
+                stageInput,
+                kind,
+                'codex.review',
+              ),
+              ...(loopResult.workspaceRevision
+                ? { workspaceRevision: loopResult.workspaceRevision }
+                : {}),
+            };
+            loopResult = await runCodexStage(
+              'codex.review',
+              reviewInput,
+              loopResult.threadId,
+              {
+                reviewLoopStep: 'review',
+                reviewLoopCycle: cycle,
+                factoryReviewGenerationBefore: reviewGenerationBefore,
+              },
+            );
+            factoryState = await enforceFactoryStageState({
+              coordinator,
+              lease,
+              stage: 'codex.review',
+              threadId: loopResult.threadId,
+              workspaceRoot: stageInput.cwd,
+              ...(loopResult.workspaceRevision
+                ? { workspaceRevision: loopResult.workspaceRevision }
+                : {}),
+              minimumReviewGenerationExclusive: reviewGenerationBefore,
+              expectedReviewParentTurnId: loopResult.turnId ?? '',
+              checkpointMetadata: {
+                reviewLoopStep: 'review',
+                reviewLoopCycle: cycle,
+                factoryReviewGenerationBefore: reviewGenerationBefore,
+              },
+              log: (message) => context.log(message),
+            });
+            verdict = factoryReviewVerdict(factoryState.state);
+            reviewCycles = cycle;
+            await coordinator.saveCheckpoint({
+              attemptId: lease.attempt.attemptId,
+              kind: 'codex.remediate.cycle-reviewed',
+              payload: {
+                stage: kind,
+                phase: 'cycleReviewed',
+                threadId: loopResult.threadId,
+                cycle,
+                verdict,
+                stateRevision: factoryState.revision,
+                reviewGeneration: factoryState.reviewGeneration,
+                reviewTurnId: factoryState.reviewTurnId ?? null,
+                reviewParentTurnId: factoryState.reviewParentTurnId ?? null,
+                factoryState: factoryState.state as unknown as JsonValue,
+              },
+              workspaceRoot: stageInput.cwd,
+              ...(loopResult.workspaceRevision
+                ? { workspaceRevision: loopResult.workspaceRevision }
+                : {}),
+            });
+            phase = 'reviewed';
+          }
+
+          if (!loopResult || verdict !== 'approve') {
+            throw new TerminalOperationError('review/remediation loop ended without approval');
+          }
+          const approvedReviewTurnId = factoryState?.reviewTurnId;
+          const approvedReviewParentTurnId = factoryState?.reviewParentTurnId;
+          result = loopResult;
+          factoryState = await enforceFactoryStageState({
+            coordinator,
+            lease,
+            stage: 'codex.review',
+            threadId: result.threadId,
+            workspaceRoot: stageInput.cwd,
+            ...(result.workspaceRevision
+              ? { workspaceRevision: result.workspaceRevision }
+              : {}),
+            expectedReviewTurnId: approvedReviewTurnId ?? '',
+            expectedReviewParentTurnId: approvedReviewParentTurnId ?? '',
+            log: (message) => context.log(message),
+          });
+          verdict = factoryReviewVerdict(factoryState.state);
+          if (verdict !== 'approve') {
+            throw new TerminalOperationError(
+              `review/remediation loop cannot finalize with verdict ${verdict}`,
+            );
+          }
+          const completion = await coordinator.saveCheckpoint({
+            attemptId: lease.attempt.attemptId,
+            kind: `${kind}.completed`,
+            payload: {
+              stage: kind,
+              mode: 'normal',
+              phase: 'completed',
+              threadId: result.threadId,
+              turnStatus: 'completed',
+              reviewLoopComplete: true,
+              finalReviewVerdict: verdict,
+              reviewCycles,
+              reviewedStateRevision: factoryState.revision,
+              reviewedReviewGeneration: factoryState.reviewGeneration,
+              reviewedReviewTurnId: factoryState.reviewTurnId ?? null,
+              reviewedReviewParentTurnId: factoryState.reviewParentTurnId ?? null,
+              ...(result.turnId ? { turnId: result.turnId } : {}),
+              ...(result.turn ? { turn: result.turn as unknown as JsonValue } : {}),
+            },
+            workspaceRoot: stageInput.cwd,
+            ...(result.workspaceRevision
+              ? { workspaceRevision: result.workspaceRevision }
+              : {}),
+          });
+          await context.log(
+            `completed autonomous review/remediation loop after ${reviewCycles} re-review cycles as ${completion.checkpointId}`,
           );
         }
-        await enforceFactoryStageState({
-          coordinator,
-          lease,
-          stage: kind,
-          threadId: result.threadId,
-          workspaceRoot: stageInput.cwd,
-          ...(result.workspaceRevision
-            ? { workspaceRevision: result.workspaceRevision }
-            : {}),
-          log: (message) => context.log(message),
-        });
         if (integration) {
           await integration.stageCompleted({
             jobId: input.jobId,

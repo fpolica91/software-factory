@@ -15,55 +15,47 @@ const NOW = '2026-07-31T00:00:00.000Z';
 const ADAPTER_NAME = 'disposable-intake';
 const pluginModule = new URL('./fixtures/disposable-intake-plugin.mjs', import.meta.url).href;
 
-const factoryState = {
-  decomposition: {
-    revision: 1,
-    work_units: [
-      {
-        id: 'design',
-        title: 'Design',
-        description: 'Define the implementation.',
-        depends_on: [],
-      },
-      {
-        id: 'implement',
-        title: 'Implement',
-        description: 'Build the defined implementation.',
-        depends_on: ['design'],
-      },
-    ],
-  },
-  progress: {
-    work_units: [
-      { id: 'design', status: 'completed', progress_summary: 'Design complete.' },
-      { id: 'implement', status: 'completed', progress_summary: 'Implementation complete.' },
-    ],
-  },
-  review: {
-    verdict: 'request_changes',
-    summary: 'One finding requires remediation.',
-    findings: [
-      {
-        id: 'F1',
-        severity: 'minor',
-        unit_id: 'implement',
-        title: 'Clarify behavior',
-        evidence: 'The behavior needs one explicit note.',
-        recommendation: 'Add the note.',
-      },
-    ],
-  },
-  remediation: {
-    records: [
-      {
-        finding_id: 'F1',
-        disposition: 'resolved',
-        rationale: 'The note was added.',
-        unit_id: 'implement',
-      },
-    ],
-  },
-};
+function factoryState(threadId) {
+  return {
+    decomposition: {
+      revision: 1,
+      work_units: [
+        {
+          id: 'design',
+          title: 'Design',
+          description: 'Define the implementation.',
+          depends_on: [],
+        },
+        {
+          id: 'implement',
+          title: 'Implement',
+          description: 'Build the defined implementation.',
+          depends_on: ['design'],
+        },
+      ],
+    },
+    progress: {
+      work_units: [
+        { id: 'design', status: 'completed', progress_summary: 'Design complete.' },
+        { id: 'implement', status: 'completed', progress_summary: 'Implementation complete.' },
+      ],
+    },
+    review: {
+      generation: 2,
+      recorded_turn_id: `${threadId}-review-agent-turn`,
+      recorded_thread_id: `${threadId}-review-agent-thread`,
+      recorded_parent_thread_id: threadId,
+      recorded_parent_turn_id: `${threadId}-review-turn`,
+      recorded_subagent_kind: 'review',
+      verdict: 'approve',
+      summary: 'The independent review found no remaining issues.',
+      findings: [],
+    },
+    remediation: {
+      records: [],
+    },
+  };
+}
 
 class RecoveredCheckpointCoordinator {
   constructor(jobId, kinds, threadId) {
@@ -137,6 +129,24 @@ class RecoveredCheckpointCoordinator {
         phase: 'completed',
         threadId: this.threadId,
         turnStatus: 'completed',
+        ...(operation.kind === 'codex.review'
+          ? {
+              turnId: `${this.threadId}-review-turn`,
+              factoryReviewGenerationBefore: 1,
+            }
+          : {}),
+        ...(operation.kind === 'codex.remediate'
+          ? {
+              turnId: `${this.threadId}-review-turn`,
+              reviewLoopComplete: true,
+              finalReviewVerdict: 'approve',
+              reviewCycles: 0,
+              reviewedStateRevision: 1,
+              reviewedReviewGeneration: 2,
+              reviewedReviewTurnId: `${this.threadId}-review-agent-turn`,
+              reviewedReviewParentTurnId: `${this.threadId}-review-turn`,
+            }
+          : {}),
       },
       workspaceRoot: null,
       workspaceRevision: null,
@@ -176,7 +186,7 @@ class RecoveredCheckpointCoordinator {
     assert.equal(threadId, this.threadId);
     return {
       threadId,
-      state: structuredClone(factoryState),
+      state: structuredClone(factoryState(threadId)),
       revision: 1,
       createdAt: NOW,
       updatedAt: NOW,
