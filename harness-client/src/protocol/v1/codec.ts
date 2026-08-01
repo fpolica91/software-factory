@@ -806,7 +806,7 @@ function decodeCommandDecision(value: unknown, label: string): CommandApprovalDe
     return {
       acceptWithExecpolicyAmendment: {
         execpolicyAmendment: stringArray(
-          payload.execpolicyAmendment,
+          payload.execpolicyAmendment ?? payload.execpolicy_amendment,
           `${label}.acceptWithExecpolicyAmendment.execpolicyAmendment`,
         ),
       },
@@ -820,7 +820,7 @@ function decodeCommandDecision(value: unknown, label: string): CommandApprovalDe
     return {
       applyNetworkPolicyAmendment: {
         networkPolicyAmendment: decodeNetworkPolicyAmendment(
-          payload.networkPolicyAmendment,
+          payload.networkPolicyAmendment ?? payload.network_policy_amendment,
           `${label}.applyNetworkPolicyAmendment.networkPolicyAmendment`,
         ),
       },

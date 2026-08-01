@@ -16,14 +16,21 @@ plan:
 
 | Profile | Base URL |
 | --- | --- |
-| Coding Developer Plan (default) | `https://api.z.ai/api/coding/paas/v4` |
-| Standard applications and SDKs | `https://api.z.ai/api/paas/v4/` |
+| Standard applications and SDKs (default) | `https://api.z.ai/api/paas/v4` |
+| Coding Developer Plan | `https://api.z.ai/api/coding/paas/v4` |
 
 Both profiles use the exact model identifier `glm-5.2`. The documented key
 variable is `ZAI_API_KEY`; `FACTORY_ZAI_API_KEY_ENV` may point the bridge at a
 different variable for an advanced manual deployment. See Z.AI's
 [HTTP endpoint guide](https://docs.z.ai/guides/develop/http/introduction) and
 [OpenAI Python SDK guide](https://docs.z.ai/guides/develop/openai/python).
+
+Select Coding Developer Plan explicitly when that is the plan attached to the
+key:
+
+```sh
+FACTORY_ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4 factory configure --preset zai
+```
 
 The equivalent direct OpenAI Python SDK setup is:
 
@@ -33,7 +40,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key=os.environ["ZAI_API_KEY"],
-    base_url="https://api.z.ai/api/coding/paas/v4",
+    base_url="https://api.z.ai/api/paas/v4",
 )
 
 response = client.chat.completions.create(

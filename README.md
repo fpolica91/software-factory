@@ -88,9 +88,29 @@ factory run "Review this codebase"
 ```
 
 The preset asks for `ZAI_API_KEY`, generates its internal bridge token, and
-selects the Coding Developer Plan URL. See
-[`docs/providers/zai-glm-5.2.md`](docs/providers/zai-glm-5.2.md) for the
-standard API alternative and adapter details.
+selects the Standard API URL. Coding Developer Plan keys can select their
+endpoint explicitly in one line:
+
+```sh
+FACTORY_ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4 factory configure --preset zai
+```
+
+See [`docs/providers/zai-glm-5.2.md`](docs/providers/zai-glm-5.2.md) for
+adapter details.
+
+DeepSeek is a separate optional translated profile:
+
+```sh
+factory configure --preset deepseek
+factory run "Review this codebase"
+```
+
+The preset asks for `DEEPSEEK_API_KEY`, selects the official
+`https://api.deepseek.com` Chat endpoint, and persists `deepseek-v4-pro` as the
+model. The shared bridge translates Chat Completions to Responses while
+preserving Codex tool calls. See
+[`docs/providers/deepseek.md`](docs/providers/deepseek.md) for adapter and model
+override details.
 
 ## Durable Jobs and Workspaces
 
@@ -127,7 +147,8 @@ Job input overrides deployment defaults, and operation input is authoritative.
 
 | Profile | Services | Purpose |
 |---|---|---|
-| `zai` | provider bridge | Exact GLM-5.2 Coding Plan or standard API |
+| `zai` | provider bridge | Exact GLM-5.2 Standard API by default; Coding Plan by override |
+| `deepseek` | provider bridge | DeepSeek Chat translation with `deepseek-v4-pro` by default |
 | `coordination` | Redis | Optional coordination, cache, or pub/sub; never durable job state |
 | `artifacts` | MinIO | Optional S3-compatible build and run artifacts |
 | `local-models` | Ollama | Optional local model server |

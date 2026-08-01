@@ -31,10 +31,11 @@ use tokio::time::timeout;
 pub const BRIDGE_PACKAGE: &str = "@bitkyc08/opencodex";
 pub const BRIDGE_VERSION: &str = "2.8.0";
 pub const CODEX_PROVIDER_ID: &str = "factory-provider";
+pub const DEFAULT_UPSTREAM_PROVIDER: &str = "factory-zai";
 pub const DEFAULT_MODEL: &str = "glm-5.2";
-pub const STANDARD_UPSTREAM_BASE_URL: &str = "https://api.z.ai/api/paas/v4/";
+pub const STANDARD_UPSTREAM_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 pub const CODING_PLAN_UPSTREAM_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
-pub const DEFAULT_UPSTREAM_BASE_URL: &str = CODING_PLAN_UPSTREAM_BASE_URL;
+pub const DEFAULT_UPSTREAM_BASE_URL: &str = STANDARD_UPSTREAM_BASE_URL;
 pub const DEFAULT_API_KEY_ENV: &str = "ZAI_API_KEY";
 pub const DEFAULT_ADMISSION_TOKEN_ENV: &str = "FACTORY_PROVIDER_BRIDGE_TOKEN";
 pub const DEFAULT_CONTEXT_WINDOW: i64 = 1_000_000;
@@ -48,6 +49,7 @@ pub struct BridgeOptions {
     pub advertised_base_url: Option<String>,
     pub resource_dir: Option<PathBuf>,
     pub state_dir: PathBuf,
+    pub upstream_provider: String,
     pub model: String,
     pub upstream_base_url: String,
     pub api_key_env: String,
@@ -62,6 +64,7 @@ impl BridgeOptions {
             advertised_base_url: None,
             resource_dir: None,
             state_dir: state_dir.into(),
+            upstream_provider: DEFAULT_UPSTREAM_PROVIDER.to_string(),
             model: DEFAULT_MODEL.to_string(),
             upstream_base_url: DEFAULT_UPSTREAM_BASE_URL.to_string(),
             api_key_env: DEFAULT_API_KEY_ENV.to_string(),
@@ -80,7 +83,7 @@ impl BridgeOptions {
 pub struct CodexProviderSelection {
     pub model: String,
     pub model_provider: String,
-    pub model_catalog_json: PathBuf,
+    pub model_catalog_json: Option<PathBuf>,
     pub config: BTreeMap<String, Value>,
 }
 
@@ -88,11 +91,10 @@ impl CodexProviderSelection {
     pub fn for_bridge(
         base_url: impl Into<String>,
         model: impl Into<String>,
-        model_catalog_json: impl Into<PathBuf>,
+        model_catalog_json: Option<PathBuf>,
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let model = model.into();
-        let model_catalog_json = model_catalog_json.into();
         let mut config = BTreeMap::new();
         config.insert(
             format!("model_providers.{CODEX_PROVIDER_ID}"),
@@ -107,7 +109,9 @@ impl CodexProviderSelection {
                 }
             }),
         );
-        config.insert("model_catalog_json".to_string(), json!(model_catalog_json));
+        if let Some(model_catalog_json) = &model_catalog_json {
+            config.insert("model_catalog_json".to_string(), json!(model_catalog_json));
+        }
 
         Self {
             model,
@@ -275,8 +279,6 @@ pub enum BridgeError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("only model `{DEFAULT_MODEL}` is supported by the Z.AI profile, got `{0}`")]
-    UnsupportedModel(String),
     #[error("failed to serialize the Codex model catalog: {0}")]
     SerializeModelCatalog(#[source] serde_json::Error),
     #[error("failed to write Codex model catalog {path}: {source}")]
@@ -307,9 +309,6 @@ impl ProviderBridge {
     pub async fn start(options: BridgeOptions) -> Result<Self, BridgeError> {
         let bridge_dir = resolve_bridge_dir(options.resource_dir.as_deref())?;
         let bun = bridge_dir.join("node_modules/.bin/bun");
-        if options.model != DEFAULT_MODEL {
-            return Err(BridgeError::UnsupportedModel(options.model));
-        }
 
         tokio::fs::create_dir_all(&options.state_dir)
             .await
@@ -323,7 +322,13 @@ impl ProviderBridge {
                 path: options.state_dir.clone(),
                 source,
             })?;
-        let model_catalog_json = write_model_catalog(&state_dir).await?;
+        let model_catalog_json = if options.upstream_provider == DEFAULT_UPSTREAM_PROVIDER
+            && options.model == DEFAULT_MODEL
+        {
+            Some(write_model_catalog(&state_dir).await?)
+        } else {
+            None
+        };
 
         let mut command = Command::new(bun);
         command
@@ -336,8 +341,16 @@ impl ProviderBridge {
             .arg("--state-dir")
             .arg(&state_dir)
             .current_dir(&bridge_dir)
-            .env("FACTORY_ZAI_BASE_URL", &options.upstream_base_url)
-            .env("FACTORY_ZAI_API_KEY_ENV", &options.api_key_env)
+            .env("FACTORY_PROVIDER_UPSTREAM_ID", &options.upstream_provider)
+            .env("FACTORY_PROVIDER_UPSTREAM_MODEL", &options.model)
+            .env(
+                "FACTORY_PROVIDER_UPSTREAM_BASE_URL",
+                &options.upstream_base_url,
+            )
+            .env(
+                "FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV",
+                &options.api_key_env,
+            )
             .env("OPENCODEX_DEBUG", "0")
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -349,7 +362,7 @@ impl ProviderBridge {
             .advertised_base_url
             .unwrap_or_else(|| format!("http://127.0.0.1:{}/v1", options.port));
         let selection =
-            CodexProviderSelection::for_bridge(&endpoint, DEFAULT_MODEL, model_catalog_json);
+            CodexProviderSelection::for_bridge(&endpoint, options.model, model_catalog_json);
         let mut bridge = Self {
             child,
             selection,
@@ -434,3 +447,7 @@ impl Drop for ProviderBridge {
         let _ = self.child.start_kill();
     }
 }
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;

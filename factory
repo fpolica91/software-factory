@@ -3,6 +3,9 @@ set -euo pipefail
 
 readonly FACTORY_PROJECT_NAME='software-factory'
 readonly HATCHET_TENANT_ID='707d0855-80ab-4e1f-a156-f1c4546cbf52'
+readonly DEFAULT_ZAI_BASE_URL='https://api.z.ai/api/paas/v4'
+readonly DEFAULT_DEEPSEEK_BASE_URL='https://api.deepseek.com'
+readonly DEFAULT_DEEPSEEK_MODEL='deepseek-v4-pro'
 
 resolve_product_root() {
   local source_path=${BASH_SOURCE[0]}
@@ -81,6 +84,8 @@ Usage:
   factory configure              Configure a Responses-compatible model provider
   factory configure --show       Show active provider settings (never secret values)
   factory configure --preset zai Configure the optional Z.AI adapter
+  factory configure --preset deepseek
+                                 Configure the optional DeepSeek adapter
   factory attach <job-id>        Attach to a durable job
   factory status <job-id>        Show durable job and stage status
   factory logs                   Follow Factory service logs
@@ -191,14 +196,14 @@ value_is_blank() {
 
 PROVIDER_CONFIG_ERRORS=()
 validate_provider_configuration() {
-  local adapter provider base_url model authentication api_key bridge_token catalog
+  local adapter provider base_url model authentication api_key bridge_token catalog upstream_base_url
   PROVIDER_CONFIG_ERRORS=()
   adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
 
   if [[ -z "$adapter" ]]; then
     PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER is required")
-  elif [[ "$adapter" != responses && "$adapter" != zai ]]; then
-    PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER must be one of: responses, zai")
+  elif [[ "$adapter" != responses && "$adapter" != zai && "$adapter" != deepseek ]]; then
+    PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER must be one of: responses, zai, deepseek")
     return 1
   fi
 
@@ -253,6 +258,32 @@ validate_provider_configuration() {
       PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BRIDGE_TOKEN is required when FACTORY_PROVIDER_ADAPTER=zai")
     fi
     [[ "$catalog" == /var/lib/software-factory/provider/codex-models.json ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_CATALOG_JSON must be /var/lib/software-factory/provider/codex-models.json when FACTORY_PROVIDER_ADAPTER=zai")
+  elif [[ "$adapter" == deepseek ]]; then
+    provider=$(configured_value FACTORY_MODEL_PROVIDER)
+    base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
+    model=$(configured_value FACTORY_MODEL)
+    authentication=$(configured_value FACTORY_PROVIDER_AUTH)
+    api_key=$(configured_value DEEPSEEK_API_KEY)
+    bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
+    catalog=$(configured_value FACTORY_MODEL_CATALOG_JSON)
+    upstream_base_url=$(configured_value FACTORY_DEEPSEEK_BASE_URL)
+
+    [[ "$provider" == factory-provider ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_PROVIDER must be factory-provider when FACTORY_PROVIDER_ADAPTER=deepseek")
+    [[ "$base_url" == http://deepseek-provider:10101/v1 ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL must be http://deepseek-provider:10101/v1 when FACTORY_PROVIDER_ADAPTER=deepseek")
+    if value_is_blank "$model"; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL is required when FACTORY_PROVIDER_ADAPTER=deepseek")
+    elif [[ "$model" == *$'\n'* || "$model" == *$'\r'* ]]; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL must be a single line")
+    fi
+    [[ "$authentication" == bridge ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH must be bridge when FACTORY_PROVIDER_ADAPTER=deepseek")
+    if value_is_blank "$api_key"; then
+      PROVIDER_CONFIG_ERRORS+=("DEEPSEEK_API_KEY is required when FACTORY_PROVIDER_ADAPTER=deepseek")
+    fi
+    if value_is_blank "$bridge_token"; then
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BRIDGE_TOKEN is required when FACTORY_PROVIDER_ADAPTER=deepseek")
+    fi
+    value_is_blank "$catalog" || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_CATALOG_JSON must be empty when FACTORY_PROVIDER_ADAPTER=deepseek")
+    [[ "$upstream_base_url" == "$DEFAULT_DEEPSEEK_BASE_URL" ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_DEEPSEEK_BASE_URL must be $DEFAULT_DEEPSEEK_BASE_URL when FACTORY_PROVIDER_ADAPTER=deepseek")
   fi
 
   (( ${#PROVIDER_CONFIG_ERRORS[@]} == 0 ))
@@ -337,6 +368,7 @@ persist_responses_configuration() {
   write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN ''
   write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
   write_env_value ZAI_API_KEY ''
+  write_env_value DEEPSEEK_API_KEY ''
 }
 
 generate_bridge_token() {
@@ -344,10 +376,11 @@ generate_bridge_token() {
 }
 
 persist_zai_preset() {
-  local api_key bridge_token legacy_bridge_token
+  local api_key bridge_token legacy_bridge_token upstream_base_url
   api_key=$(configured_value ZAI_API_KEY)
   bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
   legacy_bridge_token=$(configured_value FACTORY_PROVIDER_AUTH_TOKEN)
+  upstream_base_url=${FACTORY_ZAI_BASE_URL-}
 
   if value_is_blank "$api_key"; then
     if [[ -t 0 && -t 2 ]]; then
@@ -366,6 +399,9 @@ persist_zai_preset() {
       bridge_token=$legacy_bridge_token
     fi
   fi
+  if value_is_blank "$upstream_base_url"; then
+    upstream_base_url=$DEFAULT_ZAI_BASE_URL
+  fi
 
   write_env_value FACTORY_PROVIDER_ADAPTER zai
   write_env_value FACTORY_MODEL_PROVIDER factory-provider
@@ -378,6 +414,47 @@ persist_zai_preset() {
   write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
   write_env_value FACTORY_MODEL_CATALOG_JSON /var/lib/software-factory/provider/codex-models.json
   write_env_value ZAI_API_KEY "$api_key"
+  write_env_value FACTORY_ZAI_BASE_URL "$upstream_base_url"
+  write_env_value DEEPSEEK_API_KEY ''
+}
+
+persist_deepseek_preset() {
+  local api_key bridge_token legacy_bridge_token
+  api_key=$(configured_value DEEPSEEK_API_KEY)
+  bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
+  legacy_bridge_token=$(configured_value FACTORY_PROVIDER_AUTH_TOKEN)
+
+  if value_is_blank "$api_key"; then
+    if [[ -t 0 && -t 2 ]]; then
+      prompt_secret 'DeepSeek API key'
+      api_key=$PROMPT_VALUE
+    else
+      PROVIDER_CONFIG_ERRORS=('DEEPSEEK_API_KEY is required for preset deepseek')
+      report_provider_configuration_errors
+      return 1
+    fi
+  fi
+  if value_is_blank "$bridge_token"; then
+    if value_is_blank "$legacy_bridge_token"; then
+      bridge_token=$(generate_bridge_token)
+    else
+      bridge_token=$legacy_bridge_token
+    fi
+  fi
+
+  write_env_value FACTORY_PROVIDER_ADAPTER deepseek
+  write_env_value FACTORY_MODEL_PROVIDER factory-provider
+  write_env_value FACTORY_PROVIDER_BASE_URL http://deepseek-provider:10101/v1
+  write_env_value FACTORY_PROVIDER_NAME 'DeepSeek provider'
+  write_env_value FACTORY_MODEL "$DEFAULT_DEEPSEEK_MODEL"
+  write_env_value FACTORY_PROVIDER_AUTH bridge
+  write_env_value FACTORY_PROVIDER_API_KEY ''
+  write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN "$bridge_token"
+  write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
+  write_env_value FACTORY_MODEL_CATALOG_JSON ''
+  write_env_value ZAI_API_KEY ''
+  write_env_value DEEPSEEK_API_KEY "$api_key"
+  write_env_value FACTORY_DEEPSEEK_BASE_URL "$DEFAULT_DEEPSEEK_BASE_URL"
 }
 
 resolve_provider_environment() {
@@ -397,9 +474,15 @@ resolve_provider_environment() {
     export FACTORY_PROVIDER_BRIDGE_TOKEN=''
     export FACTORY_PROVIDER_AUTH_TOKEN=''
     export ZAI_API_KEY=''
+    export DEEPSEEK_API_KEY=''
   elif [[ "$adapter" == zai ]]; then
     export FACTORY_PROVIDER_API_KEY=''
     export FACTORY_PROVIDER_AUTH_TOKEN=''
+    export DEEPSEEK_API_KEY=''
+  elif [[ "$adapter" == deepseek ]]; then
+    export FACTORY_PROVIDER_API_KEY=''
+    export FACTORY_PROVIDER_AUTH_TOKEN=''
+    export ZAI_API_KEY=''
   fi
 }
 
@@ -427,6 +510,9 @@ show_provider_configuration() {
   if [[ "$adapter" == zai ]]; then
     printf '  provider API key: %s\n' "$([[ -n "$(configured_value ZAI_API_KEY)" ]] && printf set || printf unset)"
     printf '  bridge token: %s\n' "$([[ -n "$bridge_key" ]] && printf set || printf unset)"
+  elif [[ "$adapter" == deepseek ]]; then
+    printf '  provider API key: %s\n' "$([[ -n "$(configured_value DEEPSEEK_API_KEY)" ]] && printf set || printf unset)"
+    printf '  bridge token: %s\n' "$([[ -n "$bridge_key" ]] && printf set || printf unset)"
   else
     printf '  provider API key: %s\n' "$([[ -n "$provider_key" ]] && printf set || printf unset)"
   fi
@@ -436,7 +522,7 @@ configure_command() {
   ensure_env_file
   case ${1-} in
     '')
-      (( $# == 0 )) || die 'usage: factory configure [--show | --preset zai]'
+      (( $# == 0 )) || die 'usage: factory configure [--show | --preset zai | --preset deepseek]'
       persist_responses_configuration
       ;;
     --show)
@@ -445,11 +531,15 @@ configure_command() {
       return
       ;;
     --preset)
-      [[ $# == 2 && ${2-} == zai ]] || die 'usage: factory configure --preset zai'
-      persist_zai_preset
+      [[ $# == 2 ]] || die 'usage: factory configure --preset <zai|deepseek>'
+      case ${2-} in
+        zai) persist_zai_preset ;;
+        deepseek) persist_deepseek_preset ;;
+        *) die 'usage: factory configure --preset <zai|deepseek>' ;;
+      esac
       ;;
     *)
-      die 'usage: factory configure [--show | --preset zai]'
+      die 'usage: factory configure [--show | --preset zai | --preset deepseek]'
       ;;
   esac
 
@@ -482,10 +572,12 @@ compose() {
 
 reconcile_provider_services() {
   local provider_adapter=$1
+  local inactive_services=()
 
-  if [[ "$provider_adapter" == responses ]]; then
-    compose --profile zai rm --stop --force zai-provider >/dev/null
-  fi
+  [[ "$provider_adapter" == zai ]] || inactive_services+=(zai-provider)
+  [[ "$provider_adapter" == deepseek ]] || inactive_services+=(deepseek-provider)
+  (( ${#inactive_services[@]} == 0 )) ||
+    compose --profile zai --profile deepseek rm --stop --force "${inactive_services[@]}" >/dev/null
 }
 
 bootstrap_hatchet_token() {
@@ -531,6 +623,9 @@ up_stack() {
   if [[ "$provider_adapter" == zai ]]; then
     profile=(--profile zai)
     services+=(zai-provider)
+  elif [[ "$provider_adapter" == deepseek ]]; then
+    profile=(--profile deepseek)
+    services+=(deepseek-provider)
   fi
 
   compose "${profile[@]}" up -d --wait --wait-timeout 180 \

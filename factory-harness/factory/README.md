@@ -14,10 +14,10 @@ extensions, and subagents.
 - `protocol/` owns the stable, versioned Factory Protocol V1 contract and its
   revision-pinned adapter to Codex app-server v2. Checked-in JSON Schema and
   TypeScript declarations expose only Factory-owned public types.
-- `providers/` owns model-provider protocol bridges. The initial GLM 5.2
-  profile supervises a pinned maintained Responses-to-Chat adapter and returns
-  the per-thread Codex provider configuration without changing Codex core or a
-  user's global Codex configuration.
+- `providers/` owns model-provider protocol bridges. The optional Z.AI and
+  DeepSeek profiles supervise one pinned maintained Responses-to-Chat adapter
+  and return per-thread Codex provider configuration without changing Codex
+  core or a user's global Codex configuration.
 - `coordinator/` owns the separate `factoryd` durable lifecycle. PostgreSQL
   stores jobs, operations, leased attempts, immutable runtime correlations,
   and append-only checkpoints; recovery claims link a new attempt to the

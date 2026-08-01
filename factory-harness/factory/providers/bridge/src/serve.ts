@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -16,14 +17,22 @@ if (!hostname) {
 }
 
 const stateDir = resolve(argument('--state-dir') ?? process.env.FACTORY_PROVIDER_STATE_DIR ?? '.state');
-const model = 'glm-5.2';
-const baseUrl = process.env.FACTORY_ZAI_BASE_URL ?? 'https://api.z.ai/api/coding/paas/v4';
-const apiKeyEnv = process.env.FACTORY_ZAI_API_KEY_ENV ?? 'ZAI_API_KEY';
+const upstreamProvider = process.env.FACTORY_PROVIDER_UPSTREAM_ID ?? 'factory-zai';
+if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/.test(upstreamProvider)) {
+  throw new Error('FACTORY_PROVIDER_UPSTREAM_ID must be a valid OpenCodex provider ID');
+}
+const model = process.env.FACTORY_PROVIDER_UPSTREAM_MODEL?.trim() ?? 'glm-5.2';
+if (!model || model.includes('\n') || model.includes('\r')) {
+  throw new Error('FACTORY_PROVIDER_UPSTREAM_MODEL must be a non-empty single-line model ID');
+}
+const baseUrl = (process.env.FACTORY_PROVIDER_UPSTREAM_BASE_URL ??
+  'https://api.z.ai/api/paas/v4').replace(/\/+$/, '');
+const apiKeyEnv = process.env.FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV ?? 'ZAI_API_KEY';
 if (!/^[A-Z_][A-Z0-9_]*$/.test(apiKeyEnv)) {
-  throw new Error('FACTORY_ZAI_API_KEY_ENV must name an environment variable');
+  throw new Error('FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV must name an environment variable');
 }
 if (!process.env[apiKeyEnv]) {
-  throw new Error(`${apiKeyEnv} is required to start the Z.AI provider bridge`);
+  throw new Error(`${apiKeyEnv} is required to start the provider bridge`);
 }
 const admissionToken = process.env.FACTORY_PROVIDER_BRIDGE_TOKEN?.trim();
 if (hostname !== '127.0.0.1' && hostname !== 'localhost' && !admissionToken) {
@@ -33,15 +42,19 @@ if (admissionToken) {
   process.env.OPENCODEX_API_AUTH_TOKEN = admissionToken;
 }
 
-mkdirSync(stateDir, { recursive: true });
-process.env.OPENCODEX_HOME = stateDir;
+const configurationHash = createHash('sha256')
+  .update(JSON.stringify({ upstreamProvider, model, baseUrl }))
+  .digest('hex');
+const openCodexHome = resolve(stateDir, 'opencodex', configurationHash);
+mkdirSync(openCodexHome, { recursive: true });
+process.env.OPENCODEX_HOME = openCodexHome;
 
 const config = {
   port,
   hostname,
-  defaultProvider: 'factory-zai',
+  defaultProvider: upstreamProvider,
   providers: {
-    'factory-zai': {
+    [upstreamProvider]: {
       adapter: 'openai-chat',
       baseUrl,
       authMode: 'key',
@@ -50,11 +63,13 @@ const config = {
       models: [model],
       selectedModels: [model],
       liveModels: false,
-      modelContextWindows: { [model]: 1_000_000 },
-      modelSuffixBracketStrip: true,
-      noVisionModels: [model],
-      modelReasoningEfforts: { [model]: ['low', 'medium', 'high', 'xhigh', 'max'] },
-      preserveReasoningContentModels: [model]
+      ...(upstreamProvider === 'factory-zai' ? {
+        modelContextWindows: { [model]: 1_000_000 },
+        modelSuffixBracketStrip: true,
+        noVisionModels: [model],
+        modelReasoningEfforts: { [model]: ['low', 'medium', 'high', 'xhigh', 'max'] },
+        preserveReasoningContentModels: [model]
+      } : {})
     }
   },
   websockets: false,
@@ -65,7 +80,7 @@ const config = {
   syncResumeHistory: false
 };
 
-writeFileSync(resolve(stateDir, 'config.json'), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+writeFileSync(resolve(openCodexHome, 'config.json'), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 
 const { startServer } = await import('@bitkyc08/opencodex');
 const server = startServer(port);

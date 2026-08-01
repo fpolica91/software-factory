@@ -174,13 +174,19 @@ lifecycle and trace data to Langfuse/ClickHouse through that profile. Model API
 calls, explicit tool traffic, and explicitly configured Factory observability
 are distinct from unintended Codex export.
 
-The optional GLM adapter is the MIT-licensed `@bitkyc08/opencodex` 2.8.0 public
+The optional translation adapters use the MIT-licensed `@bitkyc08/opencodex`
+2.8.0 public
 `startServer()` API, supervised as an isolated Bun sidecar and pinned through
 the package lock. Factory never invokes its CLI or lets it rewrite a user's
-Codex configuration. The explicit `zai` preset targets Z.AI's Coding Developer
-Plan at `https://api.z.ai/api/coding/paas/v4`; its standard API alternative is
-`https://api.z.ai/api/paas/v4/`. Both select `glm-5.2` behind the same generic
-Codex Responses provider boundary. Neither Z.AI nor GLM is a product default.
+Codex configuration. The explicit `zai` preset targets Z.AI's Standard API at
+`https://api.z.ai/api/paas/v4`; Coding Developer Plan is an explicit override at
+`https://api.z.ai/api/coding/paas/v4`. Both select `glm-5.2` behind the same
+generic Codex Responses provider boundary. The separate `deepseek` preset uses
+DeepSeek's official OpenAI-compatible Chat base at `https://api.deepseek.com`
+and selects `deepseek-v4-pro`. It relies on Codex fallback model metadata rather
+than inventing a downstream catalog; OpenCodex preserves translated tool calls
+and the provider's model-specific reasoning history. Neither optional provider
+is a product default, and their sidecars use separate state volumes.
 
 Acceptance on 2026-07-31 proved a hidden-value round trip through five
 successful Codex shell-tool executions across two GLM turns, explicit

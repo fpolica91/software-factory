@@ -195,7 +195,10 @@ services:
       FACTORY_PROVIDER_RESOURCE_DIR: /usr/local/lib/software-factory/provider-bridge
       FACTORY_PROVIDER_STATE_DIR: /var/lib/software-factory/provider
       FACTORY_PROVIDER_BRIDGE_TOKEN: ${FACTORY_PROVIDER_BRIDGE_TOKEN:-}
-      FACTORY_ZAI_BASE_URL: ${FACTORY_ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4}
+      FACTORY_PROVIDER_UPSTREAM_ID: factory-zai
+      FACTORY_PROVIDER_UPSTREAM_MODEL: glm-5.2
+      FACTORY_PROVIDER_UPSTREAM_BASE_URL: ${FACTORY_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}
+      FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV: ZAI_API_KEY
       DO_NOT_TRACK: "1"
       OTEL_SDK_DISABLED: "true"
     entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
@@ -204,6 +207,43 @@ services:
       - provider-state:/var/lib/software-factory/provider
     ports:
       - "${FACTORY_PROVIDER_PORT:-10101}:10101"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:10101/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  deepseek-provider:
+    <<: *factory-image
+    profiles: [deepseek]
+    restart: unless-stopped
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      FACTORY_RUN_AS_UID: ${FACTORY_RUN_AS_UID:-}
+      FACTORY_RUN_AS_GID: ${FACTORY_RUN_AS_GID:-}
+      FACTORY_PROVIDER_STATE_WRITABLE: "1"
+      FACTORY_PROVIDER_PORT: "10101"
+      FACTORY_PROVIDER_BIND_HOST: 0.0.0.0
+      FACTORY_PROVIDER_ADVERTISED_URL: http://deepseek-provider:10101/v1
+      FACTORY_PROVIDER_RESOURCE_DIR: /usr/local/lib/software-factory/provider-bridge
+      FACTORY_PROVIDER_STATE_DIR: /var/lib/software-factory/provider
+      FACTORY_PROVIDER_BRIDGE_TOKEN: ${FACTORY_PROVIDER_BRIDGE_TOKEN:-}
+      FACTORY_PROVIDER_UPSTREAM_ID: deepseek
+      FACTORY_PROVIDER_UPSTREAM_MODEL: ${FACTORY_MODEL:-deepseek-v4-pro}
+      FACTORY_PROVIDER_UPSTREAM_BASE_URL: ${FACTORY_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV: DEEPSEEK_API_KEY
+      DO_NOT_TRACK: "1"
+      OTEL_SDK_DISABLED: "true"
+    entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
+    command: ["factory-provider-bridge"]
+    volumes:
+      - deepseek-provider-state:/var/lib/software-factory/provider
+    ports:
+      - "${DEEPSEEK_PROVIDER_PORT:-10102}:10101"
     healthcheck:
       test:
         - CMD
@@ -363,6 +403,7 @@ volumes:
   workspaces:
   codex-state:
   provider-state:
+  deepseek-provider-state:
   coordination-redis-data:
   artifact-data:
   ollama-data:

@@ -23,10 +23,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(resource_dir) = std::env::var_os("FACTORY_PROVIDER_RESOURCE_DIR") {
         options.resource_dir = Some(PathBuf::from(resource_dir));
     }
-    if let Ok(base_url) = std::env::var("FACTORY_ZAI_BASE_URL") {
+    if let Ok(upstream_provider) = std::env::var("FACTORY_PROVIDER_UPSTREAM_ID") {
+        options.upstream_provider = upstream_provider;
+    }
+    if let Ok(model) = std::env::var("FACTORY_PROVIDER_UPSTREAM_MODEL") {
+        options.model = model;
+    }
+    if let Ok(base_url) = std::env::var("FACTORY_PROVIDER_UPSTREAM_BASE_URL")
+        .or_else(|_| std::env::var("FACTORY_ZAI_BASE_URL"))
+    {
         options.upstream_base_url = base_url;
     }
-    if let Ok(api_key_env) = std::env::var("FACTORY_ZAI_API_KEY_ENV") {
+    if let Ok(api_key_env) = std::env::var("FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV")
+        .or_else(|_| std::env::var("FACTORY_ZAI_API_KEY_ENV"))
+    {
         options.api_key_env = api_key_env;
     }
 
