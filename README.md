@@ -14,26 +14,29 @@ connects the runtime memory extension to Qdrant by default; `.env` can override
 
 ## Quick Start
 
-Requirements are Docker Engine with Compose and enough resources to build the
-Rust harness. No host agent CLI, database, Node, or Rust installation is
-required.
+Requirements are Docker Engine with Compose. Allocate at least 4 GB to Docker
+for the baseline stack; 8 GB leaves comfortable headroom for active jobs. No
+host agent CLI, database, Node, Rust toolchain, or local image build is required.
 
 ```sh
 git clone https://github.com/fpolica91/software-factory.git
 cd software-factory
-./factory configure
 ./factory install
 cd /path/to/your/project
-factory run "Review this codebase and explain its architecture"
+factory
 ```
 
-`./factory configure` asks for a provider ID, Responses API base URL, model,
-authentication mode, and API key. Installation then creates a symlink in
-`~/.local/bin`; add that directory to `PATH` if the command reports it is
-missing. From any Git repository, `factory run` builds the image when needed,
-starts the durable services, mounts that repository, submits the task, and
-attaches to its live output. Running `factory run` without saved provider configuration
-opens the same neutral configuration prompts when a terminal is available.
+The first interactive run asks for a provider, API key, model, and task.
+Installation creates a symlink in `~/.local/bin`; add that directory to `PATH`
+if the command reports it is missing. From any Git repository, `factory run`
+pulls the prebuilt image, starts the durable services, mounts that repository,
+submits the task, and attaches to its live output.
+
+The same public image, `ghcr.io/fpolica91/software-factory:edge`, runs
+`factoryd`, the workflow worker, and the selected provider bridge. It is
+published for both AMD64 and ARM64, and Docker stores the shared image layers
+only once. `factory build` is an explicit maintainer fallback; normal users
+never compile the Rust/Codex harness.
 
 Jobs are autonomous by default. Codex may execute repository tools without
 command approvals, and Factory resolves model clarification requests without
@@ -169,9 +172,12 @@ as Factory coordination or artifact stores.
 ```sh
 factory up                                    # start or repair the local stack
 factory logs                                  # follow Factory service logs
-factory build                                 # rebuild the shared image
+factory build                                 # maintainers: build a local image
 factory down                                  # stop services; preserve job data
 ```
+
+Local builds cap Cargo at two parallel jobs by default. Maintainers with a
+tighter memory limit can run `FACTORY_BUILD_JOBS=1 factory build`.
 
 - `factory-harness/factory/` contains the Rust runtime, coordinator, protocol,
   extension seam, and provider bridge.

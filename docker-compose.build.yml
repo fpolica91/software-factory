@@ -1,0 +1,8 @@
+services:
+  workflow-worker:
+    build:
+      context: .
+      args:
+        RUST_VERSION: 1.95.0
+        NODE_VERSION: 22.22.2
+        CARGO_BUILD_JOBS: ${FACTORY_BUILD_JOBS:-2}

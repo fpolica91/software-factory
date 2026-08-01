@@ -2,8 +2,10 @@
 
 ARG RUST_VERSION=1.95.0
 ARG NODE_VERSION=22.22.2
+ARG CARGO_BUILD_JOBS=2
 
 FROM rust:${RUST_VERSION}-bookworm AS rust-builder
+ARG CARGO_BUILD_JOBS
 WORKDIR /build
 COPY factory-harness/codex-rs/ factory-harness/codex-rs/
 COPY factory-harness/factory/ factory-harness/factory/
@@ -17,10 +19,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       --manifest-path factory-harness/factory/Cargo.toml \
       --workspace \
       --bins \
+      --jobs "${CARGO_BUILD_JOBS}" \
     && mkdir -p /out \
     && cp factory-harness/factory/target/release/factory-runtime /out/ \
     && cp factory-harness/factory/target/release/factoryd /out/ \
-    && cp factory-harness/factory/target/release/factory-provider-bridge /out/
+    && cp factory-harness/factory/target/release/factory-provider-bridge /out/ \
+    && strip --strip-unneeded \
+      /out/factory-runtime \
+      /out/factoryd \
+      /out/factory-provider-bridge
 
 FROM node:${NODE_VERSION}-bookworm-slim AS node-builder
 WORKDIR /build
@@ -46,10 +53,14 @@ FROM node:${NODE_VERSION}-bookworm-slim AS provider-builder
 WORKDIR /provider-bridge
 COPY factory-harness/factory/providers/bridge/package.json \
     factory-harness/factory/providers/bridge/package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev \
+    && rm -rf node_modules/@oven
 COPY factory-harness/factory/providers/bridge/src/ src/
 
 FROM node:${NODE_VERSION}-bookworm-slim AS factory
+LABEL org.opencontainers.image.source="https://github.com/fpolica91/software-factory" \
+    org.opencontainers.image.title="Software Factory" \
+    org.opencontainers.image.description="Durable autonomous software work on the native Codex harness"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*

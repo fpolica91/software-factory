@@ -2,8 +2,12 @@
 **/.git
 **/target
 **/node_modules
+**/dist
 **/.venv
 **/.cache
+**/.ruff_cache
+**/.pytest_cache
+**/coverage
 .env
 .env.*
 !.env.example

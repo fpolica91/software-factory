@@ -3,6 +3,11 @@ set -euo pipefail
 
 readonly FACTORY_PROJECT_NAME='software-factory'
 readonly HATCHET_TENANT_ID='707d0855-80ab-4e1f-a156-f1c4546cbf52'
+readonly DEFAULT_FACTORY_IMAGE='ghcr.io/fpolica91/software-factory:edge'
+readonly DEFAULT_OPENAI_BASE_URL='https://api.openai.com/v1'
+readonly DEFAULT_OPENAI_MODEL='gpt-5.6-sol'
+readonly DEFAULT_CLAUDE_BASE_URL='https://api.anthropic.com'
+readonly DEFAULT_CLAUDE_MODEL='claude-sonnet-5'
 readonly DEFAULT_ZAI_BASE_URL='https://api.z.ai/api/paas/v4'
 readonly DEFAULT_DEEPSEEK_BASE_URL='https://api.deepseek.com'
 readonly DEFAULT_DEEPSEEK_MODEL='deepseek-v4-pro'
@@ -12,8 +17,8 @@ resolve_product_root() {
   local source_dir link_target
 
   while [[ -L "$source_path" ]]; do
-    source_dir=$(cd -P -- "$(dirname -- "$source_path")" && pwd)
-    link_target=$(readlink -- "$source_path")
+    source_dir=$(cd -P "$(dirname "$source_path")" && pwd)
+    link_target=$(readlink "$source_path")
     if [[ "$link_target" == /* ]]; then
       source_path=$link_target
     else
@@ -21,7 +26,7 @@ resolve_product_root() {
     fi
   done
 
-  cd -P -- "$(dirname -- "$source_path")" && pwd
+  cd -P "$(dirname "$source_path")" && pwd
 }
 
 find_project_dir() {
@@ -30,7 +35,7 @@ find_project_dir() {
 
   if command -v git >/dev/null 2>&1; then
     if git_root=$(git -C "$start" rev-parse --show-toplevel 2>/dev/null); then
-      cd -P -- "$git_root" && pwd
+      cd -P "$git_root" && pwd
       return
     fi
   fi
@@ -52,6 +57,7 @@ find_project_dir() {
 
 readonly PRODUCT_ROOT=$(resolve_product_root)
 readonly COMPOSE_FILE=$PRODUCT_ROOT/docker-compose.yml
+readonly BUILD_COMPOSE_FILE=$PRODUCT_ROOT/docker-compose.build.yml
 readonly ENV_FILE=$PRODUCT_ROOT/.env
 readonly ENV_EXAMPLE=$PRODUCT_ROOT/.env.example
 readonly PROJECT_DIR=$(find_project_dir)
@@ -80,25 +86,30 @@ usage() {
 Software Factory CLI
 
 Usage:
-  factory run [--detach] <task>  Run any task against the current Git repository
-  factory configure              Configure a Responses-compatible model provider
+  factory                         Onboard if needed, then ask what Factory should do
+  factory run [--detach] [task]   Run a task against the current Git repository
+  factory configure              Choose provider, API key, and model
   factory configure --show       Show active provider settings (never secret values)
-  factory configure --preset zai Configure the optional Z.AI adapter
-  factory configure --preset deepseek
-                                 Configure the optional DeepSeek adapter
+  factory provider [name]        Select or switch provider
+  factory provider list          List supported providers
+  factory model [model-id]       Select or switch the active model
+  factory model list             List models for the active provider
   factory attach <job-id>        Attach to a durable job
   factory status <job-id>        Show durable job and stage status
   factory logs                   Follow Factory service logs
   factory stop <job-id>          Stop a durable job
   factory up                     Start the local Factory stack
   factory down                   Stop the stack and preserve all durable data
-  factory build                  Build the Factory image
+  factory build                  Build the Factory image locally (maintainers)
   factory install                Install `factory` in ~/.local/bin
   factory help                   Show this help
 
 Examples:
+  factory
   factory run "implement authentication"
   factory run --detach "review this codebase"
+  factory provider zai
+  factory model glm-5.2
   factory attach JOB_ID
 EOF
 }
@@ -108,16 +119,16 @@ install_cli() {
   local target=$install_dir/factory
   local expected=$PRODUCT_ROOT/factory
 
-  mkdir -p -- "$install_dir"
+  mkdir -p "$install_dir"
   if [[ -L "$target" ]]; then
-    if [[ "$(readlink -- "$target")" == "$expected" ]]; then
+    if [[ "$(readlink "$target")" == "$expected" ]]; then
       printf 'factory is already installed at %s\n' "$target"
       return
     fi
     die "$target is already a symlink to a different file"
   fi
   [[ ! -e "$target" ]] || die "$target already exists"
-  ln -s -- "$expected" "$target"
+  ln -s "$expected" "$target"
   printf 'Installed factory at %s\n' "$target"
   case ":$PATH:" in
     *":$install_dir:"*) ;;
@@ -126,10 +137,20 @@ install_cli() {
 }
 
 ensure_env_file() {
-  [[ -f "$ENV_FILE" ]] && return
-  [[ -f "$ENV_EXAMPLE" ]] || die "missing $ENV_EXAMPLE"
-  cp -- "$ENV_EXAMPLE" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
+  local existing_image
+  if [[ ! -f "$ENV_FILE" ]]; then
+    [[ -f "$ENV_EXAMPLE" ]] || die "missing $ENV_EXAMPLE"
+    cp "$ENV_EXAMPLE" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
+
+  if [[ -z ${FACTORY_IMAGE+x} ]]; then
+    existing_image=$(env_file_value FACTORY_IMAGE)
+    if [[ "$existing_image" == software-factory:local ]]; then
+      write_env_value FACTORY_IMAGE "$DEFAULT_FACTORY_IMAGE"
+      printf 'Updated Factory to use the prebuilt image %s\n' "$DEFAULT_FACTORY_IMAGE" >&2
+    fi
+  fi
 }
 
 env_file_value() {
@@ -179,7 +200,7 @@ write_env_value() {
     printf '\n%s=%s\n' "$key" "$value" >> "$temporary"
   fi
   chmod 600 "$temporary"
-  mv -- "$temporary" "$ENV_FILE"
+  mv "$temporary" "$ENV_FILE"
 }
 
 require_docker() {
@@ -196,18 +217,19 @@ value_is_blank() {
 
 PROVIDER_CONFIG_ERRORS=()
 validate_provider_configuration() {
-  local adapter provider base_url model authentication api_key bridge_token catalog upstream_base_url
+  local adapter provider base_url model authentication api_key bridge_token catalog upstream_base_url scoped_api_key
   PROVIDER_CONFIG_ERRORS=()
   adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
 
   if [[ -z "$adapter" ]]; then
     PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER is required")
-  elif [[ "$adapter" != responses && "$adapter" != zai && "$adapter" != deepseek ]]; then
-    PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER must be one of: responses, zai, deepseek")
+  elif [[ "$adapter" != openai && "$adapter" != responses && "$adapter" != claude &&
+          "$adapter" != zai && "$adapter" != deepseek ]]; then
+    PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_ADAPTER must be one of: openai, claude, deepseek, zai, responses")
     return 1
   fi
 
-  if [[ -z "$adapter" || "$adapter" == responses ]]; then
+  if [[ -z "$adapter" || "$adapter" == responses || "$adapter" == openai ]]; then
     provider=$(configured_value FACTORY_MODEL_PROVIDER)
     base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
     model=$(configured_value FACTORY_MODEL)
@@ -234,10 +256,32 @@ validate_provider_configuration() {
     if [[ -z "$authentication" ]]; then
       PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH is required")
     elif [[ "$authentication" != key && "$authentication" != none ]]; then
-      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH must be one of: key, none when FACTORY_PROVIDER_ADAPTER=responses")
+      PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH must be one of: key, none for a direct Responses provider")
     elif [[ "$authentication" == key ]] && value_is_blank "$api_key"; then
       PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_API_KEY is required when FACTORY_PROVIDER_AUTH=key")
     fi
+    if [[ "$adapter" == openai ]]; then
+      scoped_api_key=$(configured_value OPENAI_API_KEY)
+      [[ "$provider" == factory-openai ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_PROVIDER must be factory-openai when FACTORY_PROVIDER_ADAPTER=openai")
+      [[ "$base_url" == "$DEFAULT_OPENAI_BASE_URL" ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL must be $DEFAULT_OPENAI_BASE_URL when FACTORY_PROVIDER_ADAPTER=openai")
+      value_is_blank "$scoped_api_key" && PROVIDER_CONFIG_ERRORS+=("OPENAI_API_KEY is required when FACTORY_PROVIDER_ADAPTER=openai")
+    fi
+  elif [[ "$adapter" == claude ]]; then
+    provider=$(configured_value FACTORY_MODEL_PROVIDER)
+    base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
+    model=$(configured_value FACTORY_MODEL)
+    authentication=$(configured_value FACTORY_PROVIDER_AUTH)
+    api_key=$(configured_value ANTHROPIC_API_KEY)
+    bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
+    catalog=$(configured_value FACTORY_MODEL_CATALOG_JSON)
+
+    [[ "$provider" == factory-provider ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_PROVIDER must be factory-provider when FACTORY_PROVIDER_ADAPTER=claude")
+    [[ "$base_url" == http://claude-provider:10101/v1 ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL must be http://claude-provider:10101/v1 when FACTORY_PROVIDER_ADAPTER=claude")
+    value_is_blank "$model" && PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL is required when FACTORY_PROVIDER_ADAPTER=claude")
+    [[ "$authentication" == bridge ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH must be bridge when FACTORY_PROVIDER_ADAPTER=claude")
+    value_is_blank "$api_key" && PROVIDER_CONFIG_ERRORS+=("ANTHROPIC_API_KEY is required when FACTORY_PROVIDER_ADAPTER=claude")
+    value_is_blank "$bridge_token" && PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BRIDGE_TOKEN is required when FACTORY_PROVIDER_ADAPTER=claude")
+    value_is_blank "$catalog" || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_CATALOG_JSON must be empty when FACTORY_PROVIDER_ADAPTER=claude")
   elif [[ "$adapter" == zai ]]; then
     provider=$(configured_value FACTORY_MODEL_PROVIDER)
     base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
@@ -249,7 +293,7 @@ validate_provider_configuration() {
 
     [[ "$provider" == factory-provider ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_PROVIDER must be factory-provider when FACTORY_PROVIDER_ADAPTER=zai")
     [[ "$base_url" == http://zai-provider:10101/v1 ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BASE_URL must be http://zai-provider:10101/v1 when FACTORY_PROVIDER_ADAPTER=zai")
-    [[ "$model" == glm-5.2 ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL must be glm-5.2 when FACTORY_PROVIDER_ADAPTER=zai")
+    value_is_blank "$model" && PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL is required when FACTORY_PROVIDER_ADAPTER=zai")
     [[ "$authentication" == bridge ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_AUTH must be bridge when FACTORY_PROVIDER_ADAPTER=zai")
     if value_is_blank "$api_key"; then
       PROVIDER_CONFIG_ERRORS+=("ZAI_API_KEY is required when FACTORY_PROVIDER_ADAPTER=zai")
@@ -257,7 +301,11 @@ validate_provider_configuration() {
     if value_is_blank "$bridge_token"; then
       PROVIDER_CONFIG_ERRORS+=("FACTORY_PROVIDER_BRIDGE_TOKEN is required when FACTORY_PROVIDER_ADAPTER=zai")
     fi
-    [[ "$catalog" == /var/lib/software-factory/provider/codex-models.json ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_CATALOG_JSON must be /var/lib/software-factory/provider/codex-models.json when FACTORY_PROVIDER_ADAPTER=zai")
+    if [[ "$model" == glm-5.2 ]]; then
+      [[ "$catalog" == /var/lib/software-factory/provider/codex-models.json ]] || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_CATALOG_JSON must be /var/lib/software-factory/provider/codex-models.json for Z.AI glm-5.2")
+    else
+      value_is_blank "$catalog" || PROVIDER_CONFIG_ERRORS+=("FACTORY_MODEL_CATALOG_JSON must be empty for custom Z.AI models")
+    fi
   elif [[ "$adapter" == deepseek ]]; then
     provider=$(configured_value FACTORY_MODEL_PROVIDER)
     base_url=$(configured_value FACTORY_PROVIDER_BASE_URL)
@@ -322,6 +370,249 @@ prompt_secret() {
   printf '\n' >&2
 }
 
+provider_label() {
+  case $1 in
+    openai) PROMPT_VALUE='OpenAI' ;;
+    claude) PROMPT_VALUE='Anthropic Claude' ;;
+    deepseek) PROMPT_VALUE='DeepSeek' ;;
+    zai) PROMPT_VALUE='Z.AI' ;;
+    responses) PROMPT_VALUE='Custom Responses endpoint' ;;
+    *) die "unknown provider: $1" ;;
+  esac
+}
+
+provider_key_name() {
+  case $1 in
+    openai) PROMPT_VALUE='OPENAI_API_KEY' ;;
+    claude) PROMPT_VALUE='ANTHROPIC_API_KEY' ;;
+    deepseek) PROMPT_VALUE='DEEPSEEK_API_KEY' ;;
+    zai) PROMPT_VALUE='ZAI_API_KEY' ;;
+    *) die "unknown provider: $1" ;;
+  esac
+}
+
+provider_default_model() {
+  case $1 in
+    openai) PROMPT_VALUE=$DEFAULT_OPENAI_MODEL ;;
+    claude) PROMPT_VALUE=$DEFAULT_CLAUDE_MODEL ;;
+    deepseek) PROMPT_VALUE=$DEFAULT_DEEPSEEK_MODEL ;;
+    zai) PROMPT_VALUE='glm-5.2' ;;
+    *) die "unknown provider: $1" ;;
+  esac
+}
+
+MODEL_OPTIONS=()
+load_model_options() {
+  case $1 in
+    openai)
+      MODEL_OPTIONS=('gpt-5.6-sol' 'gpt-5.6' 'gpt-5.6-terra' 'gpt-5.6-luna')
+      ;;
+    claude)
+      MODEL_OPTIONS=('claude-sonnet-5' 'claude-opus-5' 'claude-fable-5' 'claude-haiku-4-5')
+      ;;
+    deepseek)
+      MODEL_OPTIONS=('deepseek-v4-pro' 'deepseek-v4-flash')
+      ;;
+    zai)
+      MODEL_OPTIONS=('glm-5.2')
+      ;;
+    *)
+      die "unknown provider: $1"
+      ;;
+  esac
+}
+
+list_providers() {
+  cat <<'EOF'
+Supported providers:
+  openai    OpenAI
+  claude    Anthropic Claude
+  deepseek  DeepSeek
+  zai       Z.AI
+EOF
+}
+
+normalize_provider() {
+  case ${1-} in
+    1 | openai | OpenAI) PROMPT_VALUE='openai' ;;
+    2 | claude | Claude | anthropic | Anthropic) PROMPT_VALUE='claude' ;;
+    3 | deepseek | DeepSeek) PROMPT_VALUE='deepseek' ;;
+    4 | zai | ZAI | z.ai | Z.AI) PROMPT_VALUE='zai' ;;
+    *) return 1 ;;
+  esac
+}
+
+prompt_provider_selection() {
+  local current=${1-} answer default_provider
+  default_provider=$current
+  normalize_provider "$default_provider" >/dev/null 2>&1 || default_provider='openai'
+
+  printf 'Choose a provider:\n' >&2
+  printf '  1) OpenAI\n' >&2
+  printf '  2) Anthropic Claude\n' >&2
+  printf '  3) DeepSeek\n' >&2
+  printf '  4) Z.AI\n' >&2
+  read -r -p "Provider [$default_provider]: " answer || die 'provider configuration cancelled'
+  answer=${answer:-$default_provider}
+  normalize_provider "$answer" || die 'choose OpenAI, Claude, DeepSeek, or Z.AI'
+}
+
+list_models() {
+  local provider=$1 model
+  load_model_options "$provider"
+  provider_label "$provider"
+  printf '%s models:\n' "$PROMPT_VALUE"
+  for model in "${MODEL_OPTIONS[@]}"; do
+    printf '  %s\n' "$model"
+  done
+  printf '  custom model ID\n'
+}
+
+prompt_model_selection() {
+  local provider=$1 current=${2-} answer choice index custom_index model
+  load_model_options "$provider"
+  if value_is_blank "$current"; then
+    provider_default_model "$provider"
+    current=$PROMPT_VALUE
+  fi
+
+  printf 'Choose a model:\n' >&2
+  index=1
+  for model in "${MODEL_OPTIONS[@]}"; do
+    printf '  %d) %s\n' "$index" "$model" >&2
+    index=$((index + 1))
+  done
+  custom_index=$index
+  printf '  %d) Custom model ID\n' "$custom_index" >&2
+  read -r -p "Model [$current]: " answer || die 'provider configuration cancelled'
+  if value_is_blank "$answer"; then
+    PROMPT_VALUE=$current
+    return
+  fi
+  case $answer in
+    *[!0-9]*)
+      PROMPT_VALUE=$answer
+      return
+      ;;
+  esac
+  choice=$((10#$answer))
+  if (( choice >= 1 && choice < custom_index )); then
+    PROMPT_VALUE=${MODEL_OPTIONS[$((choice - 1))]}
+  elif (( choice == custom_index )); then
+    prompt_value 'Model ID'
+    value_is_blank "$PROMPT_VALUE" && die 'model ID is required'
+  else
+    die 'choose one of the listed models'
+  fi
+}
+
+prompt_zai_endpoint() {
+  local current=${1:-$DEFAULT_ZAI_BASE_URL} answer default_choice=2
+  [[ "$current" == 'https://api.z.ai/api/coding/paas/v4' ]] && default_choice=1
+  printf 'Choose your Z.AI plan:\n' >&2
+  printf '  1) Coding Developer Plan\n' >&2
+  printf '  2) Standard API\n' >&2
+  read -r -p "Plan [$default_choice]: " answer || die 'provider configuration cancelled'
+  answer=${answer:-$default_choice}
+  case $answer in
+    1 | coding | Coding) PROMPT_VALUE='https://api.z.ai/api/coding/paas/v4' ;;
+    2 | standard | Standard) PROMPT_VALUE=$DEFAULT_ZAI_BASE_URL ;;
+    *) die 'choose Coding Developer Plan or Standard API' ;;
+  esac
+}
+
+persist_named_provider() {
+  local provider=$1 requested_model=${2-}
+  local current_provider current_model key_name api_key model label bridge_token upstream_base_url
+  current_provider=$(configured_value FACTORY_PROVIDER_ADAPTER)
+  current_model=''
+  [[ "$current_provider" == "$provider" ]] && current_model=$(configured_value FACTORY_MODEL)
+
+  provider_key_name "$provider"
+  key_name=$PROMPT_VALUE
+  api_key=$(configured_value "$key_name")
+  provider_label "$provider"
+  label=$PROMPT_VALUE
+
+  if [[ -t 0 && -t 2 ]]; then
+    prompt_secret "$label API key" "$api_key"
+    api_key=$PROMPT_VALUE
+  elif value_is_blank "$api_key"; then
+    PROVIDER_CONFIG_ERRORS=("$key_name is required to configure $label")
+    report_provider_configuration_errors
+    return 1
+  fi
+  value_is_blank "$api_key" && die "$label API key is required"
+
+  if value_is_blank "$requested_model"; then
+    if [[ -t 0 && -t 2 ]]; then
+      prompt_model_selection "$provider" "$current_model"
+      model=$PROMPT_VALUE
+    elif ! value_is_blank "$current_model"; then
+      model=$current_model
+    else
+      provider_default_model "$provider"
+      model=$PROMPT_VALUE
+    fi
+  else
+    model=$requested_model
+  fi
+  [[ "$model" != *$'\n'* && "$model" != *$'\r'* ]] || die 'model ID must be a single line'
+
+  write_env_value "$key_name" "$api_key"
+  write_env_value FACTORY_MODEL "$model"
+  write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
+
+  if [[ "$provider" == openai ]]; then
+    write_env_value FACTORY_PROVIDER_ADAPTER openai
+    write_env_value FACTORY_MODEL_PROVIDER factory-openai
+    write_env_value FACTORY_PROVIDER_NAME OpenAI
+    write_env_value FACTORY_PROVIDER_BASE_URL "$DEFAULT_OPENAI_BASE_URL"
+    write_env_value FACTORY_PROVIDER_AUTH key
+    write_env_value FACTORY_PROVIDER_API_KEY "$api_key"
+    write_env_value FACTORY_MODEL_CATALOG_JSON ''
+    return
+  fi
+
+  bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
+  value_is_blank "$bridge_token" && bridge_token=$(generate_bridge_token)
+  write_env_value FACTORY_PROVIDER_ADAPTER "$provider"
+  write_env_value FACTORY_MODEL_PROVIDER factory-provider
+  write_env_value FACTORY_PROVIDER_AUTH bridge
+  write_env_value FACTORY_PROVIDER_API_KEY ''
+  write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN "$bridge_token"
+
+  case $provider in
+    claude)
+      write_env_value FACTORY_PROVIDER_NAME 'Anthropic Claude provider'
+      write_env_value FACTORY_PROVIDER_BASE_URL http://claude-provider:10101/v1
+      write_env_value FACTORY_MODEL_CATALOG_JSON ''
+      ;;
+    deepseek)
+      write_env_value FACTORY_PROVIDER_NAME 'DeepSeek provider'
+      write_env_value FACTORY_PROVIDER_BASE_URL http://deepseek-provider:10101/v1
+      write_env_value FACTORY_MODEL_CATALOG_JSON ''
+      write_env_value FACTORY_DEEPSEEK_BASE_URL "$DEFAULT_DEEPSEEK_BASE_URL"
+      ;;
+    zai)
+      upstream_base_url=$(configured_value FACTORY_ZAI_BASE_URL)
+      value_is_blank "$upstream_base_url" && upstream_base_url=$DEFAULT_ZAI_BASE_URL
+      if [[ -t 0 && -t 2 ]]; then
+        prompt_zai_endpoint "$upstream_base_url"
+        upstream_base_url=$PROMPT_VALUE
+      fi
+      write_env_value FACTORY_PROVIDER_NAME 'Z.AI GLM provider'
+      write_env_value FACTORY_PROVIDER_BASE_URL http://zai-provider:10101/v1
+      if [[ "$model" == glm-5.2 ]]; then
+        write_env_value FACTORY_MODEL_CATALOG_JSON /var/lib/software-factory/provider/codex-models.json
+      else
+        write_env_value FACTORY_MODEL_CATALOG_JSON ''
+      fi
+      write_env_value FACTORY_ZAI_BASE_URL "$upstream_base_url"
+      ;;
+  esac
+}
+
 persist_responses_configuration() {
   local provider base_url model authentication api_key
   local current_adapter
@@ -367,8 +658,6 @@ persist_responses_configuration() {
   write_env_value FACTORY_MODEL_CATALOG_JSON ''
   write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN ''
   write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
-  write_env_value ZAI_API_KEY ''
-  write_env_value DEEPSEEK_API_KEY ''
 }
 
 generate_bridge_token() {
@@ -376,92 +665,18 @@ generate_bridge_token() {
 }
 
 persist_zai_preset() {
-  local api_key bridge_token legacy_bridge_token upstream_base_url
-  api_key=$(configured_value ZAI_API_KEY)
-  bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
-  legacy_bridge_token=$(configured_value FACTORY_PROVIDER_AUTH_TOKEN)
-  upstream_base_url=${FACTORY_ZAI_BASE_URL-}
-
-  if value_is_blank "$api_key"; then
-    if [[ -t 0 && -t 2 ]]; then
-      prompt_secret 'Z.AI API key'
-      api_key=$PROMPT_VALUE
-    else
-      PROVIDER_CONFIG_ERRORS=('ZAI_API_KEY is required for preset zai')
-      report_provider_configuration_errors
-      return 1
-    fi
-  fi
-  if value_is_blank "$bridge_token"; then
-    if value_is_blank "$legacy_bridge_token"; then
-      bridge_token=$(generate_bridge_token)
-    else
-      bridge_token=$legacy_bridge_token
-    fi
-  fi
-  if value_is_blank "$upstream_base_url"; then
-    upstream_base_url=$DEFAULT_ZAI_BASE_URL
-  fi
-
-  write_env_value FACTORY_PROVIDER_ADAPTER zai
-  write_env_value FACTORY_MODEL_PROVIDER factory-provider
-  write_env_value FACTORY_PROVIDER_BASE_URL http://zai-provider:10101/v1
-  write_env_value FACTORY_PROVIDER_NAME 'Z.AI GLM provider'
-  write_env_value FACTORY_MODEL glm-5.2
-  write_env_value FACTORY_PROVIDER_AUTH bridge
-  write_env_value FACTORY_PROVIDER_API_KEY ''
-  write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN "$bridge_token"
-  write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
-  write_env_value FACTORY_MODEL_CATALOG_JSON /var/lib/software-factory/provider/codex-models.json
-  write_env_value ZAI_API_KEY "$api_key"
-  write_env_value FACTORY_ZAI_BASE_URL "$upstream_base_url"
-  write_env_value DEEPSEEK_API_KEY ''
+  persist_named_provider zai 'glm-5.2'
 }
 
 persist_deepseek_preset() {
-  local api_key bridge_token legacy_bridge_token
-  api_key=$(configured_value DEEPSEEK_API_KEY)
-  bridge_token=$(configured_value FACTORY_PROVIDER_BRIDGE_TOKEN)
-  legacy_bridge_token=$(configured_value FACTORY_PROVIDER_AUTH_TOKEN)
-
-  if value_is_blank "$api_key"; then
-    if [[ -t 0 && -t 2 ]]; then
-      prompt_secret 'DeepSeek API key'
-      api_key=$PROMPT_VALUE
-    else
-      PROVIDER_CONFIG_ERRORS=('DEEPSEEK_API_KEY is required for preset deepseek')
-      report_provider_configuration_errors
-      return 1
-    fi
-  fi
-  if value_is_blank "$bridge_token"; then
-    if value_is_blank "$legacy_bridge_token"; then
-      bridge_token=$(generate_bridge_token)
-    else
-      bridge_token=$legacy_bridge_token
-    fi
-  fi
-
-  write_env_value FACTORY_PROVIDER_ADAPTER deepseek
-  write_env_value FACTORY_MODEL_PROVIDER factory-provider
-  write_env_value FACTORY_PROVIDER_BASE_URL http://deepseek-provider:10101/v1
-  write_env_value FACTORY_PROVIDER_NAME 'DeepSeek provider'
-  write_env_value FACTORY_MODEL "$DEFAULT_DEEPSEEK_MODEL"
-  write_env_value FACTORY_PROVIDER_AUTH bridge
-  write_env_value FACTORY_PROVIDER_API_KEY ''
-  write_env_value FACTORY_PROVIDER_BRIDGE_TOKEN "$bridge_token"
-  write_env_value FACTORY_PROVIDER_AUTH_TOKEN ''
-  write_env_value FACTORY_MODEL_CATALOG_JSON ''
-  write_env_value ZAI_API_KEY ''
-  write_env_value DEEPSEEK_API_KEY "$api_key"
-  write_env_value FACTORY_DEEPSEEK_BASE_URL "$DEFAULT_DEEPSEEK_BASE_URL"
+  persist_named_provider deepseek "$DEFAULT_DEEPSEEK_MODEL"
 }
 
 resolve_provider_environment() {
   local adapter file_adapter
   adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
 
-  if [[ "$adapter" == responses ]]; then
+  if [[ "$adapter" == responses || "$adapter" == openai ]]; then
     file_adapter=$(env_file_value FACTORY_PROVIDER_ADAPTER)
     if declare -p FACTORY_PROVIDER_ADAPTER >/dev/null 2>&1 &&
       [[ "$file_adapter" != responses ]]; then
@@ -474,15 +689,26 @@ resolve_provider_environment() {
     fi
     export FACTORY_PROVIDER_BRIDGE_TOKEN=''
     export FACTORY_PROVIDER_AUTH_TOKEN=''
+    export ANTHROPIC_API_KEY=''
+    export ZAI_API_KEY=''
+    export DEEPSEEK_API_KEY=''
+  elif [[ "$adapter" == claude ]]; then
+    export FACTORY_PROVIDER_API_KEY=''
+    export FACTORY_PROVIDER_AUTH_TOKEN=''
+    export OPENAI_API_KEY=''
     export ZAI_API_KEY=''
     export DEEPSEEK_API_KEY=''
   elif [[ "$adapter" == zai ]]; then
     export FACTORY_PROVIDER_API_KEY=''
     export FACTORY_PROVIDER_AUTH_TOKEN=''
+    export OPENAI_API_KEY=''
+    export ANTHROPIC_API_KEY=''
     export DEEPSEEK_API_KEY=''
   elif [[ "$adapter" == deepseek ]]; then
     export FACTORY_PROVIDER_API_KEY=''
     export FACTORY_PROVIDER_AUTH_TOKEN=''
+    export OPENAI_API_KEY=''
+    export ANTHROPIC_API_KEY=''
     export ZAI_API_KEY=''
   fi
 }
@@ -508,23 +734,31 @@ show_provider_configuration() {
   printf '  model: %s\n' "${model:-<unset>}"
   printf '  model catalog: %s\n' "${catalog:-<none>}"
   printf '  authentication: %s\n' "${authentication:-<unset>}"
-  if [[ "$adapter" == zai ]]; then
+  if [[ "$adapter" == claude ]]; then
+    printf '  provider API key: %s\n' "$([[ -n "$(configured_value ANTHROPIC_API_KEY)" ]] && printf set || printf unset)"
+    printf '  bridge token: %s\n' "$([[ -n "$bridge_key" ]] && printf set || printf unset)"
+  elif [[ "$adapter" == zai ]]; then
     printf '  provider API key: %s\n' "$([[ -n "$(configured_value ZAI_API_KEY)" ]] && printf set || printf unset)"
     printf '  bridge token: %s\n' "$([[ -n "$bridge_key" ]] && printf set || printf unset)"
   elif [[ "$adapter" == deepseek ]]; then
     printf '  provider API key: %s\n' "$([[ -n "$(configured_value DEEPSEEK_API_KEY)" ]] && printf set || printf unset)"
     printf '  bridge token: %s\n' "$([[ -n "$bridge_key" ]] && printf set || printf unset)"
+  elif [[ "$adapter" == openai ]]; then
+    printf '  provider API key: %s\n' "$([[ -n "$(configured_value OPENAI_API_KEY)" ]] && printf set || printf unset)"
   else
     printf '  provider API key: %s\n' "$([[ -n "$provider_key" ]] && printf set || printf unset)"
   fi
 }
 
 configure_command() {
+  local provider model=''
   ensure_env_file
   case ${1-} in
     '')
-      (( $# == 0 )) || die 'usage: factory configure [--show | --preset zai | --preset deepseek]'
-      persist_responses_configuration
+      (( $# == 0 )) || die 'usage: factory configure [--show | --provider <name> [--model <id>] | --custom]'
+      [[ -t 0 && -t 2 ]] || die 'factory configure requires a terminal; use factory provider <name> with its API key environment variable'
+      prompt_provider_selection "$(configured_value FACTORY_PROVIDER_ADAPTER)"
+      persist_named_provider "$PROMPT_VALUE"
       ;;
     --show)
       (( $# == 1 )) || die 'usage: factory configure --show'
@@ -539,8 +773,22 @@ configure_command() {
         *) die 'usage: factory configure --preset <zai|deepseek>' ;;
       esac
       ;;
+    --provider)
+      (( $# == 2 || $# == 4 )) || die 'usage: factory configure --provider <openai|claude|deepseek|zai> [--model <id>]'
+      normalize_provider "${2-}" || die 'provider must be openai, claude, deepseek, or zai'
+      provider=$PROMPT_VALUE
+      if (( $# == 4 )); then
+        [[ ${3-} == --model && -n ${4-} ]] || die 'usage: factory configure --provider <name> [--model <id>]'
+        model=$4
+      fi
+      persist_named_provider "$provider" "$model"
+      ;;
+    --custom)
+      (( $# == 1 )) || die 'usage: factory configure --custom'
+      persist_responses_configuration
+      ;;
     *)
-      die 'usage: factory configure [--show | --preset zai | --preset deepseek]'
+      die 'usage: factory configure [--show | --provider <name> [--model <id>] | --custom]'
       ;;
   esac
 
@@ -548,8 +796,9 @@ configure_command() {
     report_provider_configuration_errors
     return 1
   fi
-  printf 'Saved provider configuration to %s\n' "$ENV_FILE"
-  show_provider_configuration
+  provider=$(configured_value FACTORY_PROVIDER_ADAPTER)
+  provider_label "$provider"
+  printf 'Configured %s with model %s.\n' "$PROMPT_VALUE" "$(configured_value FACTORY_MODEL)"
 }
 
 ensure_provider_configuration() {
@@ -557,9 +806,11 @@ ensure_provider_configuration() {
     return
   fi
   if [[ -t 0 && -t 2 ]]; then
-    persist_responses_configuration
+    printf 'Welcome to Software Factory.\n' >&2
+    prompt_provider_selection
+    persist_named_provider "$PROMPT_VALUE"
     if validate_provider_configuration; then
-      printf 'Saved provider configuration to %s\n' "$ENV_FILE" >&2
+      printf 'Provider configured.\n' >&2
       return
     fi
   fi
@@ -567,18 +818,110 @@ ensure_provider_configuration() {
   return 1
 }
 
+provider_command() {
+  local provider model=''
+  ensure_env_file
+  case ${1-} in
+    list)
+      (( $# == 1 )) || die 'usage: factory provider list'
+      list_providers
+      return
+      ;;
+    show)
+      (( $# == 1 )) || die 'usage: factory provider show'
+      show_provider_configuration
+      return
+      ;;
+    '')
+      (( $# == 0 )) || die 'usage: factory provider [list|show|<name> [--model <id>]]'
+      [[ -t 0 && -t 2 ]] || die 'provider name is required without a terminal'
+      prompt_provider_selection "$(configured_value FACTORY_PROVIDER_ADAPTER)"
+      provider=$PROMPT_VALUE
+      ;;
+    *)
+      normalize_provider "$1" || die 'provider must be openai, claude, deepseek, or zai'
+      provider=$PROMPT_VALUE
+      shift
+      if (( $# > 0 )); then
+        [[ $# == 2 && $1 == --model && -n ${2-} ]] || die 'usage: factory provider <name> [--model <id>]'
+        model=$2
+      fi
+      ;;
+  esac
+  persist_named_provider "$provider" "$model"
+  validate_provider_configuration || {
+    report_provider_configuration_errors
+    return 1
+  }
+  provider_label "$provider"
+  printf 'Now using %s with model %s.\n' "$PROMPT_VALUE" "$(configured_value FACTORY_MODEL)"
+}
+
+model_command() {
+  local provider model
+  ensure_env_file
+  validate_provider_configuration || {
+    report_provider_configuration_errors
+    return 1
+  }
+  provider=$(configured_value FACTORY_PROVIDER_ADAPTER)
+  [[ "$provider" != responses ]] || die 'use `factory configure --custom` to change a custom Responses model'
+
+  case ${1-} in
+    list)
+      (( $# == 1 )) || die 'usage: factory model list'
+      list_models "$provider"
+      return
+      ;;
+    '')
+      (( $# == 0 )) || die 'usage: factory model [list|<model-id>]'
+      [[ -t 0 && -t 2 ]] || die 'model ID is required without a terminal'
+      prompt_model_selection "$provider" "$(configured_value FACTORY_MODEL)"
+      model=$PROMPT_VALUE
+      ;;
+    *)
+      (( $# == 1 )) || die 'usage: factory model [list|<model-id>]'
+      model=$1
+      ;;
+  esac
+
+  value_is_blank "$model" && die 'model ID is required'
+  [[ "$model" != *$'\n'* && "$model" != *$'\r'* ]] || die 'model ID must be a single line'
+  write_env_value FACTORY_MODEL "$model"
+  if [[ "$provider" == zai && "$model" == glm-5.2 ]]; then
+    write_env_value FACTORY_MODEL_CATALOG_JSON /var/lib/software-factory/provider/codex-models.json
+  elif [[ "$provider" == zai ]]; then
+    write_env_value FACTORY_MODEL_CATALOG_JSON ''
+  fi
+  validate_provider_configuration || {
+    report_provider_configuration_errors
+    return 1
+  }
+  printf 'Now using model %s.\n' "$model"
+}
+
 compose() {
   "${COMPOSE[@]}" "$@"
+}
+
+pull_factory_image() {
+  local image
+  image=$(configured_value FACTORY_IMAGE)
+  value_is_blank "$image" && image=$DEFAULT_FACTORY_IMAGE
+  [[ "$image" == software-factory:local ]] && return
+  printf 'Pulling Factory image %s\n' "$image" >&2
+  compose pull factoryd >&2
 }
 
 reconcile_provider_services() {
   local provider_adapter=$1
   local inactive_services=()
 
+  [[ "$provider_adapter" == claude ]] || inactive_services+=(claude-provider)
   [[ "$provider_adapter" == zai ]] || inactive_services+=(zai-provider)
   [[ "$provider_adapter" == deepseek ]] || inactive_services+=(deepseek-provider)
   (( ${#inactive_services[@]} == 0 )) ||
-    compose --profile zai --profile deepseek rm --stop --force "${inactive_services[@]}" >/dev/null
+    compose --profile claude --profile zai --profile deepseek rm --stop --force "${inactive_services[@]}" >/dev/null
 }
 
 bootstrap_hatchet_token() {
@@ -619,9 +962,12 @@ up_stack() {
   provider_adapter=$(configured_value FACTORY_PROVIDER_ADAPTER)
   resolve_provider_environment
   require_docker
+  pull_factory_image
   reconcile_provider_services "$provider_adapter"
-  compose build workflow-worker >&2
-  if [[ "$provider_adapter" == zai ]]; then
+  if [[ "$provider_adapter" == claude ]]; then
+    profile=(--profile claude)
+    services+=(claude-provider)
+  elif [[ "$provider_adapter" == zai ]]; then
     profile=(--profile zai)
     services+=(zai-provider)
   elif [[ "$provider_adapter" == deepseek ]]; then
@@ -635,6 +981,34 @@ up_stack() {
   guard_project_mount
   compose "${profile[@]}" up -d --wait --wait-timeout 180 workflow-worker
   printf 'Factory is ready for %s\n' "$PROJECT_DIR" >&2
+}
+
+run_command() {
+  local detach=0 task
+  if [[ ${1-} == --detach ]]; then
+    detach=1
+    shift
+  fi
+  (( $# <= 1 )) || die 'quote the task as one argument: factory run "your task"'
+  task=${1-}
+  if value_is_blank "$task"; then
+    if [[ -t 0 && -t 2 ]]; then
+      ensure_env_file
+      ensure_provider_configuration
+      prompt_value 'Task'
+      task=$PROMPT_VALUE
+    else
+      die 'a task is required: factory run [--detach] "your task"'
+    fi
+  fi
+  value_is_blank "$task" && die 'task cannot be empty'
+
+  up_stack
+  if (( detach == 1 )); then
+    exec_run_cli run --detach "$task"
+  else
+    exec_run_cli run "$task"
+  fi
 }
 
 require_service() {
@@ -680,21 +1054,30 @@ guard_project_mount() {
 }
 
 main() {
-  local command=${1:-help}
-  if (( $# > 0 )); then
-    shift
+  local command
+  if (( $# == 0 )); then
+    [[ -t 0 && -t 2 ]] || die 'a task is required: factory run --detach "your task"'
+    run_command
+    return
   fi
+  command=$1
+  shift
 
   case "$command" in
     help | --help | -h)
       usage
       ;;
     run)
-      up_stack
-      exec_run_cli run "$@"
+      run_command "$@"
       ;;
     configure)
       configure_command "$@"
+      ;;
+    provider)
+      provider_command "$@"
+      ;;
+    model)
+      model_command "$@"
       ;;
     attach | status | stop)
       ensure_env_file
@@ -718,9 +1101,13 @@ main() {
       compose --profile '*' down --remove-orphans
       ;;
     build)
+      (( $# == 0 )) || die 'usage: factory build'
       ensure_env_file
       require_docker
-      compose build workflow-worker
+      [[ -f "$BUILD_COMPOSE_FILE" ]] || die "missing $BUILD_COMPOSE_FILE"
+      FACTORY_IMAGE=software-factory:local \
+        FACTORY_BUILD_JOBS=${FACTORY_BUILD_JOBS:-2} \
+        "${COMPOSE[@]}" --file "$BUILD_COMPOSE_FILE" build workflow-worker
       ;;
     install)
       (( $# == 0 )) || die 'usage: factory install'

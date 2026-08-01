@@ -21,6 +21,10 @@ const upstreamProvider = process.env.FACTORY_PROVIDER_UPSTREAM_ID ?? 'factory-za
 if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/.test(upstreamProvider)) {
   throw new Error('FACTORY_PROVIDER_UPSTREAM_ID must be a valid OpenCodex provider ID');
 }
+const upstreamAdapter = process.env.FACTORY_PROVIDER_UPSTREAM_ADAPTER ?? 'openai-chat';
+if (upstreamAdapter !== 'openai-chat' && upstreamAdapter !== 'anthropic') {
+  throw new Error('FACTORY_PROVIDER_UPSTREAM_ADAPTER must be openai-chat or anthropic');
+}
 const model = process.env.FACTORY_PROVIDER_UPSTREAM_MODEL?.trim() ?? 'glm-5.2';
 if (!model || model.includes('\n') || model.includes('\r')) {
   throw new Error('FACTORY_PROVIDER_UPSTREAM_MODEL must be a non-empty single-line model ID');
@@ -55,7 +59,7 @@ const config = {
   defaultProvider: upstreamProvider,
   providers: {
     [upstreamProvider]: {
-      adapter: 'openai-chat',
+      adapter: upstreamAdapter,
       baseUrl,
       authMode: 'key',
       apiKey: `\${${apiKeyEnv}}`,
