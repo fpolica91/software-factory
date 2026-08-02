@@ -14,6 +14,11 @@ use factory_providers::provider_profile;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::transcript::StageResult;
+use crate::transcript::compact_event_line;
+use crate::transcript::compact_lines;
+use crate::transcript::event_detail;
+
 pub fn print_created(job: &DurableJob, json_output: bool) -> Result<()> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -156,10 +161,45 @@ pub fn print_progress(job: &DurableJob) {
     }
 }
 
+pub fn print_progress_compact(job: &DurableJob) {
+    let mut operations = job.operations.iter().collect::<Vec<_>>();
+    operations.sort_by_key(|operation| operation.ordinal);
+    let stages = operations
+        .into_iter()
+        .map(|operation| {
+            let label = operation
+                .kind
+                .strip_prefix("codex.")
+                .unwrap_or(&operation.kind);
+            format!("{label}={}", operation_state_label(operation.state))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if stages.is_empty() {
+        println!(
+            "Job {} · {}",
+            job.job.job_id,
+            job_state_label(job.job.state)
+        );
+    } else {
+        println!(
+            "Job {} · {} · {stages}",
+            job.job.job_id,
+            job_state_label(job.job.state)
+        );
+    }
+}
+
 pub fn print_event(event: &JobEventRecord, json_output: bool) -> Result<()> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     write_event(&mut output, event, json_output)
+}
+
+pub fn print_compact_event(event: &JobEventRecord) {
+    if let Some(line) = compact_event_line(event) {
+        println!("  {line}");
+    }
 }
 
 fn write_event(output: &mut impl Write, event: &JobEventRecord, json_output: bool) -> Result<()> {
@@ -195,6 +235,7 @@ pub fn print_final(
     job: &DurableJob,
     stages: &[StageCheckpointRecord],
     attempts: &[AttemptRecord],
+    results: &[StageResult],
     json_output: bool,
 ) -> Result<()> {
     if json_output {
@@ -243,6 +284,14 @@ pub fn print_final(
                 (None, _) => println!("  {label:<10} succeeded"),
             }
         }
+    }
+
+    if !results.is_empty() {
+        println!("\nResults");
+        for result in results {
+            println!("  {:<10} {}", title_case(&result.stage), result.preview);
+        }
+        println!("  inspect    factory attach {}", job.job.job_id);
     }
 
     print_attempt_failures(job, attempts);
@@ -329,108 +378,6 @@ fn print_attempt_failures(job: &DurableJob, attempts: &[AttemptRecord]) {
     }
 }
 
-fn event_detail(value: &Value) -> Option<String> {
-    if let Some(steps) = value.get("steps").and_then(Value::as_array) {
-        let mut details = value
-            .get("summary")
-            .and_then(Value::as_str)
-            .filter(|summary| !summary.trim().is_empty())
-            .map(|summary| vec![summary.to_string()])
-            .unwrap_or_default();
-        details.extend(steps.iter().filter_map(|item| {
-            let step = item.get("step")?.as_str()?.trim();
-            if step.is_empty() {
-                return None;
-            }
-            Some(match item.get("status").and_then(Value::as_str) {
-                Some(status) => format!("[{status}] {step}"),
-                None => step.to_string(),
-            })
-        }));
-        if !details.is_empty() {
-            return Some(details.join("\n"));
-        }
-    }
-    for key in ["message", "text", "summary", "method", "detail"] {
-        match value.get(key) {
-            Some(Value::String(text)) if !text.trim().is_empty() => return Some(text.clone()),
-            Some(Value::Array(items)) => {
-                let text = items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if !text.is_empty() {
-                    return Some(text);
-                }
-            }
-            Some(other) if !other.is_null() && !other.is_object() => {
-                return Some(other.to_string());
-            }
-            _ => {}
-        }
-    }
-    if let Some(tool) = value.get("tool").and_then(Value::as_str) {
-        return Some(match value.get("type").and_then(Value::as_str) {
-            Some("subagent") => format!("subagent: {tool}"),
-            _ => tool.to_string(),
-        });
-    }
-    if let Some(paths) = value.get("paths").and_then(Value::as_array) {
-        let paths = paths
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if !paths.is_empty() {
-            return Some(match value.get("status").and_then(Value::as_str) {
-                Some(status) => format!("{paths} ({status})"),
-                None => paths,
-            });
-        }
-    }
-    if let Some(kind) = value.get("type").and_then(Value::as_str) {
-        return Some(match kind {
-            "webSearch" => "web search".to_string(),
-            _ => kind.to_string(),
-        });
-    }
-    if let Some(status) = value.get("status") {
-        if let Some(status) = status.as_str().filter(|status| !status.trim().is_empty()) {
-            return Some(status.to_string());
-        }
-        if !status.is_null() && !status.is_object() {
-            return Some(status.to_string());
-        }
-    }
-    let item = value.get("item")?;
-    if let Some(text) = item.get("text").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
-    item.get("type")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn compact_lines(value: String) -> String {
-    let mut compact = String::new();
-    let mut previous_blank = false;
-    for line in value.trim().lines() {
-        let blank = line.trim().is_empty();
-        if blank && previous_blank {
-            continue;
-        }
-        if !compact.is_empty() {
-            compact.push('\n');
-        }
-        compact.push_str(line.trim_end());
-        previous_blank = blank;
-    }
-    compact
-}
-
 pub fn job_state_exit_code(state: JobState) -> i32 {
     match state {
         JobState::Failed => 1,
@@ -465,6 +412,14 @@ fn operation_state_label(state: OperationState) -> &'static str {
         OperationState::Succeeded => "succeeded",
         OperationState::Failed => "failed",
         OperationState::Cancelled => "cancelled",
+    }
+}
+
+fn title_case(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }
 

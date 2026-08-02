@@ -12,7 +12,8 @@ RUN test -f factory-harness/codex-rs/secrets/Cargo.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/factory-harness/factory/target,sharing=locked \
-    cargo build \
+    find factory-harness/factory -path '*/target' -prune -o -type f -name '*.rs' -exec touch {} + \
+    && cargo build \
       --locked \
       --release \
       --manifest-path factory-harness/factory/Cargo.toml \

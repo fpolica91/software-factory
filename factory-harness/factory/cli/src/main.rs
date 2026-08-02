@@ -1,7 +1,9 @@
 mod api;
 mod config;
+mod live;
 mod output;
 mod profile_guard;
+mod transcript;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -31,10 +33,42 @@ use sha2::Sha256;
 
 use crate::api::ExportedResult;
 use crate::api::FactorydClient;
+use crate::live::LiveAction;
+use crate::live::LiveScreen;
+use crate::transcript::Transcript;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_PAGE_SIZE: u32 = 200;
 const AUTONOMOUS_INSTRUCTIONS: &str = "Operate autonomously until the Factory stage is complete. Do not ask the user questions or wait for clarification. Make reasonable repository-grounded assumptions, use the required tools, verify the result, and continue with another approach when one is unavailable.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputMode {
+    Compact,
+    Interactive,
+    Json,
+    Verbose,
+}
+
+impl OutputMode {
+    fn from_flags(json: bool, verbose: bool) -> Self {
+        if json {
+            Self::Json
+        } else if verbose {
+            Self::Verbose
+        } else if std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::env::var("TERM").as_deref() != Ok("dumb")
+        {
+            Self::Interactive
+        } else {
+            Self::Compact
+        }
+    }
+
+    fn json(self) -> bool {
+        self == Self::Json
+    }
+}
 
 #[derive(Debug)]
 struct RepositoryLocation {
@@ -84,7 +118,7 @@ enum FactoryCommand {
     /// Start a durable four-stage Factory job.
     Run(RunArgs),
     /// Stream durable events and wait for a job to finish.
-    Attach(JobArgs),
+    Attach(AttachArgs),
     /// Print the current durable job state and results.
     Status(JobArgs),
     /// Stop a running durable job.
@@ -109,6 +143,10 @@ struct RunArgs {
     #[arg(long)]
     json: bool,
 
+    /// Print every durable event and its full detail instead of the compact view.
+    #[arg(long, conflicts_with = "json")]
+    verbose: bool,
+
     /// Remote Git URL. For a local checkout, run Factory from that repository.
     #[arg(long = "repository", visible_alias = "repo", conflicts_with = "cwd")]
     repository: Option<String>,
@@ -128,6 +166,20 @@ struct RunArgs {
     /// Task to complete. When omitted on a terminal, Factory prompts for it.
     #[arg(value_name = "TASK", num_args = 0.., trailing_var_arg = true)]
     task: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct AttachArgs {
+    /// Emit JSON instead of human-readable output.
+    #[arg(long)]
+    json: bool,
+
+    /// Print every durable event and its full detail instead of the compact view.
+    #[arg(long, conflicts_with = "json")]
+    verbose: bool,
+
+    /// Durable Factory job ID.
+    job_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -205,7 +257,7 @@ async fn run() -> Result<i32> {
             attach(
                 &FactorydClient::new(&cli.factoryd_url)?,
                 validate_job_id(&args.job_id)?,
-                args.json,
+                OutputMode::from_flags(args.json, args.verbose),
             )
             .await
         }
@@ -254,6 +306,7 @@ async fn run() -> Result<i32> {
 }
 
 async fn run_job(client: &FactorydClient, args: RunArgs) -> Result<i32> {
+    let output_mode = OutputMode::from_flags(args.json, args.verbose);
     let repository = repository_location(&args)?;
     let task = task_text(args.task)?;
     let definition = job_definition(
@@ -263,7 +316,7 @@ async fn run_job(client: &FactorydClient, args: RunArgs) -> Result<i32> {
     );
     let created = client.create_job(&definition).await?;
     let job_id = created.job.job_id.clone();
-    output::print_created(&created, args.json)?;
+    output::print_created(&created, output_mode.json())?;
     let workspace = match client
         .ensure_workspace(
             &job_id,
@@ -283,43 +336,64 @@ async fn run_job(client: &FactorydClient, args: RunArgs) -> Result<i32> {
         }
     };
 
-    output::print_workspace_ready(&created, &workspace.root, args.detach, args.json)?;
+    output::print_workspace_ready(&created, &workspace.root, args.detach, output_mode.json())?;
     if args.detach {
         return Ok(0);
     }
-    let exit_code = attach(client, job_id.clone(), args.json).await?;
+    let exit_code = attach(client, job_id.clone(), output_mode).await?;
     if exit_code == 0
         && !args.no_apply
         && let Some(root) = repository.local_root
     {
-        apply_result(client, &job_id, &root, &repository.repository_id, args.json).await?;
+        apply_result(
+            client,
+            &job_id,
+            &root,
+            &repository.repository_id,
+            output_mode.json(),
+        )
+        .await?;
     }
     Ok(exit_code)
 }
 
-async fn attach(client: &FactorydClient, job_id: JobId, json_output: bool) -> Result<i32> {
-    let monitor = monitor_job(client, job_id.clone(), json_output);
+async fn attach(client: &FactorydClient, job_id: JobId, output_mode: OutputMode) -> Result<i32> {
+    if output_mode == OutputMode::Interactive {
+        return monitor_interactive(client, job_id).await;
+    }
+
+    let monitor = monitor_job(client, job_id.clone(), output_mode);
     tokio::pin!(monitor);
     tokio::select! {
         result = &mut monitor => result,
         signal = tokio::signal::ctrl_c() => {
             signal.context("listen for Ctrl-C")?;
-            output::print_detached(&job_id, json_output)?;
+            output::print_detached(&job_id, output_mode.json())?;
             Ok(130)
         }
     }
 }
 
-async fn monitor_job(client: &FactorydClient, job_id: JobId, json_output: bool) -> Result<i32> {
+async fn monitor_job(
+    client: &FactorydClient,
+    job_id: JobId,
+    output_mode: OutputMode,
+) -> Result<i32> {
     let mut cursor = 0;
     let mut previous_snapshot = None;
+    let mut transcript = Transcript::default();
     loop {
-        cursor = drain_events(client, &job_id, cursor, json_output).await?;
+        cursor = drain_events(client, &job_id, cursor, output_mode, &mut transcript).await?;
 
         let job = client.load_job(&job_id).await?;
+        transcript.correlate_job(&job);
         let snapshot = output::job_snapshot(&job)?;
-        if !json_output && previous_snapshot.as_deref() != Some(snapshot.as_str()) {
-            output::print_progress(&job);
+        if previous_snapshot.as_deref() != Some(snapshot.as_str()) {
+            match output_mode {
+                OutputMode::Compact => output::print_progress_compact(&job),
+                OutputMode::Verbose => output::print_progress(&job),
+                OutputMode::Interactive | OutputMode::Json => {}
+            }
         }
         previous_snapshot = Some(snapshot);
 
@@ -329,15 +403,70 @@ async fn monitor_job(client: &FactorydClient, job_id: JobId, json_output: bool) 
             // the preceding event page. Drain once more from the exact cursor
             // before printing the terminal result so that final event is not
             // omitted from attach or its JSON replay.
-            let _ = drain_events(client, &job_id, cursor, json_output).await?;
+            let _ = drain_events(client, &job_id, cursor, output_mode, &mut transcript).await?;
+            transcript.correlate_job(&job);
             let (stages, attempts) = tokio::try_join!(
                 client.list_stage_checkpoints(&job_id),
                 client.list_attempts(&job_id),
             )?;
-            output::print_final(&job, &stages, &attempts, json_output)?;
+            let results = if output_mode == OutputMode::Compact {
+                transcript.stage_results()
+            } else {
+                Vec::new()
+            };
+            output::print_final(&job, &stages, &attempts, &results, output_mode.json())?;
             return Ok(output::job_state_exit_code(job.job.state));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn monitor_interactive(client: &FactorydClient, job_id: JobId) -> Result<i32> {
+    let mut cursor = 0;
+    let mut transcript = Transcript::default();
+    let mut screen = LiveScreen::new()?;
+    loop {
+        cursor = drain_events(
+            client,
+            &job_id,
+            cursor,
+            OutputMode::Interactive,
+            &mut transcript,
+        )
+        .await?;
+        let job = client.load_job(&job_id).await?;
+        transcript.correlate_job(&job);
+        screen.draw(&job, &transcript, output::terminal(job.job.state))?;
+
+        if output::terminal(job.job.state) {
+            let _ = drain_events(
+                client,
+                &job_id,
+                cursor,
+                OutputMode::Interactive,
+                &mut transcript,
+            )
+            .await?;
+            transcript.correlate_job(&job);
+            let (stages, attempts) = tokio::try_join!(
+                client.list_stage_checkpoints(&job_id),
+                client.list_attempts(&job_id),
+            )?;
+            screen.inspect_completed(&job, &transcript, Duration::from_secs(3))?;
+            screen.restore()?;
+            let results = transcript.stage_results();
+            output::print_final(&job, &stages, &attempts, &results, false)?;
+            return Ok(output::job_state_exit_code(job.job.state));
+        }
+
+        if matches!(
+            screen.wait_for_action(POLL_INTERVAL, transcript.rows().len())?,
+            LiveAction::Detach
+        ) {
+            screen.restore()?;
+            output::print_detached(&job_id, false)?;
+            return Ok(130);
+        }
     }
 }
 
@@ -345,13 +474,22 @@ async fn drain_events(
     client: &FactorydClient,
     job_id: &JobId,
     mut cursor: u64,
-    json_output: bool,
+    output_mode: OutputMode,
+    transcript: &mut Transcript,
 ) -> Result<u64> {
     loop {
         let page = client.list_events(job_id, cursor, EVENT_PAGE_SIZE).await?;
         let count = page.events.len();
         for event in &page.events {
-            output::print_event(event, json_output)?;
+            match output_mode {
+                OutputMode::Compact => {
+                    transcript.ingest(event);
+                    output::print_compact_event(event);
+                }
+                OutputMode::Json => output::print_event(event, true)?,
+                OutputMode::Verbose => output::print_event(event, false)?,
+                OutputMode::Interactive => transcript.ingest(event),
+            }
         }
         cursor = page.next_cursor;
         if count < EVENT_PAGE_SIZE as usize {
@@ -371,7 +509,7 @@ async fn status(client: &FactorydClient, job_id: JobId, json_output: bool) -> Re
     } else {
         output::print_progress(&job);
         if output::terminal(job.job.state) {
-            output::print_final(&job, &stages, &attempts, false)?;
+            output::print_final(&job, &stages, &attempts, &[], false)?;
         }
     }
     Ok(output::job_state_exit_code(job.job.state))

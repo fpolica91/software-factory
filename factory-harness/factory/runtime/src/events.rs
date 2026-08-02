@@ -77,10 +77,10 @@ impl TextCoalescer {
             let split = utf8_prefix(&pending.text, self.limit);
             let remainder = pending.text.split_off(split);
             let raw = std::mem::replace(&mut pending.text, remainder);
-            if let Some(text) = compact(&raw) {
+            if !raw.is_empty() {
                 ready.push(TextChunk {
                     key: pending.key.clone(),
-                    text,
+                    text: raw,
                 });
             }
         }
@@ -89,10 +89,7 @@ impl TextCoalescer {
 
     fn flush(&mut self) -> Option<TextChunk> {
         let pending = self.pending.take()?;
-        compact(&pending.text).map(|text| TextChunk {
-            key: pending.key,
-            text,
-        })
+        (!pending.text.is_empty()).then_some(pending)
     }
 }
 
@@ -349,10 +346,13 @@ fn completed_item_event(
     streamed_content: &mut StreamedContent,
 ) -> Option<(&'static str, Value)> {
     match item {
-        ThreadItem::AgentMessage { id, .. }
+        ThreadItem::AgentMessage { id, phase, .. }
             if streamed_content.agent_messages.remove(id.as_str()) =>
         {
-            None
+            Some((
+                "agent.message.completed",
+                json!({ "itemId": id, "phase": phase }),
+            ))
         }
         ThreadItem::Reasoning { id, summary, .. } => {
             let Some(streamed_parts) = streamed_content.reasoning_summary_parts.remove(id) else {
@@ -369,16 +369,14 @@ fn completed_item_event(
                     remaining_indexes.push(index);
                 }
             }
-            (!remaining_summary.is_empty()).then(|| {
-                (
-                    "reasoning.summary.completed",
-                    json!({
-                        "itemId": id,
-                        "summary": remaining_summary,
-                        "summaryIndexes": remaining_indexes,
-                    }),
-                )
-            })
+            Some((
+                "reasoning.summary.completed",
+                json!({
+                    "itemId": id,
+                    "summary": remaining_summary,
+                    "summaryIndexes": remaining_indexes,
+                }),
+            ))
         }
         _ => item_event(item, true),
     }
@@ -598,6 +596,20 @@ mod tests {
     }
 
     #[test]
+    fn stream_chunks_preserve_exact_join_boundaries() {
+        let mut text = TextCoalescer::with_limit(5);
+        let mut chunks = text.push(key("agent.message", "one"), "abcd efgh");
+        chunks.extend(text.flush());
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>(),
+            "abcd efgh"
+        );
+    }
+
+    #[test]
     fn stream_change_flushes_pending_text() {
         let mut text = TextCoalescer::with_limit(100);
         assert!(
@@ -707,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_delta_suppresses_the_duplicate_completed_event() {
+    fn streamed_delta_keeps_completion_metadata_without_duplicate_text() {
         let item = ThreadItem::AgentMessage {
             id: "message-streamed".into(),
             text: "The complete streamed response.".into(),
@@ -720,7 +732,12 @@ mod tests {
             &stream_key("agent.message", item.id(), None),
         );
 
-        assert!(completed_item_event(&item, &mut streamed_content).is_none());
+        let (kind, payload) =
+            completed_item_event(&item, &mut streamed_content).expect("completion metadata");
+        assert_eq!(kind, "agent.message.completed");
+        assert_eq!(payload["itemId"], "message-streamed");
+        assert!(payload["phase"].is_null());
+        assert!(payload.get("text").is_none());
         assert!(streamed_content.agent_messages.is_empty());
     }
 
@@ -782,5 +799,35 @@ mod tests {
         );
         assert!(streamed_content.reasoning_summary_parts.is_empty());
         assert!(!payload.to_string().contains("private raw reasoning"));
+    }
+
+    #[test]
+    fn fully_streamed_reasoning_keeps_completion_metadata() {
+        let item = ThreadItem::Reasoning {
+            id: "reasoning-streamed".into(),
+            summary: vec!["First.".into(), "Second.".into()],
+            content: vec!["private raw reasoning".into()],
+        };
+        let mut streamed_content = StreamedContent::default();
+        for index in [0, 1] {
+            record_streamed_content(
+                &mut streamed_content,
+                &stream_key("reasoning.summary", item.id(), Some(index)),
+            );
+        }
+
+        let (kind, payload) = completed_item_event(&item, &mut streamed_content)
+            .expect("reasoning completion metadata");
+
+        assert_eq!(kind, "reasoning.summary.completed");
+        assert_eq!(
+            payload,
+            json!({
+                "itemId": "reasoning-streamed",
+                "summary": [],
+                "summaryIndexes": [],
+            })
+        );
+        assert!(streamed_content.reasoning_summary_parts.is_empty());
     }
 }

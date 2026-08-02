@@ -40,14 +40,23 @@ factory run --detach "Audit this repository"     # print the job ID and exit
 factory run --repository https://host/org/repo.git --detach "Audit it"
 factory status JOB_ID                            # inspect current state
 factory attach JOB_ID                            # reconnect to live output
+factory attach --verbose JOB_ID                  # replay every event in full
 factory stop JOB_ID                              # cancel durably
 factory apply JOB_ID                             # apply a completed result here
 factory export JOB_ID -o result.patch            # preserve a portable patch
 ```
 
-`Ctrl-C` detaches without stopping the job. Pass `--detach` when a script should
-return immediately; otherwise non-interactive runs stream until completion. A
-successful attached run against a local repository applies its result to the
+On an interactive terminal, run and attach use a bounded live view: lifecycle
+pairs become one cell, arrows select a cell, and Enter or a mouse click opens
+its full durable detail. The completed view closes automatically when untouched;
+interacting pins it for inspection and `q` closes it. `Ctrl-C` restores the
+terminal and detaches without stopping a running job. Pipes receive
+deterministic compact text with no terminal escapes. Use `--verbose` for the
+complete human event replay or `--json` for the unchanged NDJSON stream. Pass
+`--detach` when a script should return immediately; otherwise non-interactive
+runs stream until completion.
+
+A successful attached run against a local repository applies its result to the
 originating checkout by default; use `factory run --no-apply ...` to retain it
 for explicit apply or export. Local work always targets the Git checkout where
 the launcher is invoked: change into that checkout before running Factory.

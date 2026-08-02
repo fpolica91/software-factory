@@ -12,8 +12,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
 factory-coordinator = { path = "../coordinator" }
 factory-providers = { path = "../providers", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }

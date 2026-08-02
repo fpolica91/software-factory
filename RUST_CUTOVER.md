@@ -186,7 +186,10 @@ unplanned and must be investigated before continuing.
   `src/events.rs`, its `src/lib.rs` module export, notification forwarding in
   `src/session.rs`, and stage lifecycle calls in `src/executor/stage_loop.rs`.
   The sink stores only exact active-turn events, coalesces text streams to
-  roughly 1 KiB, and never stores completed command output a second time.
+  roughly 1 KiB without trimming chunk join boundaries, and never stores
+  completed command output a second time. A streamed agent message ends with a
+  metadata-only completion event carrying its phase; its complete text remains
+  in the preceding chunks instead of being duplicated.
   `src/bootstrap.rs` and `src/bin/factory_worker.rs` now install the canonical
   Rust provider profile directly into Codex's existing config override layer;
   they no longer accept an unregistered provider ID without its provider table.
@@ -267,7 +270,16 @@ unplanned and must be investigated before continuing.
   the full runtime and performs a final event-cursor drain after observing a
   terminal job, so the atomically committed final `stage.completed` event is
   printed before the result. Provider/model configuration also starts only
-  PostgreSQL plus `factoryd` for its active-job check.
+  PostgreSQL plus `factoryd` for its active-job check. `src/transcript.rs`
+  reduces paired and streamed records into lossless display cells without
+  discarding durable records, and `src/live.rs` renders a bounded Ratatui view
+  with keyboard and mouse expansion. Non-TTY output is compact, `--verbose`
+  retains the complete human replay, and `--json` preserves every event and
+  payload. Final per-stage agent answers remain as short previews after the
+  live view exits; their full text stays expandable in the completed view or
+  replayable with `--verbose`. The private Codex TUI modules were not exposed
+  or copied: their cells depend on the full chat application and would add its
+  entire dependency closure to the standalone Factory CLI.
 - `factory-harness/factory/providers/`: native Rust transport adapter and
   canonical provider profiles. OpenAI Responses is direct; Anthropic Messages
   and DeepSeek/Z.AI Chat Completions are translated into the Responses surface
