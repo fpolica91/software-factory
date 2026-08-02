@@ -12,9 +12,6 @@ on:
       - apps/cli/**
       - factory-harness/codex-rs/**
       - factory-harness/factory/**
-      - harness-client/**
-      - integrations/**
-      - workflows/**
 
 concurrency:
   group: publish-container-${{ github.ref }}

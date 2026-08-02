@@ -13,10 +13,7 @@
 !.env.example
 *.bak
 *.bak-*
-worker
 docs
-secrets/**
-context-library
 factory-harness/sdk
 factory-harness/scripts
 factory-harness/.github

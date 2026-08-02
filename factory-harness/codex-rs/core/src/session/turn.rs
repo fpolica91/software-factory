@@ -61,6 +61,7 @@ use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
+use crate::tools::router::extension_disabled_tools;
 use crate::tools::router::extension_tool_executors;
 use crate::tools::spec_plan::search_tool_enabled;
 use crate::tools::spec_plan::tool_suggest_enabled;
@@ -1567,6 +1568,7 @@ pub(crate) async fn built_tools(
                 .thread_extension_data
                 .get::<crate::WaitForEnvironmentToolConfig>(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            disabled_tools: extension_disabled_tools(sess, step_store),
         },
         &sess.services.tool_search_handler_cache,
     ));

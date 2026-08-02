@@ -6,6 +6,7 @@ use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_shell_command_sse_response;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::DetachedReviewContext;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -16,18 +17,20 @@ use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
-use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_features::Feature;
+use codex_protocol::protocol::SubAgentSource;
 use codex_skills::system_cache_root_dir;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -64,6 +67,7 @@ async fn review_start_rejects_detached_delivery_for_paginated_parent() -> Result
         .send_review_start_request(ReviewStartParams {
             thread_id: thread.id,
             delivery: Some(ReviewDelivery::Detached),
+            detached_context: None,
             target: ReviewTarget::Custom {
                 instructions: "detached review".to_string(),
             },
@@ -122,6 +126,7 @@ async fn review_start_runs_review_turn_and_emits_code_review_item() -> Result<()
             params: ReviewStartParams {
                 thread_id: thread_id.clone(),
                 delivery: Some(ReviewDelivery::Inline),
+                detached_context: None,
                 target: ReviewTarget::Commit {
                     sha: "1234567deadbeef".to_string(),
                     title: Some("Tidy UI colors".to_string()),
@@ -227,6 +232,7 @@ async fn review_start_exec_approval_item_id_matches_command_execution_item() -> 
             params: ReviewStartParams {
                 thread_id,
                 delivery: Some(ReviewDelivery::Inline),
+                detached_context: None,
                 target: ReviewTarget::Commit {
                     sha: "1234567deadbeef".to_string(),
                     title: Some("Check review approvals".to_string()),
@@ -301,6 +307,7 @@ async fn review_start_rejects_empty_base_branch() -> Result<()> {
         .send_review_start_request(ReviewStartParams {
             thread_id,
             delivery: Some(ReviewDelivery::Inline),
+            detached_context: None,
             target: ReviewTarget::BaseBranch {
                 branch: "   ".to_string(),
             },
@@ -376,6 +383,7 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
             params: ReviewStartParams {
                 thread_id: thread_id.clone(),
                 delivery: Some(ReviewDelivery::Detached),
+                detached_context: None,
                 target: ReviewTarget::Custom {
                     instructions: "detached review".to_string(),
                 },
@@ -408,16 +416,6 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
         let JSONRPCMessage::Notification(notification) = message else {
             continue;
         };
-        if notification.method == "thread/status/changed" {
-            let status_changed: ThreadStatusChangedNotification =
-                serde_json::from_value(notification.params.expect("params must be present"))?;
-            if status_changed.thread_id == review_thread_id {
-                anyhow::bail!(
-                    "detached review threads should be introduced without a preceding thread/status/changed"
-                );
-            }
-            continue;
-        }
         if notification.method == "thread/started" {
             break notification;
         }
@@ -425,7 +423,14 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let started: ThreadStartedNotification =
         serde_json::from_value(notification.params.expect("params must be present"))?;
     assert_eq!(started.thread.id, review_thread_id);
-    assert_eq!(started.thread.session_id, review_thread_id);
+    assert!(!started.thread.session_id.is_empty());
+    assert_eq!(started.thread.forked_from_id, None);
+    assert_eq!(started.thread.parent_thread_id, None);
+    assert_eq!(
+        started.thread.source,
+        SessionSource::SubAgent(SubAgentSource::Review)
+    );
+    assert_eq!(started.thread.thread_source, Some(ThreadSource::Subagent));
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -436,7 +441,11 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
     let review_request = &requests[1];
-    assert_eq!(review_request.header("x-openai-subagent"), None);
+    assert_eq!(
+        review_request.header("x-openai-subagent").as_deref(),
+        Some("review")
+    );
+    assert!(!review_request.body_contains_text("materialize rollout"));
     assert!(review_request.body_contains_text("Colliding user review skill."));
     let user_messages = review_request.message_input_texts("user");
     assert!(user_messages.iter().any(|text| text == &expected_prompt));
@@ -446,6 +455,105 @@ async fn review_start_with_detached_delivery_returns_new_thread_id() -> Result<(
             && text.contains("Do not modify files")
     }));
     assert!(!review_request.body_contains_text(COLLIDING_REVIEW_SKILL_MARKER));
+
+    Ok(())
+}
+
+#[cfg_attr(target_os = "windows", ignore = "flaky on windows CI")]
+#[tokio::test]
+async fn review_start_with_detached_context_uses_review_subagent_lineage() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("materialize-response"),
+                responses::ev_assistant_message("materialize-message", "materialized"),
+                responses::ev_completed("materialize-response"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("review-response"),
+                responses::ev_assistant_message("review-message", "No findings."),
+                responses::ev_completed("review-response"),
+            ]),
+        ],
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let parent_thread_id = start_default_thread(&mut mcp).await?;
+    materialize_thread_rollout(&mut mcp, &parent_thread_id).await?;
+
+    let parent_turn_id = "execute-turn-1".to_string();
+    let ReviewStartResponse {
+        review_thread_id, ..
+    } = mcp
+        .request(|request_id| ClientRequest::ReviewStart {
+            request_id,
+            params: ReviewStartParams {
+                thread_id: parent_thread_id.clone(),
+                delivery: Some(ReviewDelivery::Detached),
+                detached_context: Some(DetachedReviewContext {
+                    parent_thread_id: parent_thread_id.clone(),
+                    parent_turn_id: parent_turn_id.clone(),
+                    durable_state_key: parent_thread_id.clone(),
+                }),
+                target: ReviewTarget::Custom {
+                    instructions: "detached factory review".to_string(),
+                },
+            },
+        })
+        .await?;
+
+    assert_ne!(review_thread_id, parent_thread_id);
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/started"),
+    )
+    .await??;
+    let started: ThreadStartedNotification = serde_json::from_value(
+        notification
+            .params
+            .expect("thread/started params must be present"),
+    )?;
+    assert_eq!(started.thread.id, review_thread_id);
+    assert_eq!(started.thread.forked_from_id, None);
+    assert_eq!(started.thread.parent_thread_id, None);
+    assert_eq!(
+        started.thread.source,
+        SessionSource::SubAgent(SubAgentSource::Review)
+    );
+    assert_eq!(started.thread.thread_source, Some(ThreadSource::Subagent));
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let review_request = &requests[1];
+    assert!(!review_request.body_contains_text("materialize rollout"));
+    assert_eq!(
+        review_request.header("x-openai-subagent").as_deref(),
+        Some("review")
+    );
+    let metadata: serde_json::Value = serde_json::from_str(
+        review_request
+            .header("x-codex-turn-metadata")
+            .as_deref()
+            .expect("review turn metadata must be present"),
+    )?;
+    assert_eq!(
+        metadata["thread_id"].as_str(),
+        Some(review_thread_id.as_str())
+    );
 
     Ok(())
 }
@@ -466,6 +574,7 @@ async fn review_start_rejects_empty_commit_sha() -> Result<()> {
         .send_review_start_request(ReviewStartParams {
             thread_id,
             delivery: Some(ReviewDelivery::Inline),
+            detached_context: None,
             target: ReviewTarget::Commit {
                 sha: "\t".to_string(),
                 title: None,
@@ -503,6 +612,7 @@ async fn review_start_rejects_empty_custom_instructions() -> Result<()> {
         .send_review_start_request(ReviewStartParams {
             thread_id,
             delivery: Some(ReviewDelivery::Inline),
+            detached_context: None,
             target: ReviewTarget::Custom {
                 instructions: "\n\n".to_string(),
             },

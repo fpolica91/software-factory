@@ -1,7 +1,5 @@
 .env
 /secrets/
-context-library/
-.hatchet-token
 .env.local
 
 # Build artifacts

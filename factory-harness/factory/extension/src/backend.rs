@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::RwLock;
+
+use serde_json::Value;
 
 use crate::FactoryState;
 
@@ -12,6 +12,12 @@ use crate::FactoryState;
 pub enum FactoryStateDurability {
     ProcessMemory,
     Durable,
+}
+
+/// Cursor into the host's append-only event history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactoryEventReference {
+    pub sequence: u64,
 }
 
 /// Backend failure surfaced to Factory tools and model context.
@@ -39,42 +45,23 @@ impl Error for FactoryBackendError {}
 pub type FactoryBackendFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, FactoryBackendError>> + Send + 'a>>;
 
-/// Load/save boundary implemented by process-memory and factoryd backends.
+/// Load/save boundary supplied by the durable Factory host.
 pub trait FactoryStateBackend: Send + Sync {
     fn load<'a>(&'a self, thread_id: &'a str) -> FactoryBackendFuture<'a, Option<FactoryState>>;
 
     fn save<'a>(&'a self, thread_id: &'a str, state: FactoryState) -> FactoryBackendFuture<'a, ()>;
 
+    /// Archives detailed history before its current-state projection is
+    /// bounded. `None` means no separate event substrate is available, so the
+    /// caller must retain the full detail in state.
+    fn append_event<'a>(
+        &'a self,
+        _kind: &'a str,
+        _payload: Value,
+        _deduplication_key: &'a str,
+    ) -> FactoryBackendFuture<'a, Option<FactoryEventReference>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn durability(&self) -> FactoryStateDurability;
-}
-
-/// Process-local backend used until `factoryd` supplies crash durability.
-#[derive(Debug, Default)]
-pub struct InMemoryFactoryStateBackend {
-    states: RwLock<HashMap<String, FactoryState>>,
-}
-
-impl FactoryStateBackend for InMemoryFactoryStateBackend {
-    fn load<'a>(&'a self, thread_id: &'a str) -> FactoryBackendFuture<'a, Option<FactoryState>> {
-        Box::pin(async move {
-            self.states
-                .read()
-                .map(|states| states.get(thread_id).cloned())
-                .map_err(|_| FactoryBackendError::new("Factory state backend lock failed"))
-        })
-    }
-
-    fn save<'a>(&'a self, thread_id: &'a str, state: FactoryState) -> FactoryBackendFuture<'a, ()> {
-        Box::pin(async move {
-            self.states
-                .write()
-                .map_err(|_| FactoryBackendError::new("Factory state backend lock failed"))?
-                .insert(thread_id.to_string(), state);
-            Ok(())
-        })
-    }
-
-    fn durability(&self) -> FactoryStateDurability {
-        FactoryStateDurability::ProcessMemory
-    }
 }

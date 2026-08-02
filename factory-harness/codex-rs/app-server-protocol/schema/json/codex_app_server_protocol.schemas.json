@@ -9318,6 +9318,25 @@
         "title": "DeprecationNoticeNotification",
         "type": "object"
       },
+      "DetachedReviewContext": {
+        "properties": {
+          "durableStateKey": {
+            "type": "string"
+          },
+          "parentThreadId": {
+            "type": "string"
+          },
+          "parentTurnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "durableStateKey",
+          "parentThreadId",
+          "parentTurnId"
+        ],
+        "type": "object"
+      },
       "DynamicToolCallOutputContentItem": {
         "oneOf": [
           {
@@ -17059,6 +17078,18 @@
             ],
             "default": null,
             "description": "Where to run the review: inline (default) on the current thread or detached on a new thread (returned in `reviewThreadId`)."
+          },
+          "detachedContext": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/DetachedReviewContext"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Explicit lineage for a detached review started by a durable host.\n\nOrdinary clients should leave this unset. It is rejected for inline reviews."
           },
           "target": {
             "$ref": "#/definitions/v2/ReviewTarget"

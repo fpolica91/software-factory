@@ -1,48 +1,60 @@
-use crate::AttemptFailure;
-use crate::ClaimRequest;
+use crate::AttemptFence;
 use crate::CoordinatorError;
 use crate::CoordinatorInstanceId;
 use crate::CoordinatorStore;
 use crate::EnsureWorkspaceRequest;
-use crate::FactoryThreadStateDocument;
-use crate::NewCheckpoint;
-use crate::NewPendingRequest;
-use crate::PendingRequestId;
-use crate::PendingRequestResolution;
-use crate::RenewLeaseRequest;
+use crate::NewAttemptEvent;
 use crate::WorkspaceManager;
+use crate::ids::AttemptId;
+use crate::ids::JobId;
+use crate::ids::ThreadId;
 use axum::Json;
 use axum::Router;
+use axum::body::Body;
 use axum::extract::FromRef;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
-use factory_protocol::FactoryCorrelation;
-use factory_protocol::ids::AttemptId;
-use factory_protocol::ids::JobId;
-use factory_protocol::ids::OperationId;
-use factory_protocol::ids::ThreadId;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::net::TcpListener;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RecoveryClaimRequest {
-    pub job_id: Option<JobId>,
-    pub owner_instance_id: CoordinatorInstanceId,
-    pub lease_seconds: u32,
+struct JobEventListQuery {
+    #[serde(default)]
+    after: u64,
+    #[serde(default = "default_job_event_limit")]
+    limit: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+fn default_job_event_limit() -> u32 {
+    200
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PendingRequestListQuery {
-    job_id: Option<JobId>,
+struct AttemptEventWriteRequest {
+    owner_instance_id: CoordinatorInstanceId,
+    lease_epoch: u64,
+    #[serde(flatten)]
+    event: NewAttemptEvent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadStateWriteRequest {
+    attempt_id: AttemptId,
+    owner_instance_id: CoordinatorInstanceId,
+    lease_epoch: u64,
+    state: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,13 +116,13 @@ impl IntoResponse for ApiError {
                     CoordinatorError::InvalidJobDefinition(_) => {
                         (StatusCode::BAD_REQUEST, "invalidJobDefinition")
                     }
-                    CoordinatorError::WorkflowRunConflict(_) => {
-                        (StatusCode::CONFLICT, "workflowRunConflict")
-                    }
                     CoordinatorError::InvalidInput(_) => (StatusCode::BAD_REQUEST, "invalidInput"),
                     CoordinatorError::JobNotFound(_) => (StatusCode::NOT_FOUND, "jobNotFound"),
                     CoordinatorError::JobNotCancellable { .. } => {
                         (StatusCode::CONFLICT, "jobNotCancellable")
+                    }
+                    CoordinatorError::JobCancellationRequested(_) => {
+                        (StatusCode::CONFLICT, "jobCancellationRequested")
                     }
                     CoordinatorError::WorkspaceNotFound(_) => {
                         (StatusCode::NOT_FOUND, "workspaceNotFound")
@@ -130,23 +142,11 @@ impl IntoResponse for ApiError {
                     CoordinatorError::CheckpointCorrelationMismatch => {
                         (StatusCode::CONFLICT, "checkpointCorrelationMismatch")
                     }
-                    CoordinatorError::PendingRequestNotFound(_) => {
-                        (StatusCode::NOT_FOUND, "pendingRequestNotFound")
-                    }
-                    CoordinatorError::PendingRequestInactive(_) => {
-                        (StatusCode::CONFLICT, "pendingRequestInactive")
-                    }
-                    CoordinatorError::PendingRequestConflict(_) => {
-                        (StatusCode::CONFLICT, "pendingRequestConflict")
-                    }
-                    CoordinatorError::PendingRequestPairing(_) => {
-                        (StatusCode::CONFLICT, "pendingRequestPairingMismatch")
-                    }
-                    CoordinatorError::PendingRequestPayload(_) => {
-                        (StatusCode::BAD_REQUEST, "invalidPendingRequestPayload")
+                    CoordinatorError::ThreadStateOwnershipMismatch { .. } => {
+                        (StatusCode::CONFLICT, "threadStateOwnershipMismatch")
                     }
                     CoordinatorError::Database(_)
-                    | CoordinatorError::ThreadStateDecode(_)
+                    | CoordinatorError::Serialization(_)
                     | CoordinatorError::UnsupportedState { .. }
                     | CoordinatorError::NumericRange { .. } => {
                         (StatusCode::INTERNAL_SERVER_ERROR, "internalError")
@@ -185,53 +185,57 @@ pub async fn serve_http_with_workspaces(
 fn router(state: ApiState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/v1/jobs", post(create_job))
-        .route("/v1/jobs/active", get(list_active_jobs))
-        .route("/v1/jobs/{job_id}", get(load_job))
-        .route("/v1/jobs/{job_id}/cancel", post(cancel_job))
-        .route("/v1/jobs/{job_id}/attempts", get(list_job_attempts))
+        .route("/jobs", post(create_job))
+        .route("/jobs/active", get(list_active_jobs))
+        .route("/jobs/{job_id}", get(load_job))
+        .route("/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/jobs/{job_id}/attempts", get(list_job_attempts))
+        .route("/jobs/{job_id}/events", get(list_job_events))
+        .route("/jobs/{job_id}/result", get(export_workspace_result))
         .route(
-            "/v1/jobs/{job_id}/stage-checkpoints",
+            "/jobs/{job_id}/stage-checkpoints",
             get(list_stage_checkpoints),
         )
         .route(
-            "/v1/jobs/{job_id}/workspace",
+            "/jobs/{job_id}/workspace",
             get(load_workspace)
                 .put(ensure_workspace)
                 .delete(remove_workspace),
         )
         .route(
-            "/v1/jobs/{job_id}/workspace/revision",
+            "/jobs/{job_id}/workspace/revision",
             post(refresh_workspace_revision),
         )
-        .route("/v1/recoveries/claim", post(claim_recovery))
-        .route("/v1/operations/{operation_id}/claim", post(claim_operation))
-        .route("/v1/correlations", post(append_correlation))
+        .route("/attempts/{attempt_id}/events", post(append_attempt_event))
         .route(
-            "/v1/pending-requests",
-            get(list_pending_requests).post(register_pending_request),
-        )
-        .route(
-            "/v1/pending-requests/{pending_request_id}",
-            get(load_pending_request),
-        )
-        .route(
-            "/v1/pending-requests/{pending_request_id}/resolve",
-            post(resolve_pending_request),
-        )
-        .route("/v1/checkpoints", post(save_checkpoint))
-        .route("/v1/attempts/{attempt_id}/complete", post(complete_attempt))
-        .route("/v1/attempts/{attempt_id}/fail", post(fail_attempt))
-        .route("/v1/attempts/{attempt_id}/renew", post(renew_attempt))
-        .route(
-            "/v1/threads/{thread_id}/state",
+            "/threads/{thread_id}/state",
             get(load_thread_state).put(put_thread_state),
         )
         .with_state(state)
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::SignalKind;
+
+        let terminate = tokio::signal::unix::signal(SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -280,6 +284,60 @@ async fn list_job_attempts(
     Ok(Json(attempts).into_response())
 }
 
+async fn list_job_events(
+    State(store): State<CoordinatorStore>,
+    Path(job_id): Path<String>,
+    Query(query): Query<JobEventListQuery>,
+) -> ApiResult {
+    let page = store
+        .list_job_events(&JobId::new(job_id), query.after, query.limit)
+        .await?;
+    Ok(Json(page).into_response())
+}
+
+async fn export_workspace_result(
+    State(state): State<ApiState>,
+    Path(job_id): Path<String>,
+) -> ApiResult {
+    let result = state
+        .workspaces
+        .export_result(&state.store, &JobId::new(job_id))
+        .await?;
+    let mut response = Response::new(Body::from(result.patch));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.git.patch"),
+    );
+    insert_result_header(
+        &mut response,
+        "x-factory-repository-id",
+        &result.repository_id,
+    )?;
+    insert_result_header(
+        &mut response,
+        "x-factory-base-revision",
+        &result.base_revision,
+    )?;
+    insert_result_header(
+        &mut response,
+        "x-factory-patch-sha256",
+        &result.patch_sha256,
+    )?;
+    Ok(response)
+}
+
+fn insert_result_header(
+    response: &mut Response,
+    name: &'static str,
+    value: &str,
+) -> Result<(), ApiError> {
+    let value = HeaderValue::from_str(value).map_err(|error| {
+        CoordinatorError::Workspace(format!("invalid {name} result metadata: {error}"))
+    })?;
+    response.headers_mut().insert(name, value);
+    Ok(())
+}
+
 async fn ensure_workspace(
     State(state): State<ApiState>,
     Path(job_id): Path<String>,
@@ -319,125 +377,18 @@ async fn remove_workspace(State(state): State<ApiState>, Path(job_id): Path<Stri
     Ok((StatusCode::OK, Json(workspace)).into_response())
 }
 
-async fn claim_recovery(
+async fn append_attempt_event(
     State(store): State<CoordinatorStore>,
-    Json(request): Json<RecoveryClaimRequest>,
+    Path(attempt_id): Path<String>,
+    Json(request): Json<AttemptEventWriteRequest>,
 ) -> ApiResult {
-    let claim = ClaimRequest {
+    let fence = AttemptFence {
+        attempt_id: AttemptId::new(attempt_id),
         owner_instance_id: request.owner_instance_id,
-        lease_seconds: request.lease_seconds,
+        lease_epoch: request.lease_epoch,
     };
-    let lease = match request.job_id {
-        Some(job_id) => store.claim_recovery_for_job(&job_id, &claim).await?,
-        None => store.claim_next_recovery(&claim).await?,
-    };
-    Ok(optional_lease_response(lease))
-}
-
-async fn claim_operation(
-    State(store): State<CoordinatorStore>,
-    Path(operation_id): Path<String>,
-    Json(request): Json<ClaimRequest>,
-) -> ApiResult {
-    let lease = store
-        .claim_recovery_for_operation(&OperationId::new(operation_id), &request)
-        .await?;
-    Ok(optional_lease_response(lease))
-}
-
-fn optional_lease_response(lease: Option<crate::RecoveryLease>) -> Response {
-    match lease {
-        Some(lease) => Json(lease).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
-    }
-}
-
-async fn append_correlation(
-    State(store): State<CoordinatorStore>,
-    Json(correlation): Json<FactoryCorrelation>,
-) -> ApiResult {
-    let record = store.append_correlation(&correlation).await?;
+    let record = store.append_attempt_event(&fence, request.event).await?;
     Ok((StatusCode::CREATED, Json(record)).into_response())
-}
-
-async fn register_pending_request(
-    State(store): State<CoordinatorStore>,
-    Json(pending): Json<NewPendingRequest>,
-) -> ApiResult {
-    let (record, created) = store.register_pending_request(pending).await?;
-    let status = if created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(record)).into_response())
-}
-
-async fn list_pending_requests(
-    State(store): State<CoordinatorStore>,
-    Query(query): Query<PendingRequestListQuery>,
-) -> ApiResult {
-    let records = store.list_pending_requests(query.job_id.as_ref()).await?;
-    Ok(Json(records).into_response())
-}
-
-async fn load_pending_request(
-    State(store): State<CoordinatorStore>,
-    Path(pending_request_id): Path<String>,
-) -> ApiResult {
-    let record = store
-        .load_pending_request(&PendingRequestId::new(pending_request_id))
-        .await?;
-    Ok(Json(record).into_response())
-}
-
-async fn resolve_pending_request(
-    State(store): State<CoordinatorStore>,
-    Path(pending_request_id): Path<String>,
-    Json(resolution): Json<PendingRequestResolution>,
-) -> ApiResult {
-    let record = store
-        .resolve_pending_request(&PendingRequestId::new(pending_request_id), resolution)
-        .await?;
-    Ok(Json(record).into_response())
-}
-
-async fn save_checkpoint(
-    State(store): State<CoordinatorStore>,
-    Json(checkpoint): Json<NewCheckpoint>,
-) -> ApiResult {
-    let record = store.save_checkpoint(checkpoint).await?;
-    Ok((StatusCode::CREATED, Json(record)).into_response())
-}
-
-async fn complete_attempt(
-    State(store): State<CoordinatorStore>,
-    Path(attempt_id): Path<String>,
-) -> ApiResult {
-    store.complete_attempt(&AttemptId::new(attempt_id)).await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-async fn fail_attempt(
-    State(store): State<CoordinatorStore>,
-    Path(attempt_id): Path<String>,
-    Json(failure): Json<AttemptFailure>,
-) -> ApiResult {
-    store
-        .fail_attempt(&AttemptId::new(attempt_id), failure)
-        .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-async fn renew_attempt(
-    State(store): State<CoordinatorStore>,
-    Path(attempt_id): Path<String>,
-    Json(request): Json<RenewLeaseRequest>,
-) -> ApiResult {
-    let attempt = store
-        .renew_attempt(&AttemptId::new(attempt_id), &request)
-        .await?;
-    Ok(Json(attempt).into_response())
 }
 
 async fn load_thread_state(
@@ -455,10 +406,15 @@ async fn load_thread_state(
 async fn put_thread_state(
     State(store): State<CoordinatorStore>,
     Path(thread_id): Path<String>,
-    Json(state): Json<FactoryThreadStateDocument>,
+    Json(request): Json<ThreadStateWriteRequest>,
 ) -> ApiResult {
+    let fence = AttemptFence {
+        attempt_id: request.attempt_id,
+        owner_instance_id: request.owner_instance_id,
+        lease_epoch: request.lease_epoch,
+    };
     let state = store
-        .put_thread_state(&ThreadId::new(thread_id), state)
+        .put_thread_state(&fence, &ThreadId::new(thread_id), request.state)
         .await?;
     Ok(Json(state).into_response())
 }

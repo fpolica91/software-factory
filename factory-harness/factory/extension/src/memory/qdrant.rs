@@ -17,11 +17,17 @@ use crate::memory::FactoryMemoryError;
 use crate::memory::FactoryMemoryFuture;
 use crate::memory::FactoryMemoryHit;
 use crate::memory::FactoryMemoryRecord;
+use crate::memory::FactoryMemoryScope;
 use crate::memory::FactoryMemoryStore;
 use crate::memory::MemoryVector;
 use crate::memory::MemoryVectorKind;
 use crate::memory::MemoryVectorizer;
 use crate::memory::validate_name;
+
+// The lexical sparse vectors use unnormalized term-frequency weights. A score
+// of one means only one token matched, which proved too weak for automatic
+// context injection and allowed generic words to override an unrelated task.
+const MIN_LEXICAL_RECALL_SCORE: f32 = 2.0;
 
 #[derive(Clone, Debug)]
 pub struct QdrantMemoryConfig {
@@ -194,7 +200,7 @@ impl QdrantMemoryStore {
 impl FactoryMemoryStore for QdrantMemoryStore {
     fn remember<'a>(
         &'a self,
-        namespace: &'a str,
+        scope: &'a FactoryMemoryScope,
         source_thread_id: &'a str,
         content: String,
         tags: Vec<String>,
@@ -212,7 +218,8 @@ impl FactoryMemoryStore for QdrantMemoryStore {
             let record = FactoryMemoryRecord {
                 id: Uuid::new_v4().to_string(),
                 content,
-                namespace: namespace.to_string(),
+                namespace: scope.namespace().to_string(),
+                repository_id: scope.repository_id().to_string(),
                 tags,
                 source_thread_id: source_thread_id.to_string(),
                 created_at: timestamp.clone(),
@@ -245,7 +252,7 @@ impl FactoryMemoryStore for QdrantMemoryStore {
 
     fn recall<'a>(
         &'a self,
-        namespace: &'a str,
+        scope: &'a FactoryMemoryScope,
         query: &'a str,
         limit: usize,
     ) -> FactoryMemoryFuture<'a, Vec<FactoryMemoryHit>> {
@@ -256,18 +263,16 @@ impl FactoryMemoryStore for QdrantMemoryStore {
                 return Ok(Vec::new());
             }
             let query = self.vector_value(vector)?;
+            let body = recall_body(
+                scope,
+                query,
+                self.vectorizer.vector_name(),
+                limit,
+                matches!(self.vectorizer.kind(), MemoryVectorKind::Sparse),
+            );
             let response = self
                 .request(self.client.post(self.query_url()?))
-                .json(&json!({
-                    "query": query,
-                    "using": self.vectorizer.vector_name(),
-                    "filter": {
-                        "must": [{"key": "namespace", "match": {"value": namespace}}]
-                    },
-                    "limit": limit,
-                    "with_payload": true,
-                    "with_vector": false,
-                }))
+                .json(&body)
                 .send()
                 .await
                 .map_err(|error| request_error("recall", error))?;
@@ -307,6 +312,32 @@ impl FactoryMemoryStore for QdrantMemoryStore {
     }
 }
 
+fn recall_body(
+    scope: &FactoryMemoryScope,
+    query: Value,
+    vector_name: &str,
+    limit: usize,
+    sparse: bool,
+) -> Value {
+    let mut body = json!({
+        "query": query,
+        "using": vector_name,
+        "filter": {
+            "must": [
+                {"key": "namespace", "match": {"value": scope.namespace()}},
+                {"key": "repository_id", "match": {"value": scope.repository_id()}},
+            ]
+        },
+        "limit": limit,
+        "with_payload": true,
+        "with_vector": false,
+    });
+    if sparse {
+        body["score_threshold"] = json!(MIN_LEXICAL_RECALL_SCORE);
+    }
+    body
+}
+
 fn request_error(operation: &str, error: reqwest::Error) -> FactoryMemoryError {
     FactoryMemoryError::new(format!("Qdrant {operation} failed: {error}"))
 }
@@ -318,4 +349,35 @@ async fn response_error(operation: &str, response: reqwest::Response) -> Factory
         .await
         .unwrap_or_else(|error| format!("failed to read error response: {error}"));
     FactoryMemoryError::new(format!("Qdrant {operation} returned HTTP {status}: {body}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::FactoryRepositoryId;
+
+    #[test]
+    fn recall_filter_requires_namespace_and_repository_identity() {
+        let scope = FactoryMemoryScope::new(
+            Arc::<str>::from("factory-global"),
+            FactoryRepositoryId::new("local:repository-a").expect("repository identity"),
+        );
+
+        let body = recall_body(
+            &scope,
+            json!({"indices": [1], "values": [1.0]}),
+            "factory_sparse",
+            5,
+            true,
+        );
+
+        assert_eq!(
+            body["filter"]["must"],
+            json!([
+                {"key": "namespace", "match": {"value": "factory-global"}},
+                {"key": "repository_id", "match": {"value": "local:repository-a"}},
+            ])
+        );
+        assert_eq!(body["score_threshold"], json!(MIN_LEXICAL_RECALL_SCORE));
+    }
 }

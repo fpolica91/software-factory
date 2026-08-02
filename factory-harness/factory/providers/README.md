@@ -1,90 +1,62 @@
-# Factory Provider Bridge
+# Factory Providers
 
-This crate contains optional translation adapters between the Codex Responses
-API and providers that expose another wire protocol. Direct
-Responses-compatible providers do not use this crate. Codex core remains
-unchanged and continues to use `wire_api = "responses"`.
+This crate is Factory's provider boundary. Codex continues to speak its native
+Responses API. OpenAI already supports that protocol and is configured directly;
+it does not start this adapter. Anthropic, DeepSeek, and Z.AI use the native Rust
+`factory-provider-bridge` binary to translate their official streaming APIs into
+Responses events.
 
-The optional profiles are Z.AI GLM 5.2 through its Standard API endpoint and
-DeepSeek through its official OpenAI-compatible Chat endpoint.
-Protocol translation is delegated to the maintained MIT-licensed
-[`@bitkyc08/opencodex`](https://github.com/lidge-jun/opencodex) package, pinned
-to version 2.8.0. Factory starts its public server API in an isolated state
-directory. It does not run the `ocx` CLI, modify a user's Codex configuration,
-or enable unrelated provider adapters.
+There is no JavaScript bridge, npm install, provider SDK, or mirrored Factory
+protocol. The adapter exposes only:
 
-Install the pinned bridge dependency once:
+- `GET /healthz`
+- `POST /v1/responses` with `stream: true`
+
+## Provider profiles
+
+| ID | Transport | Default model | Key variable | Base URL |
+| --- | --- | --- | --- | --- |
+| `openai` | direct Responses | `gpt-5.6-sol` | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
+| `anthropic` | Messages adapter | `claude-sonnet-5` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` |
+| `deepseek` | Chat adapter | `deepseek-v4-pro` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com` |
+| `zai` | Chat adapter | `glm-5.2` | `ZAI_API_KEY` | Coding or Standard API |
+
+Z.AI's Coding Developer Plan base is
+`https://api.z.ai/api/coding/paas/v4`; its Standard API base is
+`https://api.z.ai/api/paas/v4`. `provider_profiles()` is the canonical catalog
+used by onboarding and runtime configuration.
+
+## Run an adapter
 
 ```sh
-cd factory-harness/factory/providers/bridge
-npm ci
-```
-
-Set `ZAI_API_KEY`, then run the bridge from the Factory workspace:
-
-```sh
+ZAI_API_KEY=... \
+FACTORY_PROVIDER_UPSTREAM_ID=zai \
+FACTORY_PROVIDER_UPSTREAM_MODEL=glm-5.2 \
+FACTORY_PROVIDER_UPSTREAM_BASE_URL=https://api.z.ai/api/coding/paas/v4 \
 cargo run -p factory-providers --bin factory-provider-bridge
 ```
 
-Packaged installations resolve bridge assets next to the executable at
-`../lib/software-factory/provider-bridge`; source-tree resolution is only a
-development fallback. Set `FACTORY_PROVIDER_RESOURCE_DIR` for another installed
-layout. A container-facing deployment can bind and advertise different URLs:
+The server binds to `127.0.0.1:10101` by default. Deployment may set
+`FACTORY_PROVIDER_BIND_HOST`, `FACTORY_PROVIDER_PORT`,
+`FACTORY_PROVIDER_ADVERTISED_URL`, and `FACTORY_PROVIDER_STATE_DIR`.
+`FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV` changes only the environment-variable
+name from which the adapter reads the upstream key.
+Run `factory-provider-bridge --help` for the complete environment contract;
+help does not require an API key.
+
+## Translation contract
+
+The adapter preserves function, namespace, custom/freeform `apply_patch`, tool
+results, parallel calls, streaming text, usage, and upstream error bodies.
+Provider reasoning state is returned in the Responses reasoning item and replayed
+on the next tool turn. That includes Z.AI/DeepSeek `reasoning_content` and
+Anthropic's exact signed thinking blocks. Forked or resumed history also replays
+completed calls whose tools are intentionally hidden from the current turn,
+while live provider output must still resolve to a currently advertised tool.
+
+Fixture tests need no API key:
 
 ```sh
-FACTORY_PROVIDER_BIND_HOST=0.0.0.0 \
-FACTORY_PROVIDER_ADVERTISED_URL=http://zai-provider:10101/v1 \
-FACTORY_PROVIDER_STATE_DIR=/var/lib/software-factory/provider \
-FACTORY_PROVIDER_BRIDGE_TOKEN=replace-this-local-token \
-factory-provider-bridge
+cargo test -p factory-providers
+cargo check -p factory-providers --no-default-features --lib
 ```
-
-The advertised URL is the full Responses API base used in Codex thread config.
-Non-loopback binds require `FACTORY_PROVIDER_BRIDGE_TOKEN`; Codex reads it
-through the generated `X-OpenCodex-API-Key` environment-header mapping. This
-adapter-local token is separate from `ZAI_API_KEY` and is not forwarded
-upstream. `factory configure --preset zai` generates it automatically.
-For Z.AI, the state directory contains `codex-models.json`; mount it into
-workers at the same absolute path advertised by the deployment. DeepSeek uses
-Codex fallback model metadata and does not require this catalog.
-
-For GLM 5.2, Factory writes a typed Codex `ModelsResponse` catalog into the
-isolated provider state directory. `ProviderBridge::selection()` returns the
-model, provider ID, optional `model_catalog_json` path, and per-thread
-configuration needed by `thread/start`. OpenCodex's Chat adapter preserves
-Codex tool definitions and tool results without modifying Codex core or user
-configuration.
-
-Both official Z.AI OpenAI-compatible endpoint choices are explicit:
-
-- Standard API (default within the `zai` preset):
-  `https://api.z.ai/api/paas/v4`
-- Coding Developer Plan: `https://api.z.ai/api/coding/paas/v4`
-
-Both use model `glm-5.2`. Select Coding Developer Plan without changing code:
-
-```sh
-FACTORY_ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4 \
-  cargo run -p factory-providers --bin factory-provider-bridge
-```
-
-`FACTORY_ZAI_API_KEY_ENV` remains a compatibility override for the name of the
-key-bearing environment variable. The profile intentionally fixes the model to
-exact `glm-5.2`.
-`BridgeOptions::glm()` and `BridgeOptions::standard()` use the Standard API by
-default; Rust callers can set `upstream_base_url` for Coding Plan. The bridge
-binary accepts neutral `FACTORY_PROVIDER_UPSTREAM_ID`,
-`FACTORY_PROVIDER_UPSTREAM_MODEL`, `FACTORY_PROVIDER_UPSTREAM_BASE_URL`, and
-`FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV` inputs. It prints the complete
-`threadStart` fragment, including `config.model_catalog_json` when present, for
-non-Rust callers.
-
-The `deepseek` preset supplies provider ID `deepseek`, model
-`deepseek-v4-pro`, base `https://api.deepseek.com`, and key environment variable
-`DEEPSEEK_API_KEY`. It uses a separate state volume from Z.AI and relies on the
-installed OpenCodex DeepSeek registry plus Codex fallback metadata.
-
-The direct GLM functional acceptance lives in
-`../../../harness-client/scripts/glm-tool-smoke.mjs`. It proves hidden-value tool
-use, tool-result continuation, model-backed Codex compaction, a fresh runtime
-process, persisted thread resume, and a second tool-using turn.

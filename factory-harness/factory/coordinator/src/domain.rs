@@ -1,15 +1,12 @@
+use crate::correlation::Correlation;
 use crate::error::CoordinatorError;
 use crate::error::Result;
+use crate::ids::AttemptId;
+use crate::ids::JobId;
+use crate::ids::OperationId;
+use crate::ids::ThreadId;
 use chrono::DateTime;
 use chrono::Utc;
-use factory_protocol::FactoryCorrelation;
-use factory_protocol::FactoryRawServerRequest;
-use factory_protocol::FactoryRawServerResponse;
-use factory_protocol::ids::AttemptId;
-use factory_protocol::ids::JobId;
-use factory_protocol::ids::OperationId;
-use factory_protocol::ids::ThreadId;
-use factory_protocol::ids::WorkflowRunId;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -42,7 +39,6 @@ macro_rules! coordinator_id {
 coordinator_id!(CheckpointId);
 coordinator_id!(CorrelationRecordId);
 coordinator_id!(CoordinatorInstanceId);
-coordinator_id!(PendingRequestId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +65,7 @@ impl WorkspaceState {
 pub enum JobState {
     Queued,
     Running,
+    Cancelling,
     Succeeded,
     Failed,
     Cancelled,
@@ -79,6 +76,7 @@ impl JobState {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Cancelling => "cancelling",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -89,6 +87,7 @@ impl JobState {
         match value {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
+            "cancelling" => Ok(Self::Cancelling),
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
@@ -137,28 +136,6 @@ pub enum AttemptState {
     Abandoned,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PendingRequestState {
-    Pending,
-    Resolved,
-    Inactive,
-}
-
-impl PendingRequestState {
-    pub(crate) fn from_database_value(value: &str) -> Result<Self> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "resolved" => Ok(Self::Resolved),
-            "inactive" => Ok(Self::Inactive),
-            value => Err(CoordinatorError::UnsupportedState {
-                kind: "pending request",
-                value: value.to_string(),
-            }),
-        }
-    }
-}
-
 impl AttemptState {
     pub(crate) fn from_database_value(value: &str) -> Result<Self> {
         match value {
@@ -179,8 +156,29 @@ impl AttemptState {
 pub struct JobDefinition {
     pub kind: String,
     pub input: Value,
-    pub workflow_run_id: Option<WorkflowRunId>,
     pub operations: Vec<OperationDefinition>,
+}
+
+/// Exact model execution capability pinned when a Factory task is created.
+/// Credentials and provider endpoints remain worker configuration, not job data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionProfile {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Durable input shared directly by the Factory CLI and runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactoryTaskInput {
+    pub task: String,
+    #[serde(default)]
+    pub execution_profile: Option<ExecutionProfile>,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub developer_instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,9 +196,47 @@ pub struct JobRecord {
     pub kind: String,
     pub input: Value,
     pub state: JobState,
-    pub workflow_run_id: Option<WorkflowRunId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A coordinator lifecycle event that is not owned by an execution attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewJobEvent {
+    pub job_id: JobId,
+    pub kind: String,
+    pub payload: Value,
+}
+
+/// An execution event written while an attempt still owns its lease.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAttemptEvent {
+    pub kind: String,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deduplication_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobEventRecord {
+    pub sequence: u64,
+    pub job_id: JobId,
+    pub operation_id: Option<OperationId>,
+    pub attempt_id: Option<AttemptId>,
+    pub kind: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One incremental page from a job's append-only event stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobEventPage {
+    pub events: Vec<JobEventRecord>,
+    pub next_cursor: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,6 +275,7 @@ pub struct StageCheckpointRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnsureWorkspaceRequest {
+    pub repository_id: String,
     pub repository: String,
     #[serde(default = "default_workspace_base_ref")]
     pub base_ref: String,
@@ -248,18 +285,44 @@ fn default_workspace_base_ref() -> String {
     "HEAD".to_string()
 }
 
+/// Complete active binding written when a managed worktree is materialized or
+/// its current revision advances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBinding {
+    pub job_id: JobId,
+    pub repository_id: String,
+    pub repository: String,
+    pub base_ref: String,
+    pub base_revision: String,
+    pub branch_name: String,
+    pub root: String,
+    pub revision: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {
     pub job_id: JobId,
+    pub repository_id: String,
     pub repository: String,
     pub base_ref: String,
+    pub base_revision: String,
     pub branch_name: String,
     pub root: String,
     pub revision: String,
     pub state: WorkspaceState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Immutable-base change set exported from a succeeded managed worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceResult {
+    pub job_id: JobId,
+    pub repository_id: String,
+    pub base_revision: String,
+    pub patch_sha256: String,
+    pub patch: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,6 +333,7 @@ pub struct AttemptRecord {
     pub attempt_number: u32,
     pub state: AttemptState,
     pub owner_instance_id: CoordinatorInstanceId,
+    pub lease_epoch: u64,
     pub lease_expires_at: DateTime<Utc>,
     pub recovery_cause: RecoveryCause,
     pub resumes_attempt_id: Option<AttemptId>,
@@ -279,39 +343,35 @@ pub struct AttemptRecord {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+impl AttemptRecord {
+    pub fn fence(&self) -> AttemptFence {
+        AttemptFence {
+            attempt_id: self.attempt_id.clone(),
+            owner_instance_id: self.owner_instance_id.clone(),
+            lease_epoch: self.lease_epoch,
+        }
+    }
+}
+
+/// Identifies one exclusive lease generation for a durable attempt.
+///
+/// An expired attempt keeps its business identity and attempt number when a
+/// new worker takes ownership. Incrementing `lease_epoch` makes every handle
+/// held by the previous worker permanently stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptFence {
+    pub attempt_id: AttemptId,
+    pub owner_instance_id: CoordinatorInstanceId,
+    pub lease_epoch: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DurableCorrelationRecord {
     pub correlation_id: CorrelationRecordId,
-    pub correlation: FactoryCorrelation,
+    pub correlation: Correlation,
     pub observed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewPendingRequest {
-    pub attempt_id: AttemptId,
-    pub request: FactoryRawServerRequest,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingRequestResolution {
-    pub response: FactoryRawServerResponse,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingRequestRecord {
-    pub pending_request_id: PendingRequestId,
-    pub job_id: JobId,
-    pub operation_id: OperationId,
-    pub attempt_id: AttemptId,
-    pub request: FactoryRawServerRequest,
-    pub state: PendingRequestState,
-    pub response: Option<FactoryRawServerResponse>,
-    pub created_at: DateTime<Utc>,
-    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -395,12 +455,15 @@ pub struct RecoverySelection {
 pub struct ClaimRequest {
     pub owner_instance_id: CoordinatorInstanceId,
     pub lease_seconds: u32,
+    #[serde(default)]
+    pub execution_profile: Option<ExecutionProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenewLeaseRequest {
     pub owner_instance_id: CoordinatorInstanceId,
+    pub lease_epoch: u64,
     pub lease_seconds: u32,
 }
 
@@ -409,6 +472,7 @@ pub struct RenewLeaseRequest {
 pub struct RecoveryLease {
     pub selection: RecoverySelection,
     pub attempt: AttemptRecord,
+    pub fence: AttemptFence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -424,30 +488,20 @@ pub enum AttemptFailure {
     },
 }
 
-/// Factory-owned state that must survive Codex process and thread rehydration.
-///
-/// Each field is independently owned by its native extension contributor. The
-/// coordinator stores the document without interpreting contributor payloads.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FactoryThreadStateDocument {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decomposition: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remediation: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagents: Option<Value>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "disposition", content = "failure")]
+pub enum AttemptSettlement {
+    Succeeded,
+    Failed(AttemptFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FactoryThreadStateRecord {
     pub thread_id: ThreadId,
-    pub state: FactoryThreadStateDocument,
+    /// Opaque extension-owned state. The coordinator fences and stores it but
+    /// does not duplicate or interpret its document schema.
+    pub state: Value,
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

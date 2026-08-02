@@ -5,13 +5,41 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[features]
+default = ["adapter"]
+adapter = [
+  "dep:axum",
+  "dep:bytes",
+  "dep:codex-apply-patch",
+  "dep:codex-models-manager",
+  "dep:codex-protocol",
+  "dep:eventsource-stream",
+  "dep:futures-util",
+  "dep:reqwest",
+  "dep:serde",
+  "dep:thiserror",
+  "dep:tokio",
+  "dep:tokio-stream",
+  "dep:uuid",
+]
+
 [dependencies]
-codex-models-manager = { path = "../../codex-rs/models-manager" }
-codex-protocol = { path = "../../codex-rs/protocol" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+bytes = { version = "1", optional = true }
+codex-apply-patch = { path = "../../codex-rs/apply-patch", optional = true }
+codex-models-manager = { path = "../../codex-rs/models-manager", optional = true }
+codex-protocol = { path = "../../codex-rs/protocol", optional = true }
+eventsource-stream = { version = "0.2.3", optional = true }
+futures-util = { version = "0.3", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+thiserror = { version = "2", optional = true }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [[bin]]
 name = "factory-provider-bridge"
 path = "src/bin/factory-provider-bridge.rs"
+required-features = ["adapter"]

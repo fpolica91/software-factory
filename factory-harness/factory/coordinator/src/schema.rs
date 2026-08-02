@@ -7,8 +7,7 @@ CREATE TABLE factory_jobs (
     job_id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK (length(kind) > 0),
     input JSONB NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
-    workflow_run_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
@@ -50,8 +49,6 @@ CREATE TABLE factory_runtime_correlations (
     job_id TEXT NOT NULL,
     operation_id TEXT NOT NULL,
     attempt_id TEXT NOT NULL,
-    workflow_run_id TEXT,
-    task_run_external_id TEXT,
     request_id TEXT NOT NULL,
     thread_id TEXT,
     turn_id TEXT,
@@ -118,37 +115,127 @@ CREATE TABLE factory_workspaces (
 );
 "#;
 
-const MIGRATION_4: &str = r#"
-CREATE TABLE factory_pending_requests (
-    pending_request_id TEXT PRIMARY KEY,
-    attempt_id TEXT NOT NULL REFERENCES factory_attempts(attempt_id) ON DELETE CASCADE,
-    request_id JSONB NOT NULL CHECK (jsonb_typeof(request_id) IN ('string', 'number')),
-    method TEXT NOT NULL CHECK (length(method) > 0),
-    params JSONB NOT NULL,
-    response JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    resolved_at TIMESTAMPTZ,
-    CHECK ((response IS NULL) = (resolved_at IS NULL)),
-    UNIQUE (attempt_id, request_id)
-);
-
-CREATE INDEX factory_pending_requests_actionable_idx
-    ON factory_pending_requests (created_at, attempt_id)
-    WHERE response IS NULL;
+const MIGRATION_6: &str = r#"
+ALTER TABLE factory_attempts
+    ADD COLUMN lease_epoch BIGINT NOT NULL DEFAULT 1
+    CHECK (lease_epoch > 0);
 "#;
 
-const MIGRATION_5: &str = r#"
-CREATE UNIQUE INDEX factory_jobs_workflow_run_id_unique_idx
-    ON factory_jobs (workflow_run_id)
-    WHERE workflow_run_id IS NOT NULL;
+const MIGRATION_7: &str = r#"
+CREATE TABLE factory_job_events (
+    sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES factory_jobs(job_id) ON DELETE CASCADE,
+    operation_id TEXT,
+    attempt_id TEXT,
+    kind TEXT NOT NULL CHECK (length(kind) > 0),
+    payload JSONB NOT NULL,
+    deduplication_key TEXT CHECK (deduplication_key IS NULL OR length(deduplication_key) > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CHECK (attempt_id IS NULL OR operation_id IS NOT NULL),
+    FOREIGN KEY (operation_id, job_id)
+        REFERENCES factory_operations(operation_id, job_id) ON DELETE CASCADE,
+    FOREIGN KEY (attempt_id, operation_id)
+        REFERENCES factory_attempts(attempt_id, operation_id) ON DELETE CASCADE
+);
+
+CREATE INDEX factory_job_events_job_sequence_idx
+    ON factory_job_events (job_id, sequence);
+CREATE UNIQUE INDEX factory_job_events_job_deduplication_idx
+    ON factory_job_events (job_id, deduplication_key)
+    WHERE deduplication_key IS NOT NULL;
+"#;
+
+// Remove the unused coordinator approval workflow from databases created by
+// older development builds. Native autonomous sessions answer Codex server
+// requests directly and never read this table.
+const REMOVE_PENDING_REQUESTS: &str = "DROP TABLE IF EXISTS factory_pending_requests CASCADE;";
+
+// Drop external-workflow columns left by the deleted Hatchet-backed runner.
+// Native Factory jobs and Codex correlations use their own durable IDs.
+const REMOVE_EXTERNAL_WORKFLOW_IDS: &str = r#"
+DROP INDEX IF EXISTS factory_jobs_workflow_run_id_unique_idx;
+ALTER TABLE factory_jobs DROP COLUMN IF EXISTS workflow_run_id;
+ALTER TABLE factory_runtime_correlations DROP COLUMN IF EXISTS workflow_run_id;
+ALTER TABLE factory_runtime_correlations DROP COLUMN IF EXISTS task_run_external_id;
+"#;
+
+const ADD_JOB_EVENT_DEDUPLICATION: &str = r#"
+ALTER TABLE factory_job_events
+    ADD COLUMN IF NOT EXISTS deduplication_key TEXT
+    CHECK (deduplication_key IS NULL OR length(deduplication_key) > 0);
+CREATE UNIQUE INDEX IF NOT EXISTS factory_job_events_job_deduplication_idx
+    ON factory_job_events (job_id, deduplication_key)
+    WHERE deduplication_key IS NOT NULL;
+"#;
+
+// Repository identity is deliberately separate from its clone transport.
+// Every pre-migration workspace is assigned a job-scoped legacy identity so
+// the fixed historical `/workspace/project` locator can never alias a newly
+// identified host checkout. The original resolved revision becomes its
+// immutable result-application base.
+const ADD_WORKSPACE_IDENTITY_AND_BASE_REVISION: &str = r#"
+ALTER TABLE factory_workspaces
+    ADD COLUMN IF NOT EXISTS repository_id TEXT;
+ALTER TABLE factory_workspaces
+    ADD COLUMN IF NOT EXISTS base_revision TEXT;
+
+UPDATE factory_workspaces
+SET repository_id = 'legacy:' || job_id
+WHERE repository_id IS NULL;
+UPDATE factory_workspaces
+SET base_revision = revision
+WHERE base_revision IS NULL;
+
+ALTER TABLE factory_workspaces
+    ALTER COLUMN repository_id SET NOT NULL;
+ALTER TABLE factory_workspaces
+    ALTER COLUMN base_revision SET NOT NULL;
+ALTER TABLE factory_workspaces
+    ADD CONSTRAINT factory_workspaces_repository_id_nonempty
+    CHECK (length(repository_id) > 0);
+ALTER TABLE factory_workspaces
+    ADD CONSTRAINT factory_workspaces_base_revision_nonempty
+    CHECK (length(base_revision) > 0);
+"#;
+
+// A running job keeps its live attempt fenced while the worker interrupts and
+// drains Codex, restores disposable Plan/review state, and then acknowledges
+// cancellation. Queued jobs still move directly to `cancelled`.
+const ADD_CANCELLATION_REQUEST_STATE: &str = r#"
+ALTER TABLE factory_jobs
+    DROP CONSTRAINT IF EXISTS factory_jobs_status_check;
+ALTER TABLE factory_jobs
+    ADD CONSTRAINT factory_jobs_status_check
+    CHECK (status IN ('queued', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled'));
+"#;
+
+// Early Rust builds pinned Anthropic jobs under the UI label `claude` even
+// though the canonical provider profile is `anthropic`. Normalize retained
+// durable inputs once so claim and runtime boundaries remain exact matches.
+const NORMALIZE_ANTHROPIC_JOB_PROFILE: &str = r#"
+UPDATE factory_jobs
+SET input = jsonb_set(
+    input,
+    '{executionProfile,provider}',
+    to_jsonb('anthropic'::TEXT),
+    false
+)
+WHERE kind = 'factory.task'
+  AND input #>> '{executionProfile,provider}' = 'claude';
 "#;
 
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, MIGRATION_1),
     (2, MIGRATION_2),
     (3, MIGRATION_3),
-    (4, MIGRATION_4),
-    (5, MIGRATION_5),
+    (6, MIGRATION_6),
+    (7, MIGRATION_7),
+    (8, REMOVE_PENDING_REQUESTS),
+    (9, REMOVE_EXTERNAL_WORKFLOW_IDS),
+    (10, ADD_JOB_EVENT_DEDUPLICATION),
+    (11, ADD_WORKSPACE_IDENTITY_AND_BASE_REVISION),
+    (12, ADD_CANCELLATION_REQUEST_STATE),
+    (13, NORMALIZE_ANTHROPIC_JOB_PROFILE),
 ];
 
 pub(crate) async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {

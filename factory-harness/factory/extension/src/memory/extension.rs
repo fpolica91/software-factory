@@ -27,7 +27,13 @@ use serde_json::json;
 
 use crate::memory::FactoryMemory;
 use crate::memory::FactoryMemoryHit;
-use crate::memory::FactoryMemoryStore;
+use crate::memory::FactoryMemoryScope;
+use crate::memory::FactoryRepositoryId;
+use crate::memory::RepositoryScopedMemory;
+use crate::stage::FactoryThreadScope;
+use crate::stage::FactoryTurnStage;
+use crate::stage::require_tool_stage;
+use crate::stage::thread_scope;
 
 const REMEMBER_TOOL: &str = "factory_remember";
 const RECALL_TOOL: &str = "factory_recall";
@@ -38,7 +44,8 @@ const MAX_MEMORY_CONTEXT_BYTES: usize = 12_000;
 
 #[derive(Clone)]
 struct FactoryMemoryExtension {
-    memory: FactoryMemory,
+    memory: RepositoryScopedMemory,
+    stage: FactoryTurnStage,
 }
 
 #[derive(Clone, Copy)]
@@ -50,8 +57,7 @@ enum FactoryMemoryToolKind {
 #[derive(Clone)]
 struct FactoryMemoryToolExecutor {
     kind: FactoryMemoryToolKind,
-    store: Arc<dyn FactoryMemoryStore>,
-    namespace: Arc<str>,
+    memory: RepositoryScopedMemory,
     source_thread_id: Arc<str>,
 }
 
@@ -71,6 +77,7 @@ struct RecallArgs {
 struct RememberReceipt {
     id: String,
     namespace: String,
+    repository_id: String,
     stored: bool,
     tag_count: usize,
     created_at: String,
@@ -79,6 +86,7 @@ struct RememberReceipt {
 #[derive(Debug, Serialize)]
 struct RecallReceipt {
     namespace: String,
+    repository_id: String,
     count: usize,
     memories: Vec<FactoryMemoryHit>,
 }
@@ -87,6 +95,7 @@ struct RecallReceipt {
 struct FactoryMemoryContext<'a> {
     source: &'static str,
     namespace: &'a str,
+    repository_id: &'a str,
     query: &'a str,
     memories: &'a [FactoryMemoryHit],
 }
@@ -104,8 +113,13 @@ struct FactoryMemoryErrorFragment {
 pub(crate) fn install_memory<C: Sync + 'static>(
     registry: &mut ExtensionRegistryBuilder<C>,
     memory: FactoryMemory,
+    repository_id: FactoryRepositoryId,
+    stage: FactoryTurnStage,
 ) {
-    let extension = Arc::new(FactoryMemoryExtension { memory });
+    let extension = Arc::new(FactoryMemoryExtension {
+        memory: memory.for_repository(repository_id),
+        stage,
+    });
     registry.tool_contributor(extension.clone());
     registry.turn_input_contributor(extension);
 }
@@ -116,23 +130,26 @@ impl ToolContributor for FactoryMemoryExtension {
         _session_store: &ExtensionData,
         thread_store: &ExtensionData,
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
-        let store = self.memory.store();
-        let namespace: Arc<str> = self.memory.namespace().to_string().into();
         let source_thread_id: Arc<str> = thread_store.level_id().to_string().into();
-        [
-            FactoryMemoryToolKind::Remember,
-            FactoryMemoryToolKind::Recall,
-        ]
-        .into_iter()
-        .map(|kind| {
-            Arc::new(FactoryMemoryToolExecutor {
-                kind,
-                store: Arc::clone(&store),
-                namespace: Arc::clone(&namespace),
-                source_thread_id: Arc::clone(&source_thread_id),
-            }) as Arc<dyn ToolExecutor<ToolCall>>
-        })
-        .collect()
+        let stage = match thread_scope(thread_store) {
+            FactoryThreadScope::Parent => self.stage,
+            FactoryThreadScope::DetachedReview | FactoryThreadScope::Subagent => {
+                FactoryTurnStage::Review
+            }
+        };
+        stage
+            .memory_tool_kinds()
+            .iter()
+            .copied()
+            .into_iter()
+            .map(|kind| {
+                Arc::new(FactoryMemoryToolExecutor {
+                    kind,
+                    memory: self.memory.clone(),
+                    source_thread_id: Arc::clone(&source_thread_id),
+                }) as Arc<dyn ToolExecutor<ToolCall>>
+            })
+            .collect()
     }
 }
 
@@ -148,7 +165,15 @@ impl ToolExecutor<ToolCall> for FactoryMemoryToolExecutor {
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             match self.kind {
-                FactoryMemoryToolKind::Remember => self.remember(call).await,
+                FactoryMemoryToolKind::Remember => {
+                    require_tool_stage(
+                        &call,
+                        REMEMBER_TOOL,
+                        &[FactoryTurnStage::Execute, FactoryTurnStage::Remediate],
+                    )
+                    .map_err(respond)?;
+                    self.remember(call).await
+                }
                 FactoryMemoryToolKind::Recall => self.recall(call).await,
             }
         })
@@ -166,18 +191,14 @@ impl FactoryMemoryToolExecutor {
         }
         validate_tags(&mut args.tags).map_err(respond)?;
         let memory = self
-            .store
-            .remember(
-                &self.namespace,
-                &self.source_thread_id,
-                args.content,
-                args.tags,
-            )
+            .memory
+            .remember(&self.source_thread_id, args.content, args.tags)
             .await
             .map_err(|error| respond(error.to_string()))?;
         json_output(RememberReceipt {
             id: memory.id,
             namespace: memory.namespace,
+            repository_id: memory.repository_id,
             stored: true,
             tag_count: memory.tags.len(),
             created_at: memory.created_at,
@@ -194,12 +215,14 @@ impl FactoryMemoryToolExecutor {
             )));
         }
         let memories = self
-            .store
-            .recall(&self.namespace, &args.query, limit)
+            .memory
+            .recall(&args.query, limit)
             .await
             .map_err(|error| respond(error.to_string()))?;
+        let scope = self.memory.scope();
         json_output(RecallReceipt {
-            namespace: self.namespace.to_string(),
+            namespace: scope.namespace().to_string(),
+            repository_id: scope.repository_id().to_string(),
             count: memories.len(),
             memories,
         })
@@ -217,11 +240,11 @@ impl FactoryMemoryToolKind {
     fn spec(self) -> ToolSpec {
         let (description, schema) = match self {
             Self::Remember => (
-                "Persist one durable Factory memory in the configured namespace for later threads. Store only information worth recalling beyond this turn.",
+                "During codex.execute or codex.remediate only, persist one durable Factory memory for later threads in this repository. Store only information worth recalling beyond this turn.",
                 remember_schema(),
             ),
             Self::Recall => (
-                "Search durable Factory memory in the configured namespace and return ranked records with their source thread and tags.",
+                "Search durable Factory memory for this repository and return ranked records with their source thread and tags.",
                 recall_schema(),
             ),
         };
@@ -234,6 +257,18 @@ impl FactoryMemoryToolKind {
                 .expect("Factory-owned memory tool schema must be valid"),
             output_schema: None,
         })
+    }
+}
+
+impl FactoryTurnStage {
+    fn memory_tool_kinds(self) -> &'static [FactoryMemoryToolKind] {
+        match self {
+            Self::Plan | Self::Review => &[FactoryMemoryToolKind::Recall],
+            Self::Execute | Self::Remediate => &[
+                FactoryMemoryToolKind::Remember,
+                FactoryMemoryToolKind::Recall,
+            ],
+        }
     }
 }
 
@@ -251,23 +286,20 @@ impl TurnInputContributor for FactoryMemoryExtension {
             if query.is_empty() {
                 return Vec::new();
             }
-            match self
-                .memory
-                .store()
-                .recall(self.memory.namespace(), &query, AUTO_RECALL_LIMIT)
-                .await
-            {
+            match self.memory.recall(&query, AUTO_RECALL_LIMIT).await {
                 Ok(mut memories) => {
                     if memories.is_empty() {
                         return Vec::new();
                     }
-                    bound_context(self.memory.namespace(), &query, &mut memories);
+                    let scope = self.memory.scope();
+                    bound_context(scope, &query, &mut memories);
                     if memories.is_empty() {
                         return Vec::new();
                     }
                     let body = serde_json::to_string(&FactoryMemoryContext {
                         source: "factory-qdrant-memory",
-                        namespace: self.memory.namespace(),
+                        namespace: scope.namespace(),
+                        repository_id: scope.repository_id(),
                         query: &query,
                         memories: &memories,
                     })
@@ -276,9 +308,11 @@ impl TurnInputContributor for FactoryMemoryExtension {
                         as Box<dyn ContextualUserFragment + Send>]
                 }
                 Err(error) => {
+                    let scope = self.memory.scope();
                     let body = json!({
                         "source": "factory-qdrant-memory",
-                        "namespace": self.memory.namespace(),
+                        "namespace": scope.namespace(),
+                        "repository_id": scope.repository_id(),
                         "error": error.to_string(),
                     })
                     .to_string();
@@ -345,11 +379,12 @@ fn user_text(input: &[UserInput]) -> String {
         .join("\n")
 }
 
-fn bound_context(namespace: &str, query: &str, memories: &mut Vec<FactoryMemoryHit>) {
+fn bound_context(scope: &FactoryMemoryScope, query: &str, memories: &mut Vec<FactoryMemoryHit>) {
     while !memories.is_empty() {
         let length = serde_json::to_vec(&FactoryMemoryContext {
             source: "factory-qdrant-memory",
-            namespace,
+            namespace: scope.namespace(),
+            repository_id: scope.repository_id(),
             query,
             memories,
         })
@@ -434,4 +469,262 @@ fn recall_schema() -> Value {
         }),
         &["query", "limit"],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use codex_extension_api::NoopTurnItemEmitter;
+    use codex_extension_api::ToolPayload;
+    use codex_utils_output_truncation::TruncationPolicy;
+
+    use super::*;
+    use crate::memory::FactoryMemoryError;
+    use crate::memory::FactoryMemoryFuture;
+    use crate::memory::FactoryMemoryRecord;
+    use crate::memory::FactoryMemoryStore;
+
+    #[derive(Default)]
+    struct LeakyMemoryStore {
+        next_id: AtomicUsize,
+        memories: Mutex<Vec<FactoryMemoryRecord>>,
+    }
+
+    impl FactoryMemoryStore for LeakyMemoryStore {
+        fn remember<'a>(
+            &'a self,
+            scope: &'a FactoryMemoryScope,
+            source_thread_id: &'a str,
+            content: String,
+            tags: Vec<String>,
+        ) -> FactoryMemoryFuture<'a, FactoryMemoryRecord> {
+            Box::pin(async move {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+                let memory = FactoryMemoryRecord {
+                    id: format!("memory-{id}"),
+                    content,
+                    namespace: scope.namespace().to_string(),
+                    repository_id: scope.repository_id().to_string(),
+                    tags,
+                    source_thread_id: source_thread_id.to_string(),
+                    created_at: "2026-08-02T00:00:00.000Z".to_string(),
+                    updated_at: "2026-08-02T00:00:00.000Z".to_string(),
+                    vectorizer: "test".to_string(),
+                };
+                self.memories
+                    .lock()
+                    .expect("memory store lock")
+                    .push(memory.clone());
+                Ok(memory)
+            })
+        }
+
+        fn recall<'a>(
+            &'a self,
+            _scope: &'a FactoryMemoryScope,
+            _query: &'a str,
+            limit: usize,
+        ) -> FactoryMemoryFuture<'a, Vec<FactoryMemoryHit>> {
+            Box::pin(async move {
+                // Intentionally return every repository's records. The scoped
+                // capability must still prevent them from reaching a caller.
+                Ok(self
+                    .memories
+                    .lock()
+                    .expect("memory store lock")
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .map(|memory| FactoryMemoryHit { memory, score: 4.0 })
+                    .collect())
+            })
+        }
+    }
+
+    fn memory_extension(memory: &FactoryMemory, repository_id: &str) -> FactoryMemoryExtension {
+        memory_extension_at_stage(memory, repository_id, FactoryTurnStage::Execute)
+    }
+
+    fn memory_extension_at_stage(
+        memory: &FactoryMemory,
+        repository_id: &str,
+        stage: FactoryTurnStage,
+    ) -> FactoryMemoryExtension {
+        FactoryMemoryExtension {
+            memory: memory.for_repository(
+                FactoryRepositoryId::new(repository_id).expect("repository identity"),
+            ),
+            stage,
+        }
+    }
+
+    fn memory_tool(
+        extension: &FactoryMemoryExtension,
+        thread_id: &str,
+        name: &str,
+    ) -> Arc<dyn ToolExecutor<ToolCall>> {
+        extension
+            .tools(
+                &ExtensionData::new("session"),
+                &ExtensionData::new(thread_id),
+            )
+            .into_iter()
+            .find(|tool| tool.tool_name() == ToolName::plain(name))
+            .unwrap_or_else(|| panic!("missing memory tool {name}"))
+    }
+
+    fn tool_call(name: &str, arguments: Value) -> (ToolCall, ToolPayload) {
+        tool_call_at_stage(name, arguments, FactoryTurnStage::Execute)
+    }
+
+    fn tool_call_at_stage(
+        name: &str,
+        arguments: Value,
+        stage: FactoryTurnStage,
+    ) -> (ToolCall, ToolPayload) {
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        (
+            ToolCall {
+                turn_id: "turn-1".to_string(),
+                call_id: "call-1".to_string(),
+                tool_name: ToolName::plain(name),
+                model: "test-model".to_string(),
+                codex_turn_metadata: Some(
+                    json!({
+                        crate::FACTORY_STAGE_METADATA_KEY:
+                            stage.as_wire_name(),
+                    })
+                    .to_string(),
+                ),
+                truncation_policy: TruncationPolicy::Bytes(16_384),
+                conversation_history: codex_extension_api::ConversationHistory::default(),
+                turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+                environments: Vec::new(),
+                payload: payload.clone(),
+            },
+            payload,
+        )
+    }
+
+    async fn recall_receipt(extension: &FactoryMemoryExtension) -> Value {
+        let tool = memory_tool(extension, "thread-recall", RECALL_TOOL);
+        let (call, payload) = tool_call(
+            RECALL_TOOL,
+            json!({"query": "repository alpha nonce", "limit": 5}),
+        );
+        tool.handle(call)
+            .await
+            .expect("recall succeeds")
+            .post_tool_use_response("call-1", &payload)
+            .expect("recall response")
+    }
+
+    async fn automatic_recall(extension: &FactoryMemoryExtension) -> Vec<String> {
+        extension
+            .contribute(
+                TurnInputContext {
+                    turn_id: "turn-auto".to_string(),
+                    user_input: vec![UserInput::Text {
+                        text: "repository alpha nonce".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    environments: Vec::new(),
+                },
+                None,
+                &ExtensionData::new("session"),
+                &ExtensionData::new("thread-auto"),
+                &ExtensionData::new("turn-auto"),
+            )
+            .await
+            .into_iter()
+            .map(|fragment| fragment.render())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn plan_cannot_persist_long_term_memory() {
+        let store = Arc::new(LeakyMemoryStore::default());
+        let memory =
+            FactoryMemory::with_store("factory-global", store.clone()).expect("memory capability");
+        let extension =
+            memory_extension_at_stage(&memory, "local:repository-a", FactoryTurnStage::Plan);
+        let tools = extension.tools(
+            &ExtensionData::new("session"),
+            &ExtensionData::new("thread-plan"),
+        );
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_name(), ToolName::plain(RECALL_TOOL));
+        assert!(store.memories.lock().expect("memory store lock").is_empty());
+    }
+
+    #[test]
+    fn ordinary_subagents_receive_recall_but_not_memory_writes() {
+        let store: Arc<dyn FactoryMemoryStore> = Arc::new(LeakyMemoryStore::default());
+        let memory = FactoryMemory::with_store("factory-global", store).expect("memory capability");
+        let extension = memory_extension(&memory, "local:repository-a");
+        let thread_store = ExtensionData::new("thread-child");
+        thread_store.insert(FactoryThreadScope::Subagent);
+
+        let tools = extension.tools(&ExtensionData::new("session"), &thread_store);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_name(), ToolName::plain(RECALL_TOOL));
+    }
+
+    #[tokio::test]
+    async fn explicit_and_automatic_memory_are_repository_scoped() {
+        let store = Arc::new(LeakyMemoryStore::default());
+        let store: Arc<dyn FactoryMemoryStore> = store;
+        let memory = FactoryMemory::with_store("factory-global", store).expect("memory capability");
+        let repository_a = memory_extension(&memory, "local:repository-a");
+        let repository_b = memory_extension(&memory, "local:repository-b");
+
+        let remember = memory_tool(&repository_a, "thread-a", REMEMBER_TOOL);
+        let (call, payload) = tool_call(
+            REMEMBER_TOOL,
+            json!({
+                "content": "repository alpha nonce belongs only to A",
+                "tags": ["isolation"],
+            }),
+        );
+        let receipt = remember
+            .handle(call)
+            .await
+            .expect("remember succeeds")
+            .post_tool_use_response("call-1", &payload)
+            .expect("remember response");
+        assert_eq!(receipt["repository_id"], "local:repository-a");
+
+        let same_repository = recall_receipt(&repository_a).await;
+        assert_eq!(same_repository["count"], 1);
+        assert_eq!(
+            same_repository["memories"][0]["repository_id"],
+            "local:repository-a"
+        );
+
+        let different_repository = recall_receipt(&repository_b).await;
+        assert_eq!(different_repository["count"], 0);
+        assert_eq!(different_repository["memories"], json!([]));
+
+        let same_repository_context = automatic_recall(&repository_a).await;
+        assert_eq!(same_repository_context.len(), 1);
+        assert!(same_repository_context[0].contains("belongs only to A"));
+        assert!(same_repository_context[0].contains("local:repository-a"));
+
+        assert!(automatic_recall(&repository_b).await.is_empty());
+    }
+
+    #[test]
+    fn repository_identity_rejects_empty_values() {
+        assert_eq!(
+            FactoryRepositoryId::new("  ")
+                .expect_err("empty identity")
+                .to_string(),
+            FactoryMemoryError::new("Factory repository identity must not be empty").to_string()
+        );
+    }
 }

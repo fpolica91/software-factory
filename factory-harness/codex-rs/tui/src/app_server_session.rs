@@ -1211,6 +1211,7 @@ impl AppServerSession {
                     thread_id: thread_id.to_string(),
                     target,
                     delivery: Some(ReviewDelivery::Inline),
+                    detached_context: None,
                 },
             })
             .await

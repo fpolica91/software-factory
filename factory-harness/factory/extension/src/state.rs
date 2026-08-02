@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -5,6 +6,7 @@ use codex_extension_api::ExtensionData;
 use tokio::sync::Mutex;
 
 use crate::FactoryBackendError;
+use crate::FactoryEventReference;
 use crate::FactoryState;
 use crate::FactoryStateBackend;
 use crate::FactoryStateDurability;
@@ -13,8 +15,36 @@ use crate::FactoryStateDurability;
 pub struct FactoryThreadState {
     thread_id: String,
     backend: Arc<dyn FactoryStateBackend>,
-    state: Mutex<FactoryState>,
-    load_error: Option<FactoryBackendError>,
+    state: Mutex<Option<FactoryState>>,
+}
+
+struct FactoryThreadStateAttachment(Arc<FactoryThreadState>);
+
+#[derive(Default)]
+pub(crate) struct FactoryStateRegistry {
+    states: Mutex<HashMap<String, Arc<FactoryThreadState>>>,
+}
+
+impl FactoryStateRegistry {
+    pub(crate) async fn get_or_create(
+        &self,
+        durable_thread_key: &str,
+        backend: Arc<dyn FactoryStateBackend>,
+    ) -> Arc<FactoryThreadState> {
+        let thread_id = durable_thread_key.to_string();
+        let candidate = Arc::new(FactoryThreadState {
+            thread_id: thread_id.clone(),
+            backend,
+            state: Mutex::new(None),
+        });
+        Arc::clone(
+            self.states
+                .lock()
+                .await
+                .entry(thread_id)
+                .or_insert(candidate),
+        )
+    }
 }
 
 impl fmt::Debug for FactoryThreadState {
@@ -23,7 +53,6 @@ impl fmt::Debug for FactoryThreadState {
             .debug_struct("FactoryThreadState")
             .field("thread_id", &self.thread_id)
             .field("durability", &self.backend.durability())
-            .field("load_error", &self.load_error)
             .finish_non_exhaustive()
     }
 }
@@ -39,57 +68,141 @@ impl FactoryThreadState {
     }
 
     pub async fn snapshot(&self) -> Result<FactoryState, FactoryBackendError> {
-        self.ensure_loaded()?;
-        Ok(self.state.lock().await.clone())
+        let mut current = self.state.lock().await;
+        self.load_if_needed(&mut current).await?;
+        Ok(current.as_ref().expect("Factory state is loaded").clone())
     }
 
     pub(crate) async fn update(
         &self,
         mutation: impl FnOnce(&mut FactoryState) -> Result<(), String>,
     ) -> Result<FactoryState, FactoryBackendError> {
-        self.ensure_loaded()?;
         let mut current = self.state.lock().await;
-        let mut next = current.clone();
+        self.load_if_needed(&mut current).await?;
+        let mut next = current.as_ref().expect("Factory state is loaded").clone();
         mutation(&mut next).map_err(FactoryBackendError::new)?;
         next.revision = next.revision.saturating_add(1);
         self.backend.save(&self.thread_id, next.clone()).await?;
-        *current = next.clone();
+        *current = Some(next.clone());
         Ok(next)
     }
 
-    fn ensure_loaded(&self) -> Result<(), FactoryBackendError> {
-        match &self.load_error {
-            Some(error) => Err(error.clone()),
-            None => Ok(()),
+    pub(crate) async fn append_event(
+        &self,
+        kind: &str,
+        payload: serde_json::Value,
+        deduplication_key: &str,
+    ) -> Result<Option<FactoryEventReference>, FactoryBackendError> {
+        self.backend
+            .append_event(kind, payload, deduplication_key)
+            .await
+    }
+
+    async fn load_if_needed(
+        &self,
+        current: &mut Option<FactoryState>,
+    ) -> Result<(), FactoryBackendError> {
+        if current.is_none() {
+            *current = Some(
+                self.backend
+                    .load(&self.thread_id)
+                    .await?
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn attach_thread_state(
+    thread_store: &ExtensionData,
+    state: Arc<FactoryThreadState>,
+) -> Arc<FactoryThreadState> {
+    let attachment = thread_store.get_or_init(|| FactoryThreadStateAttachment(Arc::clone(&state)));
+    Arc::clone(&attachment.0)
+}
+
+pub(crate) fn attached_thread_state(
+    thread_store: &ExtensionData,
+) -> Option<Arc<FactoryThreadState>> {
+    thread_store
+        .get::<FactoryThreadStateAttachment>()
+        .map(|attachment| Arc::clone(&attachment.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::FactoryBackendFuture;
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        state: StdMutex<Option<FactoryState>>,
+        appended_events: AtomicUsize,
+    }
+
+    impl FactoryStateBackend for RecordingBackend {
+        fn load<'a>(
+            &'a self,
+            _thread_id: &'a str,
+        ) -> FactoryBackendFuture<'a, Option<FactoryState>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .map(|state| state.clone())
+                    .map_err(|_| FactoryBackendError::new("test state lock failed"))
+            })
+        }
+
+        fn save<'a>(
+            &'a self,
+            _thread_id: &'a str,
+            state: FactoryState,
+        ) -> FactoryBackendFuture<'a, ()> {
+            Box::pin(async move {
+                *self
+                    .state
+                    .lock()
+                    .map_err(|_| FactoryBackendError::new("test state lock failed"))? = Some(state);
+                Ok(())
+            })
+        }
+
+        fn append_event<'a>(
+            &'a self,
+            _kind: &'a str,
+            _payload: serde_json::Value,
+            _deduplication_key: &'a str,
+        ) -> FactoryBackendFuture<'a, Option<FactoryEventReference>> {
+            Box::pin(async move {
+                let sequence = self.appended_events.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(Some(FactoryEventReference {
+                    sequence: sequence as u64,
+                }))
+            })
+        }
+
+        fn durability(&self) -> FactoryStateDurability {
+            FactoryStateDurability::Durable
         }
     }
-}
 
-pub(crate) async fn initialize_thread_state(
-    thread_store: &ExtensionData,
-    backend: Arc<dyn FactoryStateBackend>,
-) -> Arc<FactoryThreadState> {
-    initialize_thread_state_with_key(thread_store, thread_store.level_id(), backend).await
-}
+    #[tokio::test]
+    async fn unrelated_state_updates_append_no_subagent_events() {
+        let backend = Arc::new(RecordingBackend::default());
+        let thread_state = FactoryThreadState {
+            thread_id: "thread-1".to_string(),
+            backend: backend.clone(),
+            state: Mutex::new(None),
+        };
 
-pub(crate) async fn initialize_thread_state_with_key(
-    thread_store: &ExtensionData,
-    durable_thread_key: &str,
-    backend: Arc<dyn FactoryStateBackend>,
-) -> Arc<FactoryThreadState> {
-    if let Some(existing) = thread_store.get::<FactoryThreadState>() {
-        return existing;
+        thread_state.update(|_| Ok(())).await.unwrap();
+
+        assert_eq!(backend.appended_events.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.state.lock().unwrap().as_ref().unwrap().revision, 1);
     }
-
-    let thread_id = durable_thread_key.to_string();
-    let (state, load_error) = match backend.load(&thread_id).await {
-        Ok(state) => (state.unwrap_or_default(), None),
-        Err(error) => (FactoryState::default(), Some(error)),
-    };
-    thread_store.get_or_init(|| FactoryThreadState {
-        thread_id,
-        backend,
-        state: Mutex::new(state),
-        load_error,
-    })
 }

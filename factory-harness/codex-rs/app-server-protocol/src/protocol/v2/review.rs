@@ -23,6 +23,23 @@ pub struct ReviewStartParams {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub delivery: Option<ReviewDelivery>,
+
+    /// Explicit lineage for a detached review started by a durable host.
+    ///
+    /// Ordinary clients should leave this unset. It is rejected for inline
+    /// reviews.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub detached_context: Option<DetachedReviewContext>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct DetachedReviewContext {
+    pub parent_thread_id: String,
+    pub parent_turn_id: String,
+    pub durable_state_key: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

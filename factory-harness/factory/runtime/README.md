@@ -1,10 +1,13 @@
-# Factory Runtime Configuration
+# Factory Worker Runtime
 
-`factory-runtime` is the full Codex app-server lifecycle with additive native
-Factory contributors. It does not implement a second model or agent loop.
+The `factory-runtime` crate is the library behind the shipped `factory-worker`
+binary. The worker embeds the full Codex app-server lifecycle and installs
+native Factory contributors; it does not implement a second model or agent
+loop.
 
-`FACTORYD_URL` selects durable Factory thread state. Without it, state uses the
-documented process-memory standalone backend.
+Every operation uses a fenced `FactorydStateBackend`. `FACTORYD_URL` identifies
+that durable state service; there is no standalone process-memory product
+mode.
 
 Long-term memory is enabled by setting:
 
@@ -17,36 +20,31 @@ FACTORY_MEMORY_NAMESPACE=default
 `FACTORY_QDRANT_API_KEY` is optional. If `FACTORY_QDRANT_URL` is absent, the
 runtime reports that memory is disabled, omits `factory_remember` and
 `factory_recall`, and otherwise runs the complete Codex harness unchanged.
-Qdrant sparse lexical retrieval is the baseline; Ollama is not required.
+Qdrant sparse lexical retrieval is the baseline; Ollama is not required. The
+worker passes the durable job repository identity into each Codex session, so
+automatic and explicit recall remain repository-scoped even when the configured
+namespace is shared by every worker.
 
-## Functional memory acceptance
+Planning, execution, and remediation run autonomously inside the isolated job
+container. Plan uses Codex's read-only Landlock path, removes `apply_patch` and
+`request_permissions` before sampling, and still allows native shell and
+subagent inspection. Its stage validator additionally requires a pure
+decomposition. Native Rust functional acceptance is recorded in
+`RUST_CUTOVER.md`; the superseded JavaScript fixtures have been deleted.
 
-With the GLM provider bridge listening on port 18102 and the Factory client
-built, run from this directory:
+A recovered Plan first promotes a valid completed checkpoint instead of
+discarding durable work. Only after a replacement turn is proven necessary does
+the runtime restore the recorded Factory state and managed-worktree baseline,
+immediately before starting that turn. The current attempt's thread correlation
+is stored before any fenced Plan or review recovery write.
 
-```sh
-node scripts/glm-qdrant-memory-smoke.mjs
-```
-
-The script owns a disposable `qdrant/qdrant:v1.16` container unless an external
-`FACTORY_QDRANT_URL` is supplied. It stores a unique fact through
-`factory_remember`, stops the complete runtime, starts a fresh runtime and
-distinct Codex thread, proves automatic marked-context recall without a tool,
-then verifies `factory_recall` and the exact persisted Qdrant payload/vector.
-It also asserts that the fixture workspace remains byte-for-byte unchanged and
-stops only the container it created.
-
-## Functional subagent acceptance
-
-With the same GLM bridge and built Factory client, run:
-
-```sh
-node scripts/glm-factoryd-subagent-smoke.mjs
-```
-
-The script starts disposable PostgreSQL and factoryd instances, then proves a
-real parent model spawns a native child, waits for its exact result, and closes
-or interrupts it. It restarts the complete runtime, verifies the unchanged
-factoryd activity document, and inspects the persisted child through native
-`thread/read` and parent-filtered `thread/list`. Only services started by the
-script are stopped.
+Cancellation, provider failure, validation failure, and worker shutdown close
+and drain the native Codex session before rollback. Detached review snapshots
+preserve tracked, staged, and nonignored untracked content while allowing
+ignored build artifacts. A review mutation is restored and rejected, with a
+durable marker retaining that fact across process death until Factory review
+state has also rolled back. A running job remains `cancelling` until this cleanup
+finishes; only then does the worker acknowledge its terminal cancellation.
+Compose gives `factory-worker` a 75-second stop grace period so Docker does not
+force-kill it during the app-server drain, rollback, and immediate lease
+relinquishment path.

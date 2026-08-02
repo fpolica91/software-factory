@@ -74,11 +74,11 @@ stop_factoryd() {
 start_factoryd
 job="$({
   jq -n '{kind:"workspace.acceptance",input:{},operations:[{kind:"codex.execute",input:{},maxAttempts:1}]}'
-} | curl -fsS -X POST "$base_url/v1/jobs" -H 'content-type: application/json' --data-binary @-)"
+} | curl -fsS -X POST "$base_url/jobs" -H 'content-type: application/json' --data-binary @-)"
 job_id="$(jq -r '.job.jobId' <<<"$job")"
 workspace="$({
   jq -n --arg repository "$source_repo" '{repository:$repository,baseRef:"main"}'
-} | curl -fsS -X PUT "$base_url/v1/jobs/$job_id/workspace" -H 'content-type: application/json' --data-binary @-)"
+} | curl -fsS -X PUT "$base_url/jobs/$job_id/workspace" -H 'content-type: application/json' --data-binary @-)"
 workspace_root="$(jq -r '.root' <<<"$workspace")"
 
 [[ "$(jq -r '.revision' <<<"$workspace")" == "$source_revision" ]]
@@ -89,15 +89,15 @@ workspace_root="$(jq -r '.root' <<<"$workspace")"
 
 stop_factoryd
 start_factoryd
-reloaded="$(curl -fsS "$base_url/v1/jobs/$job_id/workspace")"
+reloaded="$(curl -fsS "$base_url/jobs/$job_id/workspace")"
 [[ "$(jq -r '.root' <<<"$reloaded")" == "$workspace_root" ]]
 [[ "$(jq -r '.revision' <<<"$reloaded")" == "$source_revision" ]]
 reused="$({
   jq -n --arg repository "$source_repo" '{repository:$repository,baseRef:"main"}'
-} | curl -fsS -X PUT "$base_url/v1/jobs/$job_id/workspace" -H 'content-type: application/json' --data-binary @-)"
+} | curl -fsS -X PUT "$base_url/jobs/$job_id/workspace" -H 'content-type: application/json' --data-binary @-)"
 [[ "$(jq -r '.root' <<<"$reused")" == "$workspace_root" ]]
 
-removed="$(curl -fsS -X DELETE "$base_url/v1/jobs/$job_id/workspace")"
+removed="$(curl -fsS -X DELETE "$base_url/jobs/$job_id/workspace")"
 [[ "$(jq -r '.state' <<<"$removed")" == "removed" ]]
 [[ ! -e "$workspace_root" ]]
 

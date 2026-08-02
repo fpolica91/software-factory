@@ -72,7 +72,7 @@ pub struct LexicalSparseVectorizer;
 
 impl MemoryVectorizer for LexicalSparseVectorizer {
     fn name(&self) -> &'static str {
-        "factory-lexical-fnv1a-v1"
+        "factory-lexical-fnv1a"
     }
 
     fn vector_name(&self) -> &'static str {

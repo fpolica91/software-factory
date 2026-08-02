@@ -22,6 +22,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio_util::sync::CancellationToken;
@@ -77,6 +78,7 @@ pub(crate) struct ToolRouterParams<'a> {
     pub(crate) extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     pub(crate) wait_for_environment_tool_config: Option<Arc<crate::WaitForEnvironmentToolConfig>>,
     pub(crate) dynamic_tools: &'a [DynamicToolSpec],
+    pub(crate) disabled_tools: HashSet<ToolName>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +313,26 @@ pub(crate) fn extension_tool_executors(
         .iter()
         .flat_map(|contributor| {
             contributor.tools_for_step(
+                &session.services.session_extension_data,
+                &session.services.thread_extension_data,
+                step_store,
+            )
+        })
+        .collect()
+}
+
+#[instrument(level = "trace", skip_all)]
+pub(crate) fn extension_disabled_tools(
+    session: &Session,
+    step_store: &codex_extension_api::ExtensionData,
+) -> HashSet<ToolName> {
+    session
+        .services
+        .extensions
+        .tool_contributors()
+        .iter()
+        .flat_map(|contributor| {
+            contributor.disabled_tools_for_step(
                 &session.services.session_extension_data,
                 &session.services.thread_extension_data,
                 step_store,

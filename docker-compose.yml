@@ -3,28 +3,23 @@ name: software-factory
 x-factory-image: &factory-image
   image: ${FACTORY_IMAGE:-ghcr.io/fpolica91/software-factory:edge}
 
-x-factory-runtime-env: &factory-runtime-env
-  FACTORYD_URL: http://factoryd:8787/v1
-  FACTORY_RUNTIME_PATH: ${FACTORY_RUNTIME_PATH:-/usr/local/bin/factory-runtime}
-  FACTORY_CODEX_HOME: /var/lib/software-factory/codex
+x-factory-worker-env: &factory-worker-env
+  FACTORYD_URL: http://factoryd:8787
+  FACTORY_DATABASE_URL: postgresql://factory:${POSTGRES_PASSWORD:-factory-local}@postgres:5432/factory
+  CODEX_HOME: /var/lib/software-factory/codex
   FACTORY_QDRANT_URL: http://qdrant:6333
+  FACTORY_QDRANT_API_KEY: ${FACTORY_QDRANT_API_KEY:-}
   FACTORY_QDRANT_COLLECTION: ${FACTORY_QDRANT_COLLECTION:-factory_memories}
+  # Deployment partition only; the worker also applies the durable repository ID.
   FACTORY_MEMORY_NAMESPACE: ${FACTORY_MEMORY_NAMESPACE:-factory-global}
-  FACTORY_INTEGRATION_PLUGINS_JSON: '${FACTORY_INTEGRATION_PLUGINS_JSON:-[]}'
-  FACTORY_HATCHET_TASK_RETRIES: ${FACTORY_HATCHET_TASK_RETRIES:-20}
-  FACTORY_LEASE_SECONDS: ${FACTORY_LEASE_SECONDS:-900}
-  FACTORY_MAX_REVIEW_CYCLES: ${FACTORY_MAX_REVIEW_CYCLES:-5}
   FACTORY_MODEL: ${FACTORY_MODEL:-}
-  FACTORY_MODEL_PROVIDER: ${FACTORY_MODEL_PROVIDER:-}
-  FACTORY_PROVIDER_NAME: ${FACTORY_PROVIDER_NAME:-Software Factory deployment provider}
+  FACTORY_PROVIDER_ADAPTER: ${FACTORY_PROVIDER_ADAPTER:-}
   FACTORY_PROVIDER_BASE_URL: ${FACTORY_PROVIDER_BASE_URL:-}
-  FACTORY_PROVIDER_AUTH: ${FACTORY_PROVIDER_AUTH:-key}
-  FACTORY_PROVIDER_API_KEY: ${FACTORY_PROVIDER_API_KEY:-}
   FACTORY_MODEL_CATALOG_JSON: ${FACTORY_MODEL_CATALOG_JSON:-}
-  CODEX_ANALYTICS_ENABLED: "false"
-  DO_NOT_TRACK: "1"
-  NEXT_TELEMETRY_DISABLED: "1"
-  OTEL_SDK_DISABLED: "true"
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ZAI_API_KEY: ${ZAI_API_KEY:-}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
 
 x-langfuse-env: &langfuse-env
   DATABASE_URL: postgresql://factory:${POSTGRES_PASSWORD:-factory-local}@postgres:5432/langfuse
@@ -64,38 +59,11 @@ services:
       POSTGRES_DB: factory
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U factory -d factory"]
       interval: 5s
       timeout: 5s
       retries: 20
-
-  hatchet:
-    image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:v0.87.1
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://factory:${POSTGRES_PASSWORD:-factory-local}@postgres:5432/hatchet?sslmode=disable
-      SERVER_URL: ${HATCHET_PUBLIC_URL:-http://localhost:8888}
-      SERVER_AUTH_COOKIE_DOMAIN: ${HATCHET_COOKIE_DOMAIN:-localhost}
-      SERVER_AUTH_COOKIE_INSECURE: "t"
-      SERVER_AUTH_SET_EMAIL_VERIFIED: "t"
-      SERVER_GRPC_BIND_ADDRESS: 0.0.0.0
-      SERVER_GRPC_INSECURE: "t"
-      SERVER_GRPC_PORT: "7077"
-      SERVER_GRPC_BROADCAST_ADDRESS: hatchet:7077
-      SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS: localhost:7077
-      SERVER_DEFAULT_ENGINE_VERSION: V1
-      SERVER_ANALYTICS_POSTHOG_ENABLED: "false"
-      SERVER_ANALYTICS_AGGREGATE_ENABLED: "false"
-    volumes:
-      - hatchet-config:/config
-    ports:
-      - "${HATCHET_PORT:-8888}:8888"
-      - "${HATCHET_GRPC_PORT:-7077}:7077"
 
   qdrant:
     image: qdrant/qdrant:v1.16
@@ -124,9 +92,6 @@ services:
       FACTORY_WORKSPACE_ROOT: /workspaces
       FACTORY_RUN_AS_UID: ${FACTORY_RUN_AS_UID:-}
       FACTORY_RUN_AS_GID: ${FACTORY_RUN_AS_GID:-}
-      CODEX_ANALYTICS_ENABLED: "false"
-      DO_NOT_TRACK: "1"
-      OTEL_SDK_DISABLED: "true"
     entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
     command:
       - sh
@@ -134,47 +99,46 @@ services:
       - exec factoryd --database-url "$${FACTORY_DATABASE_URL}" serve --bind 0.0.0.0:8787
     volumes:
       - workspaces:/workspaces
+      - type: bind
+        source: ${FACTORY_PROJECT_DIR:-.}
+        target: /workspace/project
     ports:
       - "${FACTORYD_PORT:-8787}:8787"
     healthcheck:
       test:
         - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:8787/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8787/healthz
       interval: 5s
       timeout: 5s
       retries: 20
 
-  workflow-worker:
+  factory-worker:
     <<: *factory-image
     restart: unless-stopped
+    stop_grace_period: 75s
     depends_on:
       factoryd:
         condition: service_healthy
-      hatchet:
-        condition: service_started
       qdrant:
         condition: service_healthy
     environment:
-      <<: *factory-runtime-env
-      HATCHET_CLIENT_TOKEN: ${HATCHET_CLIENT_TOKEN:-}
-      HATCHET_CLIENT_HOST_PORT: hatchet:7077
-      HATCHET_CLIENT_API_URL: http://hatchet:8888
-      HATCHET_CLIENT_TLS_STRATEGY: none
-      FACTORY_WORKFLOW_SLOTS: ${FACTORY_WORKFLOW_SLOTS:-4}
+      <<: *factory-worker-env
+      FACTORY_WORKER_SLOTS: ${FACTORY_WORKER_SLOTS:-4}
+      FACTORY_WORKER_LEASE_SECONDS: ${FACTORY_LEASE_SECONDS:-900}
+      FACTORY_WORKER_SHUTDOWN_GRACE_SECONDS: ${FACTORY_WORKER_SHUTDOWN_GRACE_SECONDS:-30}
       FACTORY_RUN_AS_UID: ${FACTORY_RUN_AS_UID:-}
       FACTORY_RUN_AS_GID: ${FACTORY_RUN_AS_GID:-}
-      FACTORY_PROVIDER_BRIDGE_TOKEN: ${FACTORY_PROVIDER_BRIDGE_TOKEN:-}
     entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
-    command: ["node", "dist/worker.js"]
+    command: ["factory-worker"]
+    working_dir: /workspaces
     volumes:
       - workspaces:/workspaces
       - codex-state:/var/lib/software-factory/codex
       - provider-state:/var/lib/software-factory/provider:ro
-      - type: bind
-        source: ${FACTORY_PROJECT_DIR:-.}
-        target: /workspace/project
 
   zai-provider:
     <<: *factory-image
@@ -188,16 +152,11 @@ services:
       FACTORY_PROVIDER_PORT: "10101"
       FACTORY_PROVIDER_BIND_HOST: 0.0.0.0
       FACTORY_PROVIDER_ADVERTISED_URL: http://zai-provider:10101/v1
-      FACTORY_PROVIDER_RESOURCE_DIR: /usr/local/lib/software-factory/provider-bridge
       FACTORY_PROVIDER_STATE_DIR: /var/lib/software-factory/provider
-      FACTORY_PROVIDER_BRIDGE_TOKEN: ${FACTORY_PROVIDER_BRIDGE_TOKEN:-}
-      FACTORY_PROVIDER_UPSTREAM_ID: factory-zai
-      FACTORY_PROVIDER_UPSTREAM_ADAPTER: openai-chat
+      FACTORY_PROVIDER_UPSTREAM_ID: zai
       FACTORY_PROVIDER_UPSTREAM_MODEL: ${FACTORY_MODEL:-glm-5.2}
       FACTORY_PROVIDER_UPSTREAM_BASE_URL: ${FACTORY_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}
       FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV: ZAI_API_KEY
-      DO_NOT_TRACK: "1"
-      OTEL_SDK_DISABLED: "true"
     entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
     command: ["factory-provider-bridge"]
     volumes:
@@ -207,9 +166,11 @@ services:
     healthcheck:
       test:
         - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:10101/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:10101/healthz
       interval: 5s
       timeout: 5s
       retries: 20
@@ -226,28 +187,25 @@ services:
       FACTORY_PROVIDER_PORT: "10101"
       FACTORY_PROVIDER_BIND_HOST: 0.0.0.0
       FACTORY_PROVIDER_ADVERTISED_URL: http://deepseek-provider:10101/v1
-      FACTORY_PROVIDER_RESOURCE_DIR: /usr/local/lib/software-factory/provider-bridge
       FACTORY_PROVIDER_STATE_DIR: /var/lib/software-factory/provider
-      FACTORY_PROVIDER_BRIDGE_TOKEN: ${FACTORY_PROVIDER_BRIDGE_TOKEN:-}
       FACTORY_PROVIDER_UPSTREAM_ID: deepseek
-      FACTORY_PROVIDER_UPSTREAM_ADAPTER: openai-chat
       FACTORY_PROVIDER_UPSTREAM_MODEL: ${FACTORY_MODEL:-deepseek-v4-pro}
       FACTORY_PROVIDER_UPSTREAM_BASE_URL: ${FACTORY_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV: DEEPSEEK_API_KEY
-      DO_NOT_TRACK: "1"
-      OTEL_SDK_DISABLED: "true"
     entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
     command: ["factory-provider-bridge"]
     volumes:
-      - deepseek-provider-state:/var/lib/software-factory/provider
+      - provider-state:/var/lib/software-factory/provider
     ports:
       - "${DEEPSEEK_PROVIDER_PORT:-10102}:10101"
     healthcheck:
       test:
         - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:10101/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:10101/healthz
       interval: 5s
       timeout: 5s
       retries: 20
@@ -264,28 +222,25 @@ services:
       FACTORY_PROVIDER_PORT: "10101"
       FACTORY_PROVIDER_BIND_HOST: 0.0.0.0
       FACTORY_PROVIDER_ADVERTISED_URL: http://claude-provider:10101/v1
-      FACTORY_PROVIDER_RESOURCE_DIR: /usr/local/lib/software-factory/provider-bridge
       FACTORY_PROVIDER_STATE_DIR: /var/lib/software-factory/provider
-      FACTORY_PROVIDER_BRIDGE_TOKEN: ${FACTORY_PROVIDER_BRIDGE_TOKEN:-}
-      FACTORY_PROVIDER_UPSTREAM_ID: anthropic-apikey
-      FACTORY_PROVIDER_UPSTREAM_ADAPTER: anthropic
+      FACTORY_PROVIDER_UPSTREAM_ID: anthropic
       FACTORY_PROVIDER_UPSTREAM_MODEL: ${FACTORY_MODEL:-claude-sonnet-5}
       FACTORY_PROVIDER_UPSTREAM_BASE_URL: ${FACTORY_CLAUDE_BASE_URL:-https://api.anthropic.com}
       FACTORY_PROVIDER_UPSTREAM_API_KEY_ENV: ANTHROPIC_API_KEY
-      DO_NOT_TRACK: "1"
-      OTEL_SDK_DISABLED: "true"
     entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
     command: ["factory-provider-bridge"]
     volumes:
-      - claude-provider-state:/var/lib/software-factory/provider
+      - provider-state:/var/lib/software-factory/provider
     ports:
       - "${CLAUDE_PROVIDER_PORT:-10103}:10101"
     healthcheck:
       test:
         - CMD
-        - node
-        - -e
-        - fetch('http://127.0.0.1:10101/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:10101/healthz
       interval: 5s
       timeout: 5s
       retries: 20
@@ -434,13 +389,10 @@ services:
 
 volumes:
   postgres-data:
-  hatchet-config:
   qdrant-data:
   workspaces:
   codex-state:
   provider-state:
-  deepseek-provider-state:
-  claude-provider-state:
   coordination-redis-data:
   artifact-data:
   ollama-data:

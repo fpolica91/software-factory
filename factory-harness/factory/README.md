@@ -7,23 +7,20 @@ extensions, and subagents.
 
 ## Crates
 
-- `runtime/` launches the full stdio app server and exposes the upstream typed
-  in-process client with Factory's native extension installed.
+- `runtime/` exposes the upstream typed in-process client with Factory's native
+  extension installed; its durable worker runs the product stage loop.
 - `extension/` owns Factory's native Codex lifecycle contributors and
   Factory-scoped thread state.
-- `protocol/` owns the stable, versioned Factory Protocol V1 contract and its
-  revision-pinned adapter to Codex app-server v2. Checked-in JSON Schema and
-  TypeScript declarations expose only Factory-owned public types.
-- `providers/` owns model-provider protocol bridges. The optional Z.AI and
-  DeepSeek profiles supervise one pinned maintained Responses-to-Chat adapter
-  and return per-thread Codex provider configuration without changing Codex
-  core or a user's global Codex configuration.
+- `providers/` owns the native Rust model-provider transport adapters and the
+  canonical provider/model profiles used by the runtime and CLI.
 - `coordinator/` owns the separate `factoryd` durable lifecycle. PostgreSQL
   stores jobs, operations, leased attempts, immutable runtime correlations,
-  and append-only checkpoints; recovery claims link a new attempt to the
-  checkpoint selected after a retry or expired lease.
+  and append-only checkpoints. Scheduled retries create a new attempt linked
+  to the selected checkpoint; expired-lease recovery transfers the same
+  attempt under a higher lease epoch without consuming its retry budget.
+- `cli/` owns interactive onboarding plus `run`, `attach`, `status`, and `stop`.
 
-The workspace root is virtual; only the product crates above are Cargo members.
+The workspace root is virtual; only these five product crates are members.
 
 Factory depends on public Codex APIs. Codex core does not depend on Factory.
 
@@ -31,56 +28,39 @@ Factory depends on public Codex APIs. Codex core does not depend on Factory.
 
 ```sh
 just build
-target/debug/factory-runtime
-target/debug/factory-runtime protocol-manifest
-target/debug/factory-runtime legacy-protocol-manifest
-cargo build --locked -p factory-coordinator --bin factoryd
+target/debug/factory --help
 ```
 
-`coordinator/README.md` documents the two-process PostgreSQL recovery
-acceptance path. It proves that a fresh `factoryd` connection can load a
-checkpoint and its complete Factory Protocol correlation, claim the eligible
-operation, and finish the recovered job.
+`just build` produces the four distribution binaries: `factory`,
+`factory-worker`, `factoryd`, and `factory-provider-bridge`. The root Dockerfile
+copies exactly those binaries into the runtime image.
 
-The stdio process uses the app-server JSONL/JSON-RPC lifecycle: `initialize`,
-`initialized`, thread start/resume/fork, turn start, streamed notifications,
-server-request responses, and shutdown. Configuration continues to use normal
-Codex configuration and `-c key=value` overrides. Pass `--strict-config` to
-reject unknown configuration fields.
+`coordinator/README.md` documents the fixture-runner recovery gate. Against
+disposable PostgreSQL and `factoryd`, it restarts the acceptance runner to
+prove stored retries, checkpointed completion, lease heartbeats and fencing,
+process-kill recovery, cooperative shutdown, and worker-slot isolation.
 
-`factory-runtime protocol-manifest` prints exactly one distribution manifest
-and exits without starting app-server. In-process hosts can read the same value
-through `factory_runtime::protocol_manifest()`. The manifest identifies the
-Factory Protocol version and schema SHA-256, pinned Codex revision, and active
-Codex app-server V2 version and schema SHA-256. The runtime computes the V2
-digest from the pinned upstream schema bundle at build time.
+Factory does not define or negotiate a second wire protocol. Separate-process
+clients speak the exact upstream app-server surface; Rust hosts use the exact
+upstream typed client. Durable job, operation, attempt, checkpoint, and runtime
+correlation records belong to `factory-coordinator` and never become Codex wire
+types.
 
-`legacy-protocol-manifest` and
-`factory_runtime::legacy_protocol_manifest()` expose the old Factory
-Protocol-only manifest for compatibility consumers. The harness client never
-uses that legacy surface for active negotiation.
+The worker sets Codex analytics off in the Rust startup configuration and skips
+remote plugin warmup. Local plugins, skills, MCP, model traffic, tools, and all
+thread behavior remain available.
 
-The launcher sets app-server's `default_analytics_enabled` argument to `false`,
-starts remote control disabled, and skips remote plugin warmup. Local plugins,
-skills, MCP, model traffic, tools, and all thread behavior remain available;
-the startup policy only prevents unintended external Codex traffic.
+## In-process worker
 
-## In-process hosts
-
-Rust hosts call `factory_runtime::in_process::start` with an
-`InProcessClientStartArgs`. The namespace also exposes
+The worker calls `factory_runtime::in_process::start_with_backend` with an
+`InProcessClientStartArgs` and a fenced `FactorydStateBackend`. The namespace
+also exposes
 `InProcessAppServerClient`, `InProcessServerEvent`, and the upstream default
 channel capacity. These retain the upstream typed app-server lifecycle,
 including its initialize handshake, requests, events, server-request
 resolution, and graceful shutdown, while installing Factory's native
-contributors through the generic Codex composition seam.
-
-The generated Factory Protocol V1 client contract lives under
-`protocol/schema/`. The exporter verifies the JSONL envelope, request/response
-pairing for every supported server request, forward-compatible unknown
-payloads, and byte-stable checked-in artifacts. It also recomputes the JSON
-Schema digest and rejects any mismatch with the compiled manifest before it
-writes or verifies those artifacts.
+contributors through the generic Codex composition seam. There is no shipped
+standalone or process-memory runtime path.
 
 The initial Factory contributor establishes Factory-owned state through the
 native Codex thread lifecycle. Memory/context, decomposition, progress,

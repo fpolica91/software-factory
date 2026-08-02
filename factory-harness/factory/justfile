@@ -5,7 +5,11 @@ fmt-check:
     cargo fmt --all -- --check
 
 build:
-    cargo build --locked -p factory-runtime -p factory-coordinator
+    cargo build --locked --workspace \
+      --bin factory \
+      --bin factory-worker \
+      --bin factoryd \
+      --bin factory-provider-bridge
 
 clippy:
     cargo clippy --locked --all-targets -- -D warnings

@@ -1,7 +1,10 @@
 use super::*;
+use codex_agent_extension::AgentHistoryPolicy;
 use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRun;
 use codex_agent_extension::AgentRunner;
+use codex_agent_extension::AgentStartOptions;
+use codex_extension_api::DetachedReviewThreadContext;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -11,6 +14,7 @@ use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSource as CoreThreadSource;
 use codex_skills::system_cache_root_dir;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
@@ -1280,10 +1284,10 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         parent_thread: Arc<CodexThread>,
         prompt: &str,
+        detached_context: Option<DetachedReviewThreadContext>,
     ) -> std::result::Result<(), JSONRPCErrorError> {
-        // AgentRunner::start still delegates to spawn_subagent, which forks from the parent's
-        // full history. Paginated threads only allow bounded model-context reads, so keep this
-        // closed until detached review has a bounded fork path.
+        // Keep the existing paginated-parent behavior stable. Detached review
+        // history is selected independently below.
         if matches!(
             parent_thread.config_snapshot().await.history_mode,
             codex_protocol::protocol::ThreadHistoryMode::Paginated
@@ -1297,22 +1301,39 @@ impl TurnRequestProcessor {
             config.model = Some(review_model.clone());
         }
 
+        let mut start_options = AgentStartOptions {
+            history_policy: AgentHistoryPolicy::Fresh,
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::Review)),
+            thread_source: Some(CoreThreadSource::Subagent),
+            ..AgentStartOptions::default()
+        };
+        if let Some(detached_context) = detached_context {
+            start_options.thread_extension_init.insert(detached_context);
+        }
+
         let AgentRun {
             thread_id,
             thread: review_thread,
             turn_id,
         } = self
             .agent_runner
-            .start(
+            .start_with_options(
                 parent_thread.session_configured().thread_id,
                 AgentInvocation {
                     config,
                     prompt: prompt.to_string(),
                     parent_trace: self.request_trace_context(request_id).await,
                 },
+                start_options,
             )
             .await
             .map_err(|err| internal_error(format!("failed to start detached review: {err}")))?;
+
+        review_thread.ensure_rollout_materialized().await;
+        review_thread
+            .flush_rollout()
+            .await
+            .map_err(|err| internal_error(format!("failed to persist detached review: {err}")))?;
 
         let fallback_provider = self.config.model_provider_id.as_str();
         let stored_thread = match review_thread
@@ -1378,12 +1399,47 @@ impl TurnRequestProcessor {
             thread_id,
             target,
             delivery,
+            detached_context,
         } = params;
 
-        let (_, parent_thread) = self.load_thread(&thread_id).await?;
+        let (parent_thread_id, parent_thread) = self.load_thread(&thread_id).await?;
         let (review_request, display_text, target_prompt) =
             Self::review_request_from_target(target)?;
-        match delivery.unwrap_or(ApiReviewDelivery::Inline).to_core() {
+        let delivery = delivery.unwrap_or(ApiReviewDelivery::Inline).to_core();
+        if delivery == CoreReviewDelivery::Inline && detached_context.is_some() {
+            return Err(invalid_request(
+                "detachedContext is only valid for detached reviews",
+            ));
+        }
+        let detached_context = detached_context
+            .map(|context| {
+                let supplied_parent = ThreadId::from_string(&context.parent_thread_id)
+                    .map_err(|_| invalid_request("detachedContext.parentThreadId is invalid"))?;
+                if supplied_parent != parent_thread_id {
+                    return Err(invalid_request(
+                        "detachedContext.parentThreadId must match threadId",
+                    ));
+                }
+                let parent_turn_id = context.parent_turn_id.trim().to_string();
+                if parent_turn_id.is_empty() {
+                    return Err(invalid_request(
+                        "detachedContext.parentTurnId must not be empty",
+                    ));
+                }
+                let durable_state_key = context.durable_state_key.trim().to_string();
+                if durable_state_key.is_empty() {
+                    return Err(invalid_request(
+                        "detachedContext.durableStateKey must not be empty",
+                    ));
+                }
+                Ok(DetachedReviewThreadContext {
+                    parent_thread_id,
+                    parent_turn_id,
+                    durable_state_key,
+                })
+            })
+            .transpose()?;
+        match delivery {
             CoreReviewDelivery::Inline => {
                 self.start_inline_review(
                     request_id,
@@ -1406,7 +1462,7 @@ impl TurnRequestProcessor {
                 if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
                     return Err(Self::input_too_large_error(actual_chars));
                 }
-                self.start_detached_review(request_id, parent_thread, &prompt)
+                self.start_detached_review(request_id, parent_thread, &prompt, detached_context)
                     .await?;
             }
         }

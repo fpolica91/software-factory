@@ -1,22 +1,21 @@
 # Software Factory
 
-Software Factory adds a durable job lifecycle around the native Codex agent
-lifecycle. `factoryd` owns jobs, leases, checkpoints, correlations, thread state,
-and per-job Git worktrees. The workflow worker resumes the same Codex thread
-across plan, execute, review, and remediation stages; it does not reimplement the
-model or tool loop.
+Software Factory runs the native Codex agent as a durable, autonomous software
+delivery job. Codex remains the only execution harness: it owns the model loop,
+tools, threads, context compaction, resume, and approvals. Factory adds durable
+job state, managed Git worktrees, checkpoints, retries, crash recovery, memory,
+and the plan, execute, review, remediate, and re-review lifecycle.
 
-One image contains `factory-runtime`, `factoryd`, the provider bridge, the
-TypeScript harness client, and the Hatchet workflows. The baseline deployment is
-only PostgreSQL, Hatchet, Qdrant, `factoryd`, and the workflow worker. The worker
-connects the runtime memory extension to Qdrant by default; `.env` can override
-`FACTORY_QDRANT_COLLECTION` and `FACTORY_MEMORY_NAMESPACE`.
+The shipped application is Rust-only. One image contains four binaries:
+`factory` (CLI), `factory-worker` (durable runner), `factoryd` (coordinator),
+and `factory-provider-bridge` (optional non-Responses translation). There is no
+Factory TypeScript client, Hatchet workflow, Cursor harness, or second agent
+loop.
 
 ## Quick Start
 
-Requirements are Docker Engine with Compose. Allocate at least 4 GB to Docker
-for the baseline stack; 8 GB leaves comfortable headroom for active jobs. No
-host agent CLI, database, Node, Rust toolchain, or local image build is required.
+Normal use requires Docker Engine with Compose and a Git repository. No host
+agent CLI, database, Node installation, or Rust toolchain is required.
 
 ```sh
 git clone https://github.com/fpolica91/software-factory.git
@@ -26,168 +25,124 @@ cd /path/to/your/project
 factory
 ```
 
-The first interactive run asks for a provider, API key, model, and task.
-Installation creates a symlink in `~/.local/bin`; add that directory to `PATH`
-if the command reports it is missing. From any Git repository, `factory run`
-pulls the prebuilt image, starts the durable services, mounts that repository,
-submits the task, and attaches to its live output.
+The first interactive run asks for a provider, API key, model, and task. The
+installer places a symlink in `~/.local/bin`; add that directory to `PATH` if
+needed. Factory pulls `ghcr.io/fpolica91/software-factory:edge`, starts the
+baseline services, creates a managed worktree, submits the job, and streams its
+durable events.
 
-The same public image, `ghcr.io/fpolica91/software-factory:edge`, runs
-`factoryd`, the workflow worker, and the selected provider bridge. It is
-published for both AMD64 and ARM64, and Docker stores the shared image layers
-only once. `factory build` is an explicit maintainer fallback; normal users
-never compile the Rust/Codex harness.
-
-Jobs are autonomous by default. Codex may execute repository tools without
-command approvals, and Factory resolves model clarification requests without
-waiting for a terminal. Attachment is for observation and control, not required
-supervision:
+Jobs are autonomous by default. Attachment observes and controls a job; it is
+not required to keep the job running.
 
 ```sh
-factory run "Implement authentication"             # submit and attach
-factory run --detach "Implement authentication"    # print the job ID and exit
-factory status JOB_ID                              # one-shot status
-factory attach JOB_ID                              # reconnect and watch progress
-factory stop JOB_ID                                # durably cancel the job
+factory run "Implement authentication"           # submit and attach
+factory run --detach "Audit this repository"     # print the job ID and exit
+factory run --repository https://host/org/repo.git --detach "Audit it"
+factory status JOB_ID                            # inspect current state
+factory attach JOB_ID                            # reconnect to live output
+factory stop JOB_ID                              # cancel durably
+factory apply JOB_ID                             # apply a completed result here
+factory export JOB_ID -o result.patch            # preserve a portable patch
 ```
 
-`Ctrl-C` detaches the terminal; it does not stop the job. A detached job keeps
-running in Hatchet and `factoryd`, survives worker restarts, and can be attached
-again later. When stdin is not a TTY, `run` automatically behaves as detached.
-Only one direct-checkout job runs at a time; Factory refuses to remount a
-different repository while that job is active.
+`Ctrl-C` detaches without stopping the job. Pass `--detach` when a script should
+return immediately; otherwise non-interactive runs stream until completion. A
+successful attached run against a local repository applies its result to the
+originating checkout by default; use `factory run --no-apply ...` to retain it
+for explicit apply or export. Local work always targets the Git checkout where
+the launcher is invoked: change into that checkout before running Factory.
+`--repository` is only for a remote Git URL, not another host path.
 
-## Model Providers
+Apply is deliberately conflict-free. Factory verifies the result digest, the
+hashed host-repository identity, the job's immutable base commit, a completely
+clean checkout, and Git's binary-patch preflight before changing files. It
+preserves text and binary changes, additions, deletions, symlinks, and executable
+mode. If any check fails, the completed job stays available and the host checkout
+is unchanged. Detached jobs remain addressable by job ID when the launcher is
+used from another repository.
 
-The direct path supports providers that expose an OpenAI-compatible Responses
-API. It uses Codex's native provider configuration and agent loop; Software
-Factory does not invoke the Claude Code or Cursor SDK/harness. Review saved
-settings without exposing key values:
+Export paths are host paths, including absolute paths. Factory downloads and
+verifies the complete patch before publishing it atomically without overwriting
+an existing file; use `-o -` when raw patch bytes should go to standard output.
+Status, stop, apply, and export start only PostgreSQL plus `factoryd`; completed
+results remain retrievable after a full shutdown without a provider key or
+model worker. Provider/model configuration uses that same control plane for
+the active-job check and never starts Qdrant, a provider bridge, or a worker.
+
+## Providers
+
+Run `factory configure` for guided setup, `factory provider` to switch
+providers, `factory model` to switch models, and `factory configure --show` to
+review settings without displaying key values.
+
+The provider and exact model are pinned into each job when it is created. Before
+a provider or model change, Factory checks every queued, running, and cancelling
+job. It refuses a switch that would leave a pinned or legacy unpinned job
+without a matching worker and prints exact commands to inspect, stop, or serve
+that job. `--force` overrides the refusal with a warning; it changes the
+configuration used for new jobs only and does not stop or migrate existing
+jobs.
+
+OpenAI Responses is a direct Codex provider path. Anthropic, DeepSeek, and Z.AI
+use the Rust provider bridge only for wire-format translation; the Codex model
+and tool loop remains unchanged. Provider configuration also works
+non-interactively through command flags and provider-specific key environment
+variables. Exported keys are honored even when the local `.env` has no key. A
+custom direct Responses-compatible endpoint is configured explicitly:
 
 ```sh
-factory configure --show
+export OPENAI_API_KEY=your-key
+factory configure --provider openai --model your-model \
+  --base https://provider.example/v1
 ```
 
-For an unattended first run, export the neutral provider settings before
-calling `factory run --detach`, or put them in the product checkout's ignored
-`.env` file:
+The supplied direct endpoint is persisted and used by Codex; it must implement
+the OpenAI Responses API. Provider-specific details are under
+[`docs/providers/`](docs/providers/).
 
-```dotenv
-FACTORY_PROVIDER_ADAPTER=responses
-FACTORY_MODEL_PROVIDER=configured-provider
-FACTORY_PROVIDER_BASE_URL=https://provider.example/v1
-FACTORY_MODEL=provider-model-id
-FACTORY_PROVIDER_AUTH=key
-FACTORY_PROVIDER_API_KEY=...
-```
+## Services
 
-Set `FACTORY_PROVIDER_AUTH=none` and omit the key only for an endpoint that does
-not require authentication. Providers using Chat, Anthropic, or another wire
-protocol require an explicitly selected translation adapter; they are not
-silently treated as Responses endpoints.
+The baseline Compose stack is deliberately small:
 
-Z.AI GLM 5.2 is one optional translated profile. Select it explicitly:
+- PostgreSQL stores durable jobs, attempts, checkpoints, leases, correlations,
+  events, and workspace state.
+- Qdrant stores Factory long-term memory and retrieval data.
+- `factoryd` exposes the durable coordinator API and owns managed worktrees.
+- `factory-worker` claims jobs and runs the native Codex lifecycle.
+
+Provider bridges start only for the selected `claude`, `deepseek`, or `zai`
+profile. Redis (`coordination`), MinIO (`artifacts`), Ollama (`local-models`),
+and Langfuse/ClickHouse (`observability`) remain explicit optional profiles;
+none is required by the baseline job lifecycle.
 
 ```sh
-factory configure --preset zai
-factory run "Review this codebase"
+factory up       # start or repair the stack
+factory logs     # follow factoryd and worker logs
+factory down     # stop services while preserving data
+factory build    # maintainer-only local image build
 ```
 
-The preset asks for `ZAI_API_KEY`, generates its internal bridge token, and
-selects the Standard API URL. Coding Developer Plan keys can select their
-endpoint explicitly in one line:
+## Source Layout
 
-```sh
-FACTORY_ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4 factory configure --preset zai
-```
+- `factory-harness/codex-rs/` preserves the upstream-shaped Codex kernel.
+- `factory-harness/factory/runtime/` composes Codex and runs durable stages.
+- `factory-harness/factory/extension/` implements Factory-native behavior and
+  Qdrant memory.
+- `factory-harness/factory/coordinator/` implements `factoryd`, persistence,
+  recovery, event replay, and worktrees.
+- `factory-harness/factory/cli/` implements the native job CLI.
+- `factory-harness/factory/providers/` implements provider profiles and the
+  optional Rust transport adapter.
 
-See [`docs/providers/zai-glm-5.2.md`](docs/providers/zai-glm-5.2.md) for
-adapter details.
-
-DeepSeek is a separate optional translated profile:
-
-```sh
-factory configure --preset deepseek
-factory run "Review this codebase"
-```
-
-The preset asks for `DEEPSEEK_API_KEY`, selects the official
-`https://api.deepseek.com` Chat endpoint, and persists `deepseek-v4-pro` as the
-model. The shared bridge translates Chat Completions to Responses while
-preserving Codex tool calls. See
-[`docs/providers/deepseek.md`](docs/providers/deepseek.md) for adapter and model
-override details.
-
-## Durable Jobs and Workspaces
-
-CLI jobs operate directly on the Git repository from which `factory` is called.
-The same job keeps one native Codex thread across planning, execution, review,
-and remediation. A requested-change review triggers remediation followed by a
-fresh independent review, repeating up to `FACTORY_MAX_REVIEW_CYCLES` (default
-`5`). Phase-aware checkpoints resume the current cycle after a worker crash.
-The coordinator also
-supports remote repositories as managed worktrees under `/workspaces` for API
-clients and future integrations.
-
-## Integration Plugins
-
-External trackers and source hosts are plugins, not core dependencies. Install
-an ESM adapter in the image and configure it explicitly:
-
-```dotenv
-FACTORY_INTEGRATION_PLUGINS_JSON=[{"module":"file:///opt/factory-plugins/tracker/index.js","config":{}}]
-```
-
-Then associate a durable job with its external work item in job input:
-
-```json
-{"integration":{"intake":{"adapter":"tracker","externalId":"WORK-42"}}}
-```
-
-The worker publishes deterministic lifecycle event IDs inside the factoryd
-attempt boundary. A failed delivery resumes from the completed Codex checkpoint
-and retries the adapter without repeating the model stage. Adapter contracts
-live in `integrations/`; no tracker or source host is enabled by default.
-
-Model, provider, runtime, and Codex-home deployment defaults come from `.env`.
-Job input overrides deployment defaults, and operation input is authoritative.
-
-## Optional Profiles
-
-| Profile | Services | Purpose |
-|---|---|---|
-| `zai` | provider bridge | Exact GLM-5.2 Standard API by default; Coding Plan by override |
-| `deepseek` | provider bridge | DeepSeek Chat translation with `deepseek-v4-pro` by default |
-| `coordination` | Redis | Optional coordination, cache, or pub/sub; never durable job state |
-| `artifacts` | MinIO | Optional S3-compatible build and run artifacts |
-| `local-models` | Ollama | Optional local model server |
-| `observability` | Langfuse web/worker, ClickHouse, Redis, MinIO | Complete opt-in trace stack; also uses baseline PostgreSQL |
-
-Enable one or more with `docker compose --profile <name> up -d`. Profile data
-uses separate volumes, so observability Redis and MinIO are not silently reused
-as Factory coordination or artifact stores.
-
-## Operations and Source Layout
-
-```sh
-factory up                                    # start or repair the local stack
-factory logs                                  # follow Factory service logs
-factory build                                 # maintainers: build a local image
-factory down                                  # stop services; preserve job data
-```
-
-Local builds cap Cargo at two parallel jobs by default. Maintainers with a
-tighter memory limit can run `FACTORY_BUILD_JOBS=1 factory build`.
-
-- `factory-harness/factory/` contains the Rust runtime, coordinator, protocol,
-  extension seam, and provider bridge.
-- `harness-client/` is the typed process/protocol client.
-- `workflows/` contains the durable Hatchet task and direct runner.
-- `integrations/` defines neutral intake, source-host, CI, and artifact adapter
-  contracts; no concrete adapter is enabled by default.
-- `postgres-init/` creates the baseline Hatchet database. The observability
-  profile creates its Langfuse database on demand.
-
-Factory disables Codex analytics and OpenTelemetry export in the image by
-default. Hatchet analytics, Qdrant telemetry, and optional Langfuse telemetry
-are also disabled through their deployment flags.
+See [`PRODUCT.md`](PRODUCT.md) for the product contract and
+[`docs/adr/0001-codex-kernel-factory-extension.md`](docs/adr/0001-codex-kernel-factory-extension.md)
+for the dependency boundary. Real-model acceptance now covers read-only
+planning, tool-using execution, native subagent delegation, detached review,
+remediation and re-review, detach/attach replay, managed worktrees, and
+cross-job Qdrant recall. It also proves native token-triggered Codex compaction
+continues the same review turn through later tool calls and terminal approval.
+The combined recovery gate now passes as well: a non-graceful worker kill after
+an in-flight execute checkpoint was reclaimed from the same durable attempt,
+continued on the same parent thread, passed exact-output verification, and was
+approved by an independent detached review. Exact evidence is recorded in
+[`RUST_CUTOVER.md`](RUST_CUTOVER.md).

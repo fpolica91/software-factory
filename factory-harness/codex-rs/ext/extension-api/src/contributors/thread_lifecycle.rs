@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::ExtensionData;
 use crate::ExtensionMetrics;
 use codex_mcp::McpResourceClient;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 
@@ -13,6 +14,19 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 /// from model- or tool-controlled input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThreadOriginator(pub String);
+
+/// Host-supplied lineage for a detached review thread.
+///
+/// This typed attachment is present only when a host explicitly supplies
+/// detached-review context. Extensions can use it to share durable state with
+/// the reviewed parent without relying on process globals or environment
+/// variables.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetachedReviewThreadContext {
+    pub parent_thread_id: ThreadId,
+    pub parent_turn_id: String,
+    pub durable_state_key: String,
+}
 
 /// Input supplied when the host starts a runtime for a thread.
 pub struct ThreadStartInput<'a, C> {

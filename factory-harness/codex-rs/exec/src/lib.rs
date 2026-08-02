@@ -931,6 +931,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         thread_id: primary_thread_id_for_span.clone(),
                         target: review_target_to_api(review_request.target),
                         delivery: None,
+                        detached_context: None,
                     },
                 },
                 "review/start",

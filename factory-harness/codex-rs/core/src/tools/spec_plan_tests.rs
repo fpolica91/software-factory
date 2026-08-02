@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use codex_features::Feature;
@@ -55,6 +56,7 @@ struct ToolPlanInputs {
     extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     wait_for_environment_tool_config: Option<Arc<WaitForEnvironmentToolConfig>>,
     dynamic_tools: Vec<DynamicToolSpec>,
+    disabled_tools: HashSet<ToolName>,
 }
 
 struct ToolPlanProbe {
@@ -198,6 +200,7 @@ async fn probe_with(
             extension_tool_executors: inputs.extension_tool_executors,
             wait_for_environment_tool_config: inputs.wait_for_environment_tool_config,
             dynamic_tools: inputs.dynamic_tools.as_slice(),
+            disabled_tools: inputs.disabled_tools,
         },
         &Default::default(),
     );
@@ -817,6 +820,31 @@ async fn environment_count_controls_environment_backed_tools() {
 }
 
 #[tokio::test]
+async fn disabled_tools_are_neither_visible_nor_dispatchable() {
+    let plan = probe_with(
+        |turn| {
+            set_feature(turn, Feature::ShellTool, /*enabled*/ true);
+            set_feature(turn, Feature::UnifiedExec, /*enabled*/ true);
+            set_feature(turn, Feature::RequestPermissionsTool, /*enabled*/ true);
+            turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+        },
+        ToolPlanInputs {
+            disabled_tools: HashSet::from([
+                ToolName::plain("apply_patch"),
+                ToolName::plain("request_permissions"),
+            ]),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["exec_command", "write_stdin"]);
+    plan.assert_registered_contains(&["exec_command", "write_stdin"]);
+    plan.assert_visible_lacks(&["apply_patch", "request_permissions"]);
+    plan.assert_registered_lacks(&["apply_patch", "request_permissions"]);
+}
+
+#[tokio::test]
 async fn environment_tools_follow_the_step_context() {
     let (_session, mut turn) = make_session_and_context().await;
     set_feature(&mut turn, Feature::UnifiedExec, /*enabled*/ true);
@@ -839,6 +867,7 @@ async fn environment_tools_follow_the_step_context() {
             extension_tool_executors: Vec::new(),
             wait_for_environment_tool_config: None,
             dynamic_tools: &[],
+            disabled_tools: Default::default(),
         },
         &Default::default(),
     ));
@@ -1042,6 +1071,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             extension_tool_executors: Vec::new(),
             wait_for_environment_tool_config: None,
             dynamic_tools: &[],
+            disabled_tools: Default::default(),
         },
         &cache,
     );
@@ -1066,6 +1096,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             extension_tool_executors: Vec::new(),
             wait_for_environment_tool_config: None,
             dynamic_tools: &[],
+            disabled_tools: Default::default(),
         },
         &cache,
     );
@@ -1121,6 +1152,7 @@ async fn tool_search_cache_rebuilds_when_deferred_world_state_changes() {
                 extension_tool_executors: Vec::new(),
                 wait_for_environment_tool_config: None,
                 dynamic_tools: &[],
+                disabled_tools: Default::default(),
             },
             &cache,
         );

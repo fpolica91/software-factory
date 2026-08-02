@@ -1,98 +1,104 @@
-# Software Factory V1
+# Software Factory
 
-Software Factory V1 turns the complete Codex runtime into a durable software
+Software Factory turns the complete Codex runtime into a durable software
 delivery system without replacing or duplicating its harness.
 
-## Product contract
+## Product Contract
 
-The architecture is **one distribution, two lifecycles, no duplicated harness**:
+The architecture is **one distribution, two lifecycles, no duplicated
+harness**:
 
-1. **Codex is the execution kernel.** Keep its real planning and agent loop,
-   tools, existing sandbox and approval behavior, threads, persistence,
-   resume/fork, context compaction, goals, skills, MCP, extensions, and
-   subagent primitives working as upstream capabilities.
-2. **Factory is a native Codex extension.** It adds long-term memory and
+1. **Codex is the execution kernel.** It owns planning and the agent loop,
+   tools, threads, persistence, resume/fork, context compaction, goals, skills,
+   MCP, approvals, extensions, and subagent primitives.
+2. **Factory is a native Codex extension.** It contributes long-term memory and
    context, decomposition, progress, review/remediation, and Factory-specific
-   subagent behavior through Codex extension APIs. It does not implement a
-   second agent loop.
-3. **`factoryd` is the durable lifecycle.** It owns jobs, checkpoints, retries,
-   crash recovery, integrations, and scheduling. Hatchet is the durable
-   workflow engine and PostgreSQL is the durable workflow/state store.
+   subagent behavior through native Rust extension APIs. It never introduces a
+   second model or tool loop.
+3. **`factoryd` is the durable lifecycle.** PostgreSQL-backed jobs, operations,
+   attempts, leases, checkpoints, retries, crash recovery, correlations,
+   events, scheduling, and managed worktrees live outside the Codex thread
+   lifecycle. The Rust `factory-worker` claims this work and runs it directly.
 
-The complete Codex fork lives under `factory-harness/`; its upstream
-`codex-rs/` layout and internal paths remain untouched. All downstream Rust
-implementation belongs under:
+The distribution contains the Rust `factory`, `factory-worker`, `factoryd`, and
+`factory-provider-bridge` binaries. Factory does not depend on Hatchet,
+TypeScript, Cursor, Boss/Hydra, Linear, or GitLab.
+
+## Boundary
+
+The preserved Codex source lives under `factory-harness/codex-rs/`. Factory
+implementation lives under `factory-harness/factory/`:
 
 ```text
-factory-harness/factory/
-├── runtime/
-├── extension/
-├── coordinator/
-├── providers/
-└── protocol/
+factory/
+├── cli/          # user-facing job lifecycle
+├── coordinator/  # durable state, recovery, events, worktrees
+├── extension/    # memory, context, decomposition, review behavior
+├── providers/    # provider profiles and transport translation
+└── runtime/      # Codex bootstrap, sessions, stages, durable worker
 ```
 
-Factory may depend on public Codex APIs. Codex core must never depend on
-Factory. The stable, versioned Factory protocol is the boundary between the
-harness fork and ordinary work in `apps/`, `workflows/`, `integrations/`,
-`harness-client/`, and `docs/`.
+Dependency direction is Factory to public Codex APIs. Codex core never depends
+on Factory. A minimal upstream seam is allowed only when a required native
+primitive is unavailable publicly; every such change is recorded in
+`factory-harness/UPSTREAM.md` and `RUST_CUTOVER.md`.
 
-The runtime surface is the full Factory-enabled Codex app-server v2 lifecycle,
-not the current one-shot Factory turn protocol. Across the process boundary,
-`harness-client` uses app-server's supported stdio JSONL transport and JSON-RPC
-2.0 message semantics (with the `jsonrpc` header omitted on the wire). In Rust,
-the same lifecycle uses `codex-app-server-client` typed requests and events:
-initialize, thread start/resume/fork, turn start, streamed notifications,
-server-request responses, and shutdown. The distribution pins the generated
-app-server schema as its Factory protocol version.
+Factory uses Codex app-server types and its in-process lifecycle directly. It
+must not create a Factory protocol version, mirrored wire model, generated
+schema, manifest, hash negotiation, or compatibility layer. Factory job and
+attempt identifiers are coordinator domain data, not Codex protocol types.
 
-`factoryd` persists the durable mapping from Factory job/operation/attempt and
-Hatchet run identifiers to app-server request/thread/turn identifiers. It also
-owns clone/worktree creation, reuse, checkpoint binding, and cleanup. Runtime
-receives the selected workspace and context; Codex owns tool execution there.
-Neutral adapters in root `integrations/` are called by Hatchet workers inside
-the durable `factoryd` lifecycle, never by Codex core or Factory runtime.
+## Durable Lifecycle
 
-## V1 capabilities
+Each job runs in a coordinator-managed Git worktree. The durable runner moves
+through plan, execute, independent review, remediation when requested, and a
+fresh independent re-review. Checkpoints and runtime correlations allow the
+current stage to resume after worker loss without turning `factoryd` into an
+agent harness. The CLI can detach, replay durable events, reattach, inspect,
+and cancel while the job continues independently. Repository identity is
+separate from the fixed container mount path, so changing the host repository
+does not alias or lose detached jobs.
 
-- Generalize the useful durable workflow, checkpoint, review/remediation,
-  worktree, and memory behavior in the existing Software Factory.
-- Incrementally remove only Cursor, Boss/Hydra assumptions, and Linear/GitLab
-  coupling. Do not remove the Factory capabilities behind those integrations.
-- Retain RAG and long-term memory, with Qdrant as the current vector index.
-- Provide a generic direct boundary for Responses-compatible model providers.
-  Keep protocol translation in explicit optional adapters and prove GLM 5.2
-  through one such adapter with a real tool-using turn.
-- Disable unintended Codex external analytics, feedback, OTel, and log
-  exporters while retaining functional model/tool traffic and any explicitly
-  configured Factory observability profile.
+Each job pins the canonical provider and exact model it was created with. A
+worker can claim the job only when it serves that profile; switching the active
+configuration cannot silently recover an older attempt with another model. The
+CLI refuses a provider/model switch while any nonterminal pinned job needs a
+different profile, and treats legacy unpinned jobs as unknown rather than
+guessing. An explicit `--force` changes configuration with a warning but does
+not stop or migrate those jobs.
+Completed work stays in the managed worktree until delivery. Attached local
+runs apply it by default, while `--no-apply`, `factory apply`, and
+`factory export` allow explicit delivery. Apply refuses before mutation unless
+the patch digest, repository identity, immutable base revision, clean host
+checkout, and Git patch preflight all match.
 
-Baseline infrastructure is Hatchet for durable workflows and PostgreSQL for
-durable workflow/Factory state. Qdrant is the current V1 RAG/long-term-memory
-index. Redis is conditional coordination, cache, and pub/sub only; it is not
-Codex compaction, which stays inside Codex. Langfuse and ClickHouse are an
-explicitly enabled, non-default observability profile. MinIO provides artifact
-storage where used, independently of that profile. Ollama is an optional local
-embedding/extraction provider.
+PostgreSQL and Qdrant are baseline services: PostgreSQL owns durable lifecycle
+state and Qdrant owns long-term memory/RAG. Redis, MinIO, Ollama, Langfuse, and
+ClickHouse are opt-in profiles rather than core dependencies.
 
-## V1 delivery policy
+## Providers and Telemetry
 
-Build user-facing functionality first. Acceptance flows must directly prove
-planning, real tool use, compaction, resume, generic-provider behavior and GLM
-5.2, durable recovery, decomposition, review/remediation, and memory.
+The harness is model-vendor neutral. OpenAI Responses uses the direct Codex
+provider path. Anthropic Messages and DeepSeek/Z.AI Chat Completions use an
+explicit Rust translation adapter; it translates transport only and does not
+replace the Codex harness. Custom Responses-compatible providers can use the
+same direct boundary.
 
-V1 adds no security architecture or security-only test program. Direct Factory
-jobs run Codex autonomously by default and do not pause for command approval or
-clarification; attach remains an observation and cancellation surface. Preserve
-the underlying Codex approval protocol for explicit non-autonomous clients,
-disable unintended external telemetry and logging, and retain inherited safeguards against obviously destructive
-commands. Hardening, threat modeling, isolation design, mount/trust
-verification, credential brokers, egress controls, container-security work,
-and mechanical or security-only test suites are outside V1.
+Unintended Codex analytics, feedback, OTel, and log export remain disabled by
+default. Functional model/tool traffic and operator-enabled observability are
+separate, explicit behavior.
 
-If a software subagent proposes prohibited V1 security work, immediately
-terminate that subagent task and discard its contribution. Preserve user-owned
-files. Do not commit or push without explicit user authorization.
+## Delivery and Acceptance
 
-The accepted architectural details and dependency rules are recorded in
-[`docs/adr/0001-codex-kernel-factory-extension.md`](docs/adr/0001-codex-kernel-factory-extension.md).
+Work is functionality-first. Compilation and unit checks are development gates,
+not product acceptance. Completion requires a real model to prove planning,
+tool use, managed-worktree execution, detached review, remediation, approving
+re-review, detach/attach, crash recovery, context compaction/resume, and Qdrant
+memory retrieval. The 2026-08-02 cutover run proved every Factory-owned part of
+that flow, including crash resume and an actual changes-requested remediation
+cycle. Automatic context compaction remains the preserved native Codex kernel's
+responsibility rather than a second Factory implementation.
+
+Do not add unrelated security architecture or security-only test programs.
+Preserve user-owned files, and do not commit or push without explicit user
+authorization.

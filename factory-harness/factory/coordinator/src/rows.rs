@@ -1,3 +1,4 @@
+use crate::correlation::Correlation;
 use crate::domain::AttemptRecord;
 use crate::domain::AttemptState;
 use crate::domain::CheckpointId;
@@ -5,15 +6,12 @@ use crate::domain::CheckpointRecord;
 use crate::domain::CoordinatorInstanceId;
 use crate::domain::CorrelationRecordId;
 use crate::domain::DurableCorrelationRecord;
-use crate::domain::FactoryThreadStateDocument;
 use crate::domain::FactoryThreadStateRecord;
+use crate::domain::JobEventRecord;
 use crate::domain::JobRecord;
 use crate::domain::JobState;
 use crate::domain::OperationRecord;
 use crate::domain::OperationState;
-use crate::domain::PendingRequestId;
-use crate::domain::PendingRequestRecord;
-use crate::domain::PendingRequestState;
 use crate::domain::RecoveryCause;
 use crate::domain::RecoverySelection;
 use crate::domain::ResumeStrategy;
@@ -22,22 +20,15 @@ use crate::domain::WorkspaceRecord;
 use crate::domain::WorkspaceState;
 use crate::error::CoordinatorError;
 use crate::error::Result;
+use crate::ids::AttemptId;
+use crate::ids::ItemId;
+use crate::ids::JobId;
+use crate::ids::OperationId;
+use crate::ids::RequestId;
+use crate::ids::ThreadId;
+use crate::ids::TurnId;
 use chrono::DateTime;
 use chrono::Utc;
-use factory_protocol::FactoryCorrelation;
-use factory_protocol::FactoryRawServerRequest;
-use factory_protocol::FactoryRawServerResponse;
-use factory_protocol::FactoryServerRequestMethod;
-use factory_protocol::ids::AttemptId;
-use factory_protocol::ids::FactoryRequestId;
-use factory_protocol::ids::FactoryRpcRequestId;
-use factory_protocol::ids::ItemId;
-use factory_protocol::ids::JobId;
-use factory_protocol::ids::OperationId;
-use factory_protocol::ids::TaskRunExternalId;
-use factory_protocol::ids::ThreadId;
-use factory_protocol::ids::TurnId;
-use factory_protocol::ids::WorkflowRunId;
 use serde_json::Value;
 use sqlx::FromRow;
 
@@ -47,7 +38,6 @@ pub(crate) struct JobRow {
     pub kind: String,
     pub input: Value,
     pub status: String,
-    pub workflow_run_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -61,9 +51,35 @@ impl TryFrom<JobRow> for JobRecord {
             kind: row.kind,
             input: row.input,
             state: JobState::from_database_value(&row.status)?,
-            workflow_run_id: row.workflow_run_id.map(WorkflowRunId::new),
             created_at: row.created_at,
             updated_at: row.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+pub(crate) struct JobEventRow {
+    pub sequence: i64,
+    pub job_id: String,
+    pub operation_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub kind: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TryFrom<JobEventRow> for JobEventRecord {
+    type Error = CoordinatorError;
+
+    fn try_from(row: JobEventRow) -> Result<Self> {
+        Ok(Self {
+            sequence: to_u64(row.sequence, "job event sequence")?,
+            job_id: JobId::new(row.job_id),
+            operation_id: row.operation_id.map(OperationId::new),
+            attempt_id: row.attempt_id.map(AttemptId::new),
+            kind: row.kind,
+            payload: row.payload,
+            created_at: row.created_at,
         })
     }
 }
@@ -108,6 +124,7 @@ pub(crate) struct AttemptRow {
     pub attempt_number: i32,
     pub status: String,
     pub owner_instance_id: String,
+    pub lease_epoch: i64,
     pub lease_expires_at: DateTime<Utc>,
     pub recovery_cause: String,
     pub resumes_attempt_id: Option<String>,
@@ -127,6 +144,7 @@ impl TryFrom<AttemptRow> for AttemptRecord {
             attempt_number: to_u32(row.attempt_number, "attempt number")?,
             state: AttemptState::from_database_value(&row.status)?,
             owner_instance_id: CoordinatorInstanceId::new(row.owner_instance_id),
+            lease_epoch: to_u64(row.lease_epoch, "lease epoch")?,
             lease_expires_at: row.lease_expires_at,
             recovery_cause: RecoveryCause::from_database_value(&row.recovery_cause)?,
             resumes_attempt_id: row.resumes_attempt_id.map(AttemptId::new),
@@ -144,8 +162,6 @@ pub(crate) struct CorrelationRow {
     pub job_id: String,
     pub operation_id: String,
     pub attempt_id: String,
-    pub workflow_run_id: Option<String>,
-    pub task_run_external_id: Option<String>,
     pub request_id: String,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -157,65 +173,17 @@ impl From<CorrelationRow> for DurableCorrelationRecord {
     fn from(row: CorrelationRow) -> Self {
         Self {
             correlation_id: CorrelationRecordId::new(row.correlation_id),
-            correlation: FactoryCorrelation {
+            correlation: Correlation {
                 job_id: JobId::new(row.job_id),
                 operation_id: OperationId::new(row.operation_id),
                 attempt_id: AttemptId::new(row.attempt_id),
-                workflow_run_id: row.workflow_run_id.map(WorkflowRunId::new),
-                task_run_external_id: row.task_run_external_id.map(TaskRunExternalId::new),
-                request_id: FactoryRequestId::new(row.request_id),
+                request_id: RequestId::new(row.request_id),
                 thread_id: row.thread_id.map(ThreadId::new),
                 turn_id: row.turn_id.map(TurnId::new),
                 item_id: row.item_id.map(ItemId::new),
             },
             observed_at: row.observed_at,
         }
-    }
-}
-
-#[derive(Debug, FromRow)]
-pub(crate) struct PendingRequestRow {
-    pub pending_request_id: String,
-    pub job_id: String,
-    pub operation_id: String,
-    pub attempt_id: String,
-    pub request_id: Value,
-    pub method: String,
-    pub params: Value,
-    pub state: String,
-    pub response: Option<Value>,
-    pub created_at: DateTime<Utc>,
-    pub resolved_at: Option<DateTime<Utc>>,
-}
-
-impl TryFrom<PendingRequestRow> for PendingRequestRecord {
-    type Error = CoordinatorError;
-
-    fn try_from(row: PendingRequestRow) -> Result<Self> {
-        let request_id = serde_json::from_value::<FactoryRpcRequestId>(row.request_id)
-            .map_err(|error| CoordinatorError::PendingRequestPayload(error.to_string()))?;
-        let method = FactoryServerRequestMethod::new(row.method);
-        let request = FactoryRawServerRequest {
-            request_id: request_id.clone(),
-            method: method.clone(),
-            params: row.params,
-        };
-        let response = row.response.map(|response| FactoryRawServerResponse {
-            request_id,
-            method,
-            response,
-        });
-        Ok(Self {
-            pending_request_id: PendingRequestId::new(row.pending_request_id),
-            job_id: JobId::new(row.job_id),
-            operation_id: OperationId::new(row.operation_id),
-            attempt_id: AttemptId::new(row.attempt_id),
-            request,
-            state: PendingRequestState::from_database_value(&row.state)?,
-            response,
-            created_at: row.created_at,
-            resolved_at: row.resolved_at,
-        })
     }
 }
 
@@ -310,7 +278,7 @@ impl TryFrom<ThreadStateRow> for FactoryThreadStateRecord {
     fn try_from(row: ThreadStateRow) -> Result<Self> {
         Ok(Self {
             thread_id: ThreadId::new(row.thread_id),
-            state: serde_json::from_value::<FactoryThreadStateDocument>(row.state)?,
+            state: row.state,
             revision: u64::try_from(row.revision).map_err(|_| CoordinatorError::NumericRange {
                 field: "thread state revision",
             })?,
@@ -323,8 +291,10 @@ impl TryFrom<ThreadStateRow> for FactoryThreadStateRecord {
 #[derive(Debug, FromRow)]
 pub(crate) struct WorkspaceRow {
     pub job_id: String,
+    pub repository_id: String,
     pub repository: String,
     pub base_ref: String,
+    pub base_revision: String,
     pub branch_name: String,
     pub root: String,
     pub revision: String,
@@ -339,8 +309,10 @@ impl TryFrom<WorkspaceRow> for WorkspaceRecord {
     fn try_from(row: WorkspaceRow) -> Result<Self> {
         Ok(Self {
             job_id: JobId::new(row.job_id),
+            repository_id: row.repository_id,
             repository: row.repository,
             base_ref: row.base_ref,
+            base_revision: row.base_revision,
             branch_name: row.branch_name,
             root: row.root,
             revision: row.revision,
@@ -373,8 +345,6 @@ pub(crate) struct RecoverySelectionRow {
     pub correlation_job_id: Option<String>,
     pub correlation_operation_id: Option<String>,
     pub correlation_attempt_id: Option<String>,
-    pub correlation_workflow_run_id: Option<String>,
-    pub correlation_task_run_external_id: Option<String>,
     pub correlation_request_id: Option<String>,
     pub correlation_thread_id: Option<String>,
     pub correlation_turn_id: Option<String>,
@@ -424,7 +394,7 @@ impl TryFrom<RecoverySelectionRow> for RecoverySelection {
             row.correlation_id.map(|correlation_id| {
                 Ok(DurableCorrelationRecord {
                     correlation_id: CorrelationRecordId::new(correlation_id),
-                    correlation: FactoryCorrelation {
+                    correlation: Correlation {
                         job_id: JobId::new(required(row.correlation_job_id, "correlation job")?),
                         operation_id: OperationId::new(required(
                             row.correlation_operation_id,
@@ -434,11 +404,7 @@ impl TryFrom<RecoverySelectionRow> for RecoverySelection {
                             row.correlation_attempt_id,
                             "correlation attempt",
                         )?),
-                        workflow_run_id: row.correlation_workflow_run_id.map(WorkflowRunId::new),
-                        task_run_external_id: row
-                            .correlation_task_run_external_id
-                            .map(TaskRunExternalId::new),
-                        request_id: FactoryRequestId::new(required(
+                        request_id: RequestId::new(required(
                             row.correlation_request_id,
                             "correlation request",
                         )?),
@@ -450,6 +416,10 @@ impl TryFrom<RecoverySelectionRow> for RecoverySelection {
                 })
             });
         let checkpoint_correlation = checkpoint_correlation.transpose()?;
+        let next_attempt_number = match cause {
+            RecoveryCause::LeaseExpired => row.attempts_made,
+            RecoveryCause::NewOperation | RecoveryCause::RetryScheduled => row.attempts_made + 1,
+        };
 
         Ok(Self {
             job_id: JobId::new(row.job_id),
@@ -457,7 +427,7 @@ impl TryFrom<RecoverySelectionRow> for RecoverySelection {
             operation_kind: row.operation_kind,
             cause,
             previous_attempt_id: row.previous_attempt_id.map(AttemptId::new),
-            next_attempt_number: to_u32(row.attempts_made + 1, "next attempt number")?,
+            next_attempt_number: to_u32(next_attempt_number, "next attempt number")?,
             max_attempts: to_u32(row.max_attempts, "maximum attempts")?,
             resume,
             checkpoint_correlation,
@@ -474,4 +444,8 @@ fn required<T>(value: Option<T>, field: &'static str) -> Result<T> {
 
 fn to_u32(value: i32, field: &'static str) -> Result<u32> {
     u32::try_from(value).map_err(|_| CoordinatorError::NumericRange { field })
+}
+
+fn to_u64(value: i64, field: &'static str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| CoordinatorError::NumericRange { field })
 }

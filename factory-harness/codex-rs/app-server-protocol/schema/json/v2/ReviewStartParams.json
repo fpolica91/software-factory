@@ -1,6 +1,25 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "DetachedReviewContext": {
+      "properties": {
+        "durableStateKey": {
+          "type": "string"
+        },
+        "parentThreadId": {
+          "type": "string"
+        },
+        "parentTurnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "durableStateKey",
+        "parentThreadId",
+        "parentTurnId"
+      ],
+      "type": "object"
+    },
     "ReviewDelivery": {
       "enum": [
         "inline",
@@ -112,6 +131,18 @@
       ],
       "default": null,
       "description": "Where to run the review: inline (default) on the current thread or detached on a new thread (returned in `reviewThreadId`)."
+    },
+    "detachedContext": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DetachedReviewContext"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Explicit lineage for a detached review started by a durable host.\n\nOrdinary clients should leave this unset. It is rejected for inline reviews."
     },
     "target": {
       "$ref": "#/definitions/ReviewTarget"

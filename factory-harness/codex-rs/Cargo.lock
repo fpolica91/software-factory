@@ -1880,6 +1880,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-core",
+ "codex-extension-api",
  "codex-protocol",
  "core_test_support",
  "pretty_assertions",

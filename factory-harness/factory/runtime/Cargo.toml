@@ -10,21 +10,24 @@ name = "factory_runtime"
 path = "src/lib.rs"
 
 [[bin]]
-name = "factory-runtime"
-path = "src/main.rs"
+name = "factory-worker"
+path = "src/bin/factory_worker.rs"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 codex-app-server = { path = "../../codex-rs/app-server" }
 codex-app-server-client = { path = "../../codex-rs/app-server-client" }
+codex-app-server-protocol = { path = "../../codex-rs/app-server-protocol" }
 codex-arg0 = { path = "../../codex-rs/arg0" }
 codex-config = { path = "../../codex-rs/config" }
-codex-utils-cli = { path = "../../codex-rs/utils/cli" }
+codex-core = { path = "../../codex-rs/core" }
+codex-feedback = { path = "../../codex-rs/feedback" }
+codex-protocol = { path = "../../codex-rs/protocol" }
 factory-extension = { path = "../extension" }
-factory-protocol = { path = "../protocol" }
+factory-coordinator = { path = "../coordinator" }
+factory-providers = { path = "../providers", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[build-dependencies]
-sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml = "0.9.5"

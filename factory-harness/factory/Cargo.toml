@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["coordinator", "extension", "protocol", "providers", "runtime"]
+members = ["cli", "coordinator", "extension", "providers", "runtime"]
 default-members = ["coordinator", "runtime"]
 
 # Cargo patches are scoped to a workspace root. Mirror upstream's transport

@@ -36,6 +36,7 @@ pub use codex_tools::parse_tool_input_schema_without_compaction;
 pub use contributors::ApprovalReviewContributor;
 pub use contributors::ConfigContributor;
 pub use contributors::ContextContributor;
+pub use contributors::DetachedReviewThreadContext;
 pub use contributors::ExtensionFuture;
 pub use contributors::McpServerContribution;
 pub use contributors::McpServerContributionContext;

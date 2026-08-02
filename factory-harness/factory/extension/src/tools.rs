@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use codex_extension_api::DetachedReviewThreadContext;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ResponsesApiTool;
@@ -27,6 +28,18 @@ use crate::FactoryReviewVerdict;
 use crate::FactoryState;
 use crate::FactoryThreadState;
 use crate::FactoryWorkUnit;
+use crate::limits::MAX_DEPENDENCIES;
+use crate::limits::MAX_DETAIL_CHARS;
+use crate::limits::MAX_FINDINGS;
+use crate::limits::MAX_IDENTIFIER_CHARS;
+use crate::limits::MAX_SUMMARY_CHARS;
+use crate::limits::MAX_TITLE_CHARS;
+use crate::limits::MAX_WORK_UNITS;
+use crate::limits::require_bounded_text;
+use crate::stage::FactoryThreadScope;
+use crate::stage::FactoryTurnStage;
+use crate::stage::require_tool_stage;
+use crate::stage::thread_scope;
 use crate::thread_state;
 
 const DECOMPOSE_TOOL: &str = "factory_decompose";
@@ -46,6 +59,8 @@ enum FactoryToolKind {
 struct FactoryToolExecutor {
     kind: FactoryToolKind,
     state: Arc<FactoryThreadState>,
+    active_thread_id: String,
+    detached_review_context: Option<Arc<DetachedReviewThreadContext>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,20 +113,41 @@ impl ToolContributor for FactoryExtension {
         let Some(state) = thread_state(thread_store) else {
             return Vec::new();
         };
-        [
-            FactoryToolKind::Decompose,
-            FactoryToolKind::Progress,
-            FactoryToolKind::Review,
-            FactoryToolKind::Remediation,
-        ]
-        .into_iter()
-        .map(|kind| {
-            Arc::new(FactoryToolExecutor {
-                kind,
-                state: Arc::clone(&state),
-            }) as Arc<dyn ToolExecutor<ToolCall>>
-        })
-        .collect()
+        let active_thread_id = thread_store.level_id().to_string();
+        let detached_review_context = thread_store.get::<DetachedReviewThreadContext>();
+        let stage = match thread_scope(thread_store) {
+            FactoryThreadScope::Parent => Some(self.stage),
+            FactoryThreadScope::DetachedReview => Some(FactoryTurnStage::Review),
+            FactoryThreadScope::Subagent => None,
+        };
+        stage
+            .into_iter()
+            .flat_map(|stage| stage.tool_kinds().iter().copied())
+            .map(|kind| {
+                Arc::new(FactoryToolExecutor {
+                    kind,
+                    state: Arc::clone(&state),
+                    active_thread_id: active_thread_id.clone(),
+                    detached_review_context: detached_review_context.clone(),
+                }) as Arc<dyn ToolExecutor<ToolCall>>
+            })
+            .collect()
+    }
+
+    fn disabled_tools_for_step(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+        _step_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<ToolName> {
+        if self.stage == FactoryTurnStage::Plan {
+            vec![
+                ToolName::plain("apply_patch"),
+                ToolName::plain("request_permissions"),
+            ]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -126,6 +162,9 @@ impl ToolExecutor<ToolCall> for FactoryToolExecutor {
 
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
+            self.kind
+                .authorize(&call, self.detached_review_context.is_some())
+                .map_err(respond)?;
             match self.kind {
                 FactoryToolKind::Decompose => self.decompose(call).await,
                 FactoryToolKind::Progress => self.progress(call).await,
@@ -155,9 +194,16 @@ impl FactoryToolExecutor {
         let state = self
             .state
             .update(move |state| {
+                if !state.work_units.is_empty() {
+                    return Err(
+                        "factory_decompose may be called only once in a fresh Plan turn"
+                            .to_string(),
+                    );
+                }
                 state.work_units = units;
                 state.review = None;
                 state.remediations.clear();
+                state.review_history.clear();
                 Ok(())
             })
             .await
@@ -167,42 +213,49 @@ impl FactoryToolExecutor {
 
     async fn progress(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args: ProgressArgs = parse_args(&call)?;
-        require_text("unit_id", &args.unit_id).map_err(respond)?;
-        require_text("summary", &args.summary).map_err(respond)?;
+        require_bounded_text("unit_id", &args.unit_id, MAX_IDENTIFIER_CHARS).map_err(respond)?;
+        require_bounded_text("summary", &args.summary, MAX_SUMMARY_CHARS).map_err(respond)?;
         let state = self
             .state
             .update(move |state| {
+                if args.status != FactoryProgressStatus::Completed {
+                    return Err(
+                        "factory_update_progress accepts only completed status after implementation and verification"
+                            .to_string(),
+                    );
+                }
                 let unit_index = state
                     .work_units
                     .iter()
                     .position(|unit| unit.id == args.unit_id)
                     .ok_or_else(|| format!("unknown Factory work unit {}", args.unit_id))?;
-                if matches!(
-                    args.status,
-                    FactoryProgressStatus::InProgress | FactoryProgressStatus::Completed
-                ) {
-                    let incomplete = state.work_units[unit_index]
-                        .depends_on
-                        .iter()
-                        .filter(|dependency| {
-                            let dependency = dependency.as_str();
-                            state.work_units.iter().any(|unit| {
-                                unit.id == dependency
-                                    && unit.status != FactoryProgressStatus::Completed
-                            })
+                if state.work_units[unit_index].status == FactoryProgressStatus::Completed {
+                    return Err(format!(
+                        "work unit {} is already completed and cannot be rewritten",
+                        args.unit_id
+                    ));
+                }
+                let incomplete = state.work_units[unit_index]
+                    .depends_on
+                    .iter()
+                    .filter(|dependency| {
+                        let dependency = dependency.as_str();
+                        state.work_units.iter().any(|unit| {
+                            unit.id == dependency
+                                && unit.status != FactoryProgressStatus::Completed
                         })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if !incomplete.is_empty() {
-                        return Err(format!(
-                            "work unit {} has incomplete dependencies: {}",
-                            args.unit_id,
-                            incomplete.join(", ")
-                        ));
-                    }
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !incomplete.is_empty() {
+                    return Err(format!(
+                        "work unit {} has incomplete dependencies: {}",
+                        args.unit_id,
+                        incomplete.join(", ")
+                    ));
                 }
                 let unit = &mut state.work_units[unit_index];
-                unit.status = args.status;
+                unit.status = FactoryProgressStatus::Completed;
                 unit.progress_summary = Some(args.summary);
                 Ok(())
             })
@@ -224,32 +277,37 @@ impl FactoryToolExecutor {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         };
-        let recorded_thread_id = metadata_text("thread_id");
-        let recorded_parent_thread_id = metadata_text("parent_thread_id");
-        let recorded_parent_turn_id = metadata_text("parent_turn_id");
-        let recorded_subagent_kind = metadata_text("subagent_kind");
+        let (
+            recorded_thread_id,
+            recorded_parent_thread_id,
+            recorded_parent_turn_id,
+            recorded_subagent_kind,
+        ) = match &self.detached_review_context {
+            Some(context) => (
+                Some(self.active_thread_id.clone()),
+                Some(context.parent_thread_id.to_string()),
+                Some(context.parent_turn_id.clone()),
+                Some("review".to_string()),
+            ),
+            None => (
+                metadata_text("thread_id"),
+                metadata_text("parent_thread_id"),
+                metadata_text("parent_turn_id"),
+                metadata_text("subagent_kind"),
+            ),
+        };
         let args: ReviewArgs = parse_args(&call)?;
-        validate_review(
-            &args,
-            &self
-                .state
-                .snapshot()
-                .await
-                .map_err(|error| respond(error.to_string()))?,
-        )
-        .map_err(respond)?;
-        let verdict = args.verdict;
-        let summary = args.summary;
-        let findings = args.findings;
         let state = self
             .state
             .update(move |state| {
-                let generation = state
-                    .review
-                    .as_ref()
-                    .map_or(1, |review| review.generation.saturating_add(1));
-                state.review = Some(FactoryReviewReport {
-                    generation,
+                validate_review(&args, state)?;
+                let ReviewArgs {
+                    verdict,
+                    summary,
+                    findings,
+                } = args;
+                state.record_review(FactoryReviewReport {
+                    generation: 0,
                     recorded_turn_id: Some(recorded_turn_id),
                     recorded_thread_id,
                     recorded_parent_thread_id,
@@ -259,7 +317,6 @@ impl FactoryToolExecutor {
                     summary,
                     findings,
                 });
-                state.remediations.clear();
                 Ok(())
             })
             .await
@@ -269,17 +326,11 @@ impl FactoryToolExecutor {
 
     async fn remediation(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args: RemediationArgs = parse_args(&call)?;
-        let snapshot = self
-            .state
-            .snapshot()
-            .await
-            .map_err(|error| respond(error.to_string()))?;
-        validate_remediations(&args.dispositions, &snapshot).map_err(respond)?;
-        let dispositions = args.dispositions;
         let state = self
             .state
             .update(move |state| {
-                state.remediations = dispositions;
+                validate_remediations(&args.dispositions, state)?;
+                state.remediations = args.dispositions;
                 Ok(())
             })
             .await
@@ -289,6 +340,18 @@ impl FactoryToolExecutor {
 }
 
 impl FactoryToolKind {
+    fn authorize(self, call: &ToolCall, detached_review: bool) -> Result<(), String> {
+        match self {
+            Self::Decompose => require_tool_stage(call, self.name(), &[FactoryTurnStage::Plan]),
+            Self::Progress => require_tool_stage(call, self.name(), &[FactoryTurnStage::Execute]),
+            Self::Review if detached_review => Ok(()),
+            Self::Review => require_tool_stage(call, self.name(), &[FactoryTurnStage::Review]),
+            Self::Remediation => {
+                require_tool_stage(call, self.name(), &[FactoryTurnStage::Remediate])
+            }
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Decompose => DECOMPOSE_TOOL,
@@ -301,19 +364,19 @@ impl FactoryToolKind {
     fn spec(self) -> ToolSpec {
         let (description, schema) = match self {
             Self::Decompose => (
-                "Replace the current Factory decomposition with independently trackable work units and explicit dependency IDs. This resets downstream review and remediation state.",
+                "During codex.plan only, create the Factory decomposition exactly once with independently trackable work units and explicit dependency IDs.",
                 decomposition_schema(),
             ),
             Self::Progress => (
-                "Update one Factory work unit's current status and concise progress summary. Dependencies must be complete before a unit starts or completes.",
+                "During codex.execute only, complete one incomplete Factory work unit exactly once after implementation and verification. All dependencies must already be complete; the summary must contain concise evidence.",
                 progress_schema(),
             ),
             Self::Review => (
-                "Record the current structured Factory review verdict, summary, and findings tied to work-unit IDs. This replaces the prior review and resets remediation dispositions.",
+                "During detached Factory review only, record the current structured review exactly once. Approve only with an empty findings array and put passing evidence in the summary; request_changes or blocked requires findings tied to work-unit IDs.",
                 review_schema(),
             ),
             Self::Remediation => (
-                "Record dispositions for findings in the current Factory review. Each finding ID and work-unit ID must match current Factory state.",
+                "During codex.remediate only, record dispositions exactly once for findings in the current Factory review. Each finding ID and work-unit ID must match current Factory state.",
                 remediation_schema(),
             ),
         };
@@ -326,6 +389,17 @@ impl FactoryToolKind {
                 .expect("Factory-owned tool schema must be valid"),
             output_schema: None,
         })
+    }
+}
+
+impl FactoryTurnStage {
+    fn tool_kinds(self) -> &'static [FactoryToolKind] {
+        match self {
+            Self::Plan => &[FactoryToolKind::Decompose],
+            Self::Execute => &[FactoryToolKind::Progress],
+            Self::Review => &[FactoryToolKind::Review],
+            Self::Remediate => &[FactoryToolKind::Remediation],
+        }
     }
 }
 
@@ -355,23 +429,26 @@ fn respond(message: impl Into<String>) -> FunctionCallError {
     FunctionCallError::RespondToModel(message.into())
 }
 
-fn require_text(field: &str, value: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
-        Err(format!("{field} must not be empty"))
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_decomposition(units: &[WorkUnitArgs]) -> Result<(), String> {
     if units.is_empty() {
         return Err("Factory decomposition requires at least one work unit".to_string());
     }
+    if units.len() > MAX_WORK_UNITS {
+        return Err(format!(
+            "Factory decomposition supports at most {MAX_WORK_UNITS} work units"
+        ));
+    }
     let mut ids = HashSet::new();
     for unit in units {
-        require_text("work unit id", &unit.id)?;
-        require_text("work unit title", &unit.title)?;
-        require_text("work unit description", &unit.description)?;
+        require_bounded_text("work unit id", &unit.id, MAX_IDENTIFIER_CHARS)?;
+        require_bounded_text("work unit title", &unit.title, MAX_TITLE_CHARS)?;
+        require_bounded_text("work unit description", &unit.description, MAX_DETAIL_CHARS)?;
+        if unit.depends_on.len() > MAX_DEPENDENCIES {
+            return Err(format!(
+                "work unit {} supports at most {MAX_DEPENDENCIES} dependencies",
+                unit.id
+            ));
+        }
         if !ids.insert(unit.id.as_str()) {
             return Err(format!("duplicate Factory work unit id {}", unit.id));
         }
@@ -379,6 +456,7 @@ fn validate_decomposition(units: &[WorkUnitArgs]) -> Result<(), String> {
     for unit in units {
         let mut dependencies = HashSet::new();
         for dependency in &unit.depends_on {
+            require_bounded_text("work unit dependency ID", dependency, MAX_IDENTIFIER_CHARS)?;
             if dependency == &unit.id {
                 return Err(format!("work unit {} cannot depend on itself", unit.id));
             }
@@ -434,9 +512,20 @@ fn validate_acyclic(units: &[WorkUnitArgs]) -> Result<(), String> {
 }
 
 fn validate_review(args: &ReviewArgs, state: &FactoryState) -> Result<(), String> {
-    require_text("review summary", &args.summary)?;
+    require_bounded_text("review summary", &args.summary, MAX_SUMMARY_CHARS)?;
+    if args.findings.len() > MAX_FINDINGS {
+        return Err(format!(
+            "Factory review supports at most {MAX_FINDINGS} findings"
+        ));
+    }
     if args.verdict != FactoryReviewVerdict::Approve && args.findings.is_empty() {
         return Err("non-approved Factory reviews require at least one finding".to_string());
+    }
+    if args.verdict == FactoryReviewVerdict::Approve && !args.findings.is_empty() {
+        return Err(
+            "approved Factory reviews require an empty findings array; put passing evidence in the summary"
+                .to_string(),
+        );
     }
     let unit_ids = state
         .work_units
@@ -445,10 +534,15 @@ fn validate_review(args: &ReviewArgs, state: &FactoryState) -> Result<(), String
         .collect::<HashSet<_>>();
     let mut finding_ids = HashSet::new();
     for finding in &args.findings {
-        require_text("finding id", &finding.id)?;
-        require_text("finding title", &finding.title)?;
-        require_text("finding evidence", &finding.evidence)?;
-        require_text("finding recommendation", &finding.recommendation)?;
+        require_bounded_text("finding id", &finding.id, MAX_IDENTIFIER_CHARS)?;
+        require_bounded_text("finding unit id", &finding.unit_id, MAX_IDENTIFIER_CHARS)?;
+        require_bounded_text("finding title", &finding.title, MAX_TITLE_CHARS)?;
+        require_bounded_text("finding evidence", &finding.evidence, MAX_DETAIL_CHARS)?;
+        require_bounded_text(
+            "finding recommendation",
+            &finding.recommendation,
+            MAX_DETAIL_CHARS,
+        )?;
         if !finding_ids.insert(finding.id.as_str()) {
             return Err(format!("duplicate Factory finding id {}", finding.id));
         }
@@ -469,6 +563,11 @@ fn validate_remediations(
     if dispositions.is_empty() {
         return Err("Factory remediation requires at least one disposition".to_string());
     }
+    if dispositions.len() > MAX_FINDINGS {
+        return Err(format!(
+            "Factory remediation supports at most {MAX_FINDINGS} dispositions"
+        ));
+    }
     let review = state
         .review
         .as_ref()
@@ -480,7 +579,21 @@ fn validate_remediations(
         .collect::<HashMap<_, _>>();
     let mut seen = HashSet::new();
     for disposition in dispositions {
-        require_text("remediation rationale", &disposition.rationale)?;
+        require_bounded_text(
+            "remediation finding id",
+            &disposition.finding_id,
+            MAX_IDENTIFIER_CHARS,
+        )?;
+        require_bounded_text(
+            "remediation unit id",
+            &disposition.unit_id,
+            MAX_IDENTIFIER_CHARS,
+        )?;
+        require_bounded_text(
+            "remediation rationale",
+            &disposition.rationale,
+            MAX_DETAIL_CHARS,
+        )?;
         if !seen.insert(disposition.finding_id.as_str()) {
             return Err(format!(
                 "duplicate remediation disposition for {}",
@@ -521,11 +634,16 @@ fn decomposition_schema() -> Value {
                 "type": "array",
                 "description": "Complete replacement decomposition in dependency order.",
                 "minItems": 1,
+                "maxItems": MAX_WORK_UNITS,
                 "items": object(json!({
-                    "id": {"type": "string", "description": "Stable short work-unit ID."},
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
-                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                    "id": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS, "description": "Stable short work-unit ID."},
+                    "title": {"type": "string", "maxLength": MAX_TITLE_CHARS},
+                    "description": {"type": "string", "maxLength": MAX_DETAIL_CHARS},
+                    "depends_on": {
+                        "type": "array",
+                        "maxItems": MAX_DEPENDENCIES,
+                        "items": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS}
+                    }
                 }), &["id", "title", "description", "depends_on"])
             }
         }),
@@ -536,9 +654,9 @@ fn decomposition_schema() -> Value {
 fn progress_schema() -> Value {
     object(
         json!({
-            "unit_id": {"type": "string"},
-            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "blocked"]},
-            "summary": {"type": "string", "description": "Concise current progress or blocker."}
+            "unit_id": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS},
+            "status": {"type": "string", "enum": ["completed"]},
+            "summary": {"type": "string", "maxLength": MAX_SUMMARY_CHARS, "description": "Concise implementation and verification evidence."}
         }),
         &["unit_id", "status", "summary"],
     )
@@ -547,12 +665,12 @@ fn progress_schema() -> Value {
 fn finding_schema() -> Value {
     object(
         json!({
-            "id": {"type": "string"},
+            "id": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS},
             "severity": {"type": "string", "enum": ["critical", "major", "minor"]},
-            "unit_id": {"type": "string"},
-            "title": {"type": "string"},
-            "evidence": {"type": "string"},
-            "recommendation": {"type": "string"}
+            "unit_id": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS},
+            "title": {"type": "string", "maxLength": MAX_TITLE_CHARS},
+            "evidence": {"type": "string", "maxLength": MAX_DETAIL_CHARS},
+            "recommendation": {"type": "string", "maxLength": MAX_DETAIL_CHARS}
         }),
         &[
             "id",
@@ -568,9 +686,22 @@ fn finding_schema() -> Value {
 fn review_schema() -> Value {
     object(
         json!({
-            "verdict": {"type": "string", "enum": ["approve", "request_changes", "blocked"]},
-            "summary": {"type": "string"},
-            "findings": {"type": "array", "items": finding_schema()}
+            "verdict": {
+                "type": "string",
+                "enum": ["approve", "request_changes", "blocked"],
+                "description": "Use approve only when there are no findings."
+            },
+            "summary": {
+                "type": "string",
+                "maxLength": MAX_SUMMARY_CHARS,
+                "description": "Overall verdict evidence, including all passing evidence for approve."
+            },
+            "findings": {
+                "type": "array",
+                "maxItems": MAX_FINDINGS,
+                "description": "Must be empty for approve; must contain at least one actionable issue for request_changes or blocked.",
+                "items": finding_schema()
+            }
         }),
         &["verdict", "summary", "findings"],
     )
@@ -582,14 +713,317 @@ fn remediation_schema() -> Value {
             "dispositions": {
                 "type": "array",
                 "minItems": 1,
+                "maxItems": MAX_FINDINGS,
                 "items": object(json!({
-                    "finding_id": {"type": "string"},
+                    "finding_id": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS},
                     "disposition": {"type": "string", "enum": ["accepted", "rejected", "deferred", "resolved"]},
-                    "rationale": {"type": "string"},
-                    "unit_id": {"type": "string"}
+                    "rationale": {"type": "string", "maxLength": MAX_DETAIL_CHARS},
+                    "unit_id": {"type": "string", "maxLength": MAX_IDENTIFIER_CHARS}
                 }), &["finding_id", "disposition", "rationale", "unit_id"])
             }
         }),
         &["dispositions"],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use codex_extension_api::ConversationHistory;
+    use codex_extension_api::NoopTurnItemEmitter;
+    use codex_extension_api::ToolPayload;
+    use codex_utils_output_truncation::TruncationPolicy;
+
+    use super::*;
+    use crate::FactoryBackendError;
+    use crate::FactoryBackendFuture;
+    use crate::FactoryStateBackend;
+    use crate::FactoryStateDurability;
+    use crate::state::FactoryStateRegistry;
+
+    struct ProgressBackend {
+        state: Mutex<Option<FactoryState>>,
+    }
+
+    impl ProgressBackend {
+        fn new(state: FactoryState) -> Self {
+            Self {
+                state: Mutex::new(Some(state)),
+            }
+        }
+    }
+
+    impl FactoryStateBackend for ProgressBackend {
+        fn load<'a>(
+            &'a self,
+            _thread_id: &'a str,
+        ) -> FactoryBackendFuture<'a, Option<FactoryState>> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .map(|state| state.clone())
+                    .map_err(|_| FactoryBackendError::new("progress backend lock failed"))
+            })
+        }
+
+        fn save<'a>(
+            &'a self,
+            _thread_id: &'a str,
+            state: FactoryState,
+        ) -> FactoryBackendFuture<'a, ()> {
+            Box::pin(async move {
+                *self
+                    .state
+                    .lock()
+                    .map_err(|_| FactoryBackendError::new("progress backend lock failed"))? =
+                    Some(state);
+                Ok(())
+            })
+        }
+
+        fn durability(&self) -> FactoryStateDurability {
+            FactoryStateDurability::ProcessMemory
+        }
+    }
+
+    fn unit(index: usize) -> WorkUnitArgs {
+        WorkUnitArgs {
+            id: format!("unit-{index}"),
+            title: "Title".to_string(),
+            description: "Description".to_string(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    fn progress_state(units: &[(&str, FactoryProgressStatus)]) -> FactoryState {
+        FactoryState {
+            work_units: units
+                .iter()
+                .map(|(id, status)| FactoryWorkUnit {
+                    id: (*id).to_string(),
+                    title: format!("Complete {id}"),
+                    description: format!("Implement and verify {id}."),
+                    depends_on: Vec::new(),
+                    status: *status,
+                    progress_summary: None,
+                })
+                .collect(),
+            ..FactoryState::default()
+        }
+    }
+
+    async fn progress_executor(
+        initial: FactoryState,
+    ) -> (FactoryToolExecutor, Arc<FactoryThreadState>) {
+        let states = FactoryStateRegistry::default();
+        let state = states
+            .get_or_create("progress-thread", Arc::new(ProgressBackend::new(initial)))
+            .await;
+        (
+            FactoryToolExecutor {
+                kind: FactoryToolKind::Progress,
+                state: Arc::clone(&state),
+                active_thread_id: "progress-thread".to_string(),
+                detached_review_context: None,
+            },
+            state,
+        )
+    }
+
+    fn progress_call(unit_id: &str, status: FactoryProgressStatus, summary: &str) -> ToolCall {
+        ToolCall {
+            turn_id: "execute-turn".to_string(),
+            call_id: format!("progress-{unit_id}"),
+            tool_name: ToolName::plain(PROGRESS_TOOL),
+            model: "mock-model".to_string(),
+            codex_turn_metadata: Some(
+                json!({
+                    crate::FACTORY_STAGE_METADATA_KEY:
+                        FactoryTurnStage::Execute.as_wire_name(),
+                })
+                .to_string(),
+            ),
+            truncation_policy: TruncationPolicy::Bytes(1024),
+            conversation_history: ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "unit_id": unit_id,
+                    "status": status,
+                    "summary": summary,
+                })
+                .to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn decomposition_rejects_oversized_new_state() {
+        let units = (0..=MAX_WORK_UNITS).map(unit).collect::<Vec<_>>();
+        assert!(validate_decomposition(&units).is_err());
+
+        let mut units = vec![unit(0)];
+        units[0].description = "x".repeat(MAX_DETAIL_CHARS + 1);
+        assert!(validate_decomposition(&units).is_err());
+    }
+
+    #[test]
+    fn each_stage_advertises_only_its_mutation_tool() {
+        for (stage, expected) in [
+            (FactoryTurnStage::Plan, DECOMPOSE_TOOL),
+            (FactoryTurnStage::Execute, PROGRESS_TOOL),
+            (FactoryTurnStage::Review, REVIEW_TOOL),
+            (FactoryTurnStage::Remediate, REMEDIATION_TOOL),
+        ] {
+            assert_eq!(
+                stage
+                    .tool_kinds()
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>(),
+                vec![expected]
+            );
+        }
+    }
+
+    #[test]
+    fn plan_disables_codex_file_mutation_tools() {
+        let extension = FactoryExtension {
+            backend: Arc::new(ProgressBackend::new(FactoryState::default())),
+            states: Arc::new(crate::state::FactoryStateRegistry::default()),
+            stage: FactoryTurnStage::Plan,
+        };
+        let session = codex_extension_api::ExtensionData::new("session".to_string());
+        let thread = codex_extension_api::ExtensionData::new("thread".to_string());
+        let step = codex_extension_api::ExtensionData::new("step".to_string());
+
+        let disabled = extension.disabled_tools_for_step(&session, &thread, &step);
+
+        assert_eq!(
+            disabled,
+            vec![
+                ToolName::plain("apply_patch"),
+                ToolName::plain("request_permissions")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_completes_pending_once_and_rejects_rewrites_without_mutation() {
+        let (executor, state) = progress_executor(progress_state(&[(
+            "pending-unit",
+            FactoryProgressStatus::Pending,
+        )]))
+        .await;
+
+        executor
+            .progress(progress_call(
+                "pending-unit",
+                FactoryProgressStatus::Completed,
+                "Implementation finished and verification passed.",
+            ))
+            .await
+            .expect("pending work unit should complete once");
+        let completed = state.snapshot().await.expect("completed progress state");
+        assert_eq!(completed.revision, 1);
+        assert_eq!(
+            completed.work_units[0].status,
+            FactoryProgressStatus::Completed
+        );
+        assert_eq!(
+            completed.work_units[0].progress_summary.as_deref(),
+            Some("Implementation finished and verification passed.")
+        );
+
+        let repeated = executor
+            .progress(progress_call(
+                "pending-unit",
+                FactoryProgressStatus::Completed,
+                "Replace the original evidence.",
+            ))
+            .await;
+        assert!(repeated.is_err());
+        assert_eq!(
+            state
+                .snapshot()
+                .await
+                .expect("state after repeated completion"),
+            completed
+        );
+
+        let rewrite = executor
+            .progress(progress_call(
+                "pending-unit",
+                FactoryProgressStatus::Pending,
+                "Reopen completed work.",
+            ))
+            .await;
+        assert!(rewrite.is_err());
+        assert_eq!(
+            state.snapshot().await.expect("state after status rewrite"),
+            completed
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_completes_legacy_incomplete_states() {
+        let (executor, state) = progress_executor(progress_state(&[
+            ("running-unit", FactoryProgressStatus::InProgress),
+            ("blocked-unit", FactoryProgressStatus::Blocked),
+        ]))
+        .await;
+
+        for unit_id in ["running-unit", "blocked-unit"] {
+            executor
+                .progress(progress_call(
+                    unit_id,
+                    FactoryProgressStatus::Completed,
+                    "Recovered work finished and verification passed.",
+                ))
+                .await
+                .expect("legacy incomplete work unit should complete");
+        }
+
+        let completed = state.snapshot().await.expect("recovered progress state");
+        assert_eq!(completed.revision, 2);
+        assert!(
+            completed
+                .work_units
+                .iter()
+                .all(|unit| unit.status == FactoryProgressStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_rejects_non_completed_requests_without_mutation() {
+        let (executor, state) = progress_executor(progress_state(&[(
+            "pending-unit",
+            FactoryProgressStatus::Pending,
+        )]))
+        .await;
+        let initial = state.snapshot().await.expect("initial progress state");
+
+        for status in [
+            FactoryProgressStatus::Pending,
+            FactoryProgressStatus::InProgress,
+            FactoryProgressStatus::Blocked,
+        ] {
+            assert!(
+                executor
+                    .progress(progress_call(
+                        "pending-unit",
+                        status,
+                        "Do not persist this status.",
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                state.snapshot().await.expect("state after rejected status"),
+                initial
+            );
+        }
+    }
 }

@@ -46,12 +46,57 @@ impl Error for FactoryMemoryError {}
 pub type FactoryMemoryFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, FactoryMemoryError>> + Send + 'a>>;
 
+/// Stable durable identity for the repository that owns a memory.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct FactoryRepositoryId(Arc<str>);
+
+impl FactoryRepositoryId {
+    pub fn new(value: impl Into<String>) -> Result<Self, FactoryMemoryError> {
+        let value = value.into();
+        let value = validate_name("Factory repository identity", &value)?;
+        Ok(Self(value.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Complete isolation boundary used for every memory store operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactoryMemoryScope {
+    namespace: Arc<str>,
+    repository_id: FactoryRepositoryId,
+}
+
+impl FactoryMemoryScope {
+    pub(crate) fn new(namespace: Arc<str>, repository_id: FactoryRepositoryId) -> Self {
+        Self {
+            namespace,
+            repository_id,
+        }
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn repository_id(&self) -> &str {
+        self.repository_id.as_str()
+    }
+
+    fn owns(&self, memory: &FactoryMemoryRecord) -> bool {
+        memory.namespace == self.namespace() && memory.repository_id == self.repository_id()
+    }
+}
+
 /// Durable memory payload stored in Qdrant.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FactoryMemoryRecord {
     pub id: String,
     pub content: String,
     pub namespace: String,
+    pub repository_id: String,
     pub tags: Vec<String>,
     pub source_thread_id: String,
     pub created_at: String,
@@ -71,7 +116,7 @@ pub struct FactoryMemoryHit {
 pub trait FactoryMemoryStore: Send + Sync {
     fn remember<'a>(
         &'a self,
-        namespace: &'a str,
+        scope: &'a FactoryMemoryScope,
         source_thread_id: &'a str,
         content: String,
         tags: Vec<String>,
@@ -79,7 +124,7 @@ pub trait FactoryMemoryStore: Send + Sync {
 
     fn recall<'a>(
         &'a self,
-        namespace: &'a str,
+        scope: &'a FactoryMemoryScope,
         query: &'a str,
         limit: usize,
     ) -> FactoryMemoryFuture<'a, Vec<FactoryMemoryHit>>;
@@ -90,6 +135,13 @@ pub trait FactoryMemoryStore: Send + Sync {
 pub struct FactoryMemory {
     store: Arc<dyn FactoryMemoryStore>,
     namespace: Arc<str>,
+}
+
+/// One repository-scoped view shared by tools and automatic recall.
+#[derive(Clone)]
+pub(crate) struct RepositoryScopedMemory {
+    store: Arc<dyn FactoryMemoryStore>,
+    scope: FactoryMemoryScope,
 }
 
 impl fmt::Debug for FactoryMemory {
@@ -104,7 +156,7 @@ impl fmt::Debug for FactoryMemory {
 impl FactoryMemory {
     /// Creates the Qdrant baseline with deterministic lexical sparse vectors.
     pub fn qdrant(config: QdrantMemoryConfig) -> Result<Self, FactoryMemoryError> {
-        Self::qdrant_with_vectorizer(config, Arc::new(LexicalSparseVectorizer::default()))
+        Self::qdrant_with_vectorizer(config, Arc::new(LexicalSparseVectorizer))
     }
 
     /// Creates Qdrant memory with a host-provided vectorizer. A later optional
@@ -138,8 +190,49 @@ impl FactoryMemory {
         &self.namespace
     }
 
-    pub(crate) fn store(&self) -> Arc<dyn FactoryMemoryStore> {
-        Arc::clone(&self.store)
+    pub(crate) fn for_repository(
+        &self,
+        repository_id: FactoryRepositoryId,
+    ) -> RepositoryScopedMemory {
+        RepositoryScopedMemory {
+            store: Arc::clone(&self.store),
+            scope: FactoryMemoryScope::new(Arc::clone(&self.namespace), repository_id),
+        }
+    }
+}
+
+impl RepositoryScopedMemory {
+    pub(crate) fn scope(&self) -> &FactoryMemoryScope {
+        &self.scope
+    }
+
+    pub(crate) async fn remember(
+        &self,
+        source_thread_id: &str,
+        content: String,
+        tags: Vec<String>,
+    ) -> Result<FactoryMemoryRecord, FactoryMemoryError> {
+        let memory = self
+            .store
+            .remember(&self.scope, source_thread_id, content, tags)
+            .await?;
+        if !self.scope.owns(&memory) {
+            return Err(FactoryMemoryError::new(
+                "Factory memory store returned a record outside its repository scope",
+            ));
+        }
+        Ok(memory)
+    }
+
+    pub(crate) async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<FactoryMemoryHit>, FactoryMemoryError> {
+        let mut memories = self.store.recall(&self.scope, query, limit).await?;
+        memories.retain(|memory| self.scope.owns(&memory.memory));
+        memories.truncate(limit);
+        Ok(memories)
     }
 }
 

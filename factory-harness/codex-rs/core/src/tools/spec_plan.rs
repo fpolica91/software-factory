@@ -137,6 +137,13 @@ impl PlannedTools {
     fn runtimes(&self) -> &[PlannedRuntime] {
         &self.runtimes
     }
+
+    fn remove_disabled(&mut self, disabled_tools: &HashSet<ToolName>) {
+        self.runtimes
+            .retain(|runtime| !disabled_tools.contains(&runtime.tool_name()));
+        self.hosted_specs
+            .retain(|spec| !disabled_tools.contains(&ToolName::plain(spec.name())));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -186,6 +193,7 @@ fn build_tool_specs_and_registry(
         extension_tool_executors,
         wait_for_environment_tool_config,
         dynamic_tools,
+        disabled_tools,
     } = params;
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
@@ -204,6 +212,7 @@ fn build_tool_specs_and_registry(
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
+    planned_tools.remove_disabled(&disabled_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools);

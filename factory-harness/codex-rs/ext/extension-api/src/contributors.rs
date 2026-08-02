@@ -8,6 +8,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_tools::ToolCall;
 use codex_tools::ToolExecutor;
+use codex_tools::ToolName;
 
 use crate::ExtensionData;
 use crate::ExtensionMetrics;
@@ -29,6 +30,7 @@ pub use prompt::PromptFragment;
 pub use prompt::PromptSlot;
 pub use skill_invocation::SkillInvocationInput;
 pub use skill_invocation::SkillInvocationKind;
+pub use thread_lifecycle::DetachedReviewThreadContext;
 pub use thread_lifecycle::ThreadIdleInput;
 pub use thread_lifecycle::ThreadOriginator;
 pub use thread_lifecycle::ThreadResumeInput;
@@ -289,6 +291,17 @@ pub trait ToolContributor: Send + Sync {
         _step_store: &ExtensionData,
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
         self.tools(session_store, thread_store)
+    }
+
+    /// Returns host tools that must not be advertised or dispatched during
+    /// this sampling step.
+    fn disabled_tools_for_step(
+        &self,
+        _session_store: &ExtensionData,
+        _thread_store: &ExtensionData,
+        _step_store: &ExtensionData,
+    ) -> Vec<ToolName> {
+        Vec::new()
     }
 }
 
