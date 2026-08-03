@@ -12,17 +12,19 @@ fn non_tty_attach_collapses_lifecycle_noise_and_keeps_the_result() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        for request_number in 0..5 {
+        for _ in 0..7 {
             let (mut stream, _) = listener.accept().unwrap();
             let path = read_request_path(&mut stream);
-            let body = match request_number {
-                0 => event_page_json(),
-                1 => terminal_job_json(),
-                2 => r#"{"events":[],"nextCursor":7}"#.to_string(),
-                _ if path.ends_with("/stage-checkpoints") || path.ends_with("/attempts") => {
-                    "[]".to_string()
-                }
-                _ => panic!("unexpected request {request_number}: {path}"),
+            let body = if path == format!("/jobs/{JOB_ID}") {
+                terminal_job_json()
+            } else if path.ends_with("/stage-checkpoints") || path.ends_with("/attempts") {
+                "[]".to_string()
+            } else if path.contains("/events?after=7") {
+                r#"{"events":[],"nextCursor":7}"#.to_string()
+            } else if path.contains("/events?after=0") {
+                event_page_json()
+            } else {
+                panic!("unexpected request: {path}")
             };
             write_json(&mut stream, &body);
         }
@@ -51,6 +53,9 @@ fn non_tty_attach_collapses_lifecycle_noise_and_keeps_the_result() {
     assert_eq!(stdout.matches("Audit finished.").count(), 1, "{stdout}");
     assert!(stdout.contains("provider will retry"), "{stdout}");
     assert!(stdout.contains("Result: succeeded"), "{stdout}");
+    assert!(stdout.contains("# Result"), "{stdout}");
+    assert!(stdout.contains("## Execute"), "{stdout}");
+    assert!(stdout.contains("Inspect: factory result"), "{stdout}");
 
     server.join().unwrap();
 }
@@ -103,7 +108,7 @@ fn event_page_json() -> String {
             {{"sequence":4,"jobId":"{JOB_ID}","operationId":"operation-execute","attemptId":"attempt-1","kind":"agent.message","payload":{{"threadId":"thread-1","turnId":"turn-1","itemId":"answer-1","partIndex":null,"text":"finished."}},"createdAt":"2026-08-02T00:00:00Z"}},
             {{"sequence":5,"jobId":"{JOB_ID}","operationId":"operation-execute","attemptId":"attempt-1","kind":"agent.message.completed","payload":{{"threadId":"thread-1","turnId":"turn-1","itemId":"answer-1","phase":null}},"createdAt":"2026-08-02T00:00:00Z"}},
             {{"sequence":6,"jobId":"{JOB_ID}","operationId":"operation-execute","attemptId":"attempt-1","kind":"turn.warning","payload":{{"threadId":"thread-1","turnId":"turn-1","message":"provider will retry"}},"createdAt":"2026-08-02T00:00:00Z"}},
-            {{"sequence":7,"jobId":"{JOB_ID}","operationId":"operation-execute","attemptId":"attempt-1","kind":"stage.completed","payload":{{"stage":"codex.execute","threadId":"thread-1","turnId":"turn-1"}},"createdAt":"2026-08-02T00:00:01Z"}}
+            {{"sequence":7,"jobId":"{JOB_ID}","operationId":"operation-execute","attemptId":"attempt-1","kind":"stage.completed","payload":{{"stage":"codex.execute","role":"stage","reviewCycle":0,"threadId":"thread-1","turnId":"turn-1","findings":[]}},"createdAt":"2026-08-02T00:00:01Z"}}
         ],"nextCursor":7}}"#
     )
 }

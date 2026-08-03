@@ -49,10 +49,13 @@ readonly ENV_FILE=$PRODUCT_ROOT/.env
 readonly ENV_EXAMPLE=$PRODUCT_ROOT/.env.example
 readonly PROJECT_DIR=$(find_project_dir)
 readonly HOST_REPOSITORY_ID="local:$(sha256_text "$PROJECT_DIR")"
+readonly HOST_ARTIFACT_DIR=$PROJECT_DIR/.factory
 readonly HOST_UID=$(id -u)
 readonly HOST_GID=$(id -g)
 
 export FACTORY_PROJECT_DIR=$PROJECT_DIR
+export FACTORY_ARTIFACT_HOST_DIR=$HOST_ARTIFACT_DIR
+export FACTORY_HOST_REPOSITORY_ID=$HOST_REPOSITORY_ID
 export FACTORY_RUN_AS_UID=$HOST_UID
 export FACTORY_RUN_AS_GID=$HOST_GID
 
@@ -85,6 +88,8 @@ Usage:
   factory attach <job-id>            Reattach with compact expandable output
   factory attach --verbose <job-id>  Replay every durable event in full
   factory status <job-id>            Show durable job and stage status
+  factory result <job-id>            Print the complete durable result
+  factory artifacts <job-id>         List fixed job artifacts and location
   factory stop <job-id>              Cancel a durable job
   factory apply <job-id>             Apply a result to this clean checkout
   factory export <job-id> [-o FILE]  Export a standard binary Git patch
@@ -105,6 +110,24 @@ ensure_env_file() {
     [[ -f "$ENV_EXAMPLE" ]] || die "missing $ENV_EXAMPLE"
     cp "$ENV_EXAMPLE" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
+  fi
+}
+
+ensure_artifact_root() {
+  local exclude_path exclude_parent
+  mkdir -p "$HOST_ARTIFACT_DIR/jobs"
+
+  if ! exclude_path=$(git -C "$PROJECT_DIR" rev-parse --git-path info/exclude 2>/dev/null); then
+    return
+  fi
+  if [[ "$exclude_path" != /* ]]; then
+    exclude_path=$PROJECT_DIR/$exclude_path
+  fi
+  exclude_parent=$(dirname -- "$exclude_path")
+  mkdir -p "$exclude_parent"
+  touch "$exclude_path"
+  if ! grep -Fqx '/.factory/' "$exclude_path"; then
+    printf '\n/.factory/\n' >> "$exclude_path"
   fi
 }
 
@@ -234,6 +257,7 @@ up_stack() {
   local provider profile
   local services=(postgres qdrant factoryd)
   ensure_env_file
+  ensure_artifact_root
   require_docker
   ensure_provider_configuration
   pull_factory_image
@@ -253,6 +277,7 @@ up_stack() {
 
 up_coordinator() {
   ensure_env_file
+  ensure_artifact_root
   require_docker
   pull_factory_image
   compose up -d --wait --wait-timeout 180 --remove-orphans postgres factoryd
@@ -416,7 +441,7 @@ main() {
       up_stack
       exec_factory_cli "$command" "$@"
       ;;
-    status | stop)
+    status | stop | result | artifacts)
       shift
       up_coordinator
       exec_factory_coordinator_cli "$command" "$@"

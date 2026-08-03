@@ -1,4 +1,5 @@
 mod api;
+mod artifacts;
 mod config;
 mod live;
 mod output;
@@ -121,6 +122,10 @@ enum FactoryCommand {
     Attach(AttachArgs),
     /// Print the current durable job state and results.
     Status(JobArgs),
+    /// Print the complete durable human result.
+    Result(JobArgs),
+    /// List the fixed artifacts for a durable job.
+    Artifacts(JobArgs),
     /// Stop a running durable job.
     Stop(JobArgs),
     /// Export a succeeded job as a standard binary Git patch.
@@ -269,6 +274,22 @@ async fn run() -> Result<i32> {
             )
             .await
         }
+        Some(FactoryCommand::Result(args)) => {
+            result(
+                &FactorydClient::new(&cli.factoryd_url)?,
+                validate_job_id(&args.job_id)?,
+                args.json,
+            )
+            .await
+        }
+        Some(FactoryCommand::Artifacts(args)) => {
+            artifacts(
+                &FactorydClient::new(&cli.factoryd_url)?,
+                validate_job_id(&args.job_id)?,
+                args.json,
+            )
+            .await
+        }
         Some(FactoryCommand::Stop(args)) => {
             stop(
                 &FactorydClient::new(&cli.factoryd_url)?,
@@ -409,12 +430,15 @@ async fn monitor_job(
                 client.list_stage_checkpoints(&job_id),
                 client.list_attempts(&job_id),
             )?;
-            let results = if output_mode == OutputMode::Compact {
-                transcript.stage_results()
-            } else {
-                Vec::new()
-            };
-            output::print_final(&job, &stages, &attempts, &results, output_mode.json())?;
+            let full_result = terminal_result(client, &job).await?;
+            output::print_final(
+                &job,
+                &stages,
+                &attempts,
+                full_result.as_ref(),
+                output_mode.json(),
+                output_mode != OutputMode::Verbose,
+            )?;
             return Ok(output::job_state_exit_code(job.job.state));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -454,8 +478,8 @@ async fn monitor_interactive(client: &FactorydClient, job_id: JobId) -> Result<i
             )?;
             screen.inspect_completed(&job, &transcript, Duration::from_secs(3))?;
             screen.restore()?;
-            let results = transcript.stage_results();
-            output::print_final(&job, &stages, &attempts, &results, false)?;
+            let full_result = terminal_result(client, &job).await?;
+            output::print_final(&job, &stages, &attempts, full_result.as_ref(), false, true)?;
             return Ok(output::job_state_exit_code(job.job.state));
         }
 
@@ -504,15 +528,60 @@ async fn status(client: &FactorydClient, job_id: JobId, json_output: bool) -> Re
         client.list_stage_checkpoints(&job_id),
         client.list_attempts(&job_id),
     )?;
+    let full_result = if output::terminal(job.job.state) {
+        terminal_result(client, &job).await?
+    } else {
+        None
+    };
     if json_output {
-        output::print_status_json(&job, &stages, &attempts)?;
+        output::print_status_json(&job, &stages, &attempts, full_result.as_ref())?;
     } else {
         output::print_progress(&job);
         if output::terminal(job.job.state) {
-            output::print_final(&job, &stages, &attempts, &[], false)?;
+            output::print_final(&job, &stages, &attempts, full_result.as_ref(), false, true)?;
         }
     }
     Ok(output::job_state_exit_code(job.job.state))
+}
+
+async fn result(client: &FactorydClient, job_id: JobId, json_output: bool) -> Result<i32> {
+    let job = client.load_job(&job_id).await?;
+    let full_result = artifacts::load_full_result(client, &job).await?;
+    output::print_full_result(&job_id, &full_result, json_output)?;
+    Ok(output::job_state_exit_code(job.job.state))
+}
+
+async fn artifacts(client: &FactorydClient, job_id: JobId, json_output: bool) -> Result<i32> {
+    let job = client.load_job(&job_id).await?;
+    let artifacts = artifacts::load_artifacts(client, &job).await?;
+    output::print_artifacts(&job_id, &artifacts, json_output)?;
+    Ok(output::job_state_exit_code(job.job.state))
+}
+
+async fn terminal_result(
+    client: &FactorydClient,
+    job: &factory_coordinator::DurableJob,
+) -> Result<Option<artifacts::FullResult>> {
+    terminal_result_policy(
+        job.job.state,
+        artifacts::load_full_result(client, job).await,
+    )
+}
+
+fn terminal_result_policy(
+    state: factory_coordinator::JobState,
+    loaded: Result<artifacts::FullResult>,
+) -> Result<Option<artifacts::FullResult>> {
+    if state == factory_coordinator::JobState::Succeeded {
+        return loaded.map(Some);
+    }
+    match loaded {
+        Ok(result) => Ok(Some(result)),
+        Err(error) => {
+            eprintln!("Result unavailable: {error:#}");
+            Ok(None)
+        }
+    }
 }
 
 async fn stop(client: &FactorydClient, job_id: JobId, json_output: bool) -> Result<i32> {
@@ -912,6 +981,8 @@ fn normalize_shorthand(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
                 | "run"
                 | "attach"
                 | "status"
+                | "result"
+                | "artifacts"
                 | "stop"
                 | "export"
                 | "apply"
@@ -931,6 +1002,17 @@ fn normalize_shorthand(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn succeeded_terminal_job_propagates_result_reconstruction_failure() {
+        let error = terminal_result_policy(
+            factory_coordinator::JobState::Succeeded,
+            Err(anyhow::anyhow!("event reconstruction failed")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("event reconstruction failed"));
+    }
 
     struct TestRoot(PathBuf);
 

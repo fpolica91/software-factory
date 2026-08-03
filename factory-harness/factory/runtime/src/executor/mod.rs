@@ -6,6 +6,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use codex_app_server_client::InProcessClientStartArgs;
+use factory_coordinator::ArtifactManager;
 use factory_coordinator::AttemptFailure;
 use factory_coordinator::CancellationHandle;
 use factory_coordinator::CoordinatorError;
@@ -29,6 +30,7 @@ use crate::session::AutonomousSession;
 use crate::session::ParentThread;
 use crate::stages::OperationKind;
 
+mod artifacts;
 mod resume;
 mod stage_loop;
 mod task;
@@ -60,6 +62,7 @@ pub struct CodexOperationExecutor {
     factoryd_base_url: String,
     max_review_cycles: u32,
     workspaces: WorkspaceManager,
+    artifacts: ArtifactManager,
     execution_profile: ExecutionProfile,
 }
 
@@ -92,12 +95,14 @@ impl CodexOperationExecutor {
             return Err("maximum review cycles must be positive".to_string());
         }
         let workspaces = WorkspaceManager::from_env().map_err(|error| error.to_string())?;
+        let artifacts = ArtifactManager::from_env().map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             start_args,
             factoryd_base_url,
             max_review_cycles,
             workspaces,
+            artifacts,
             execution_profile,
         })
     }
@@ -567,6 +572,13 @@ impl OperationExecutor for CodexOperationExecutor {
                 .await
                 .map_err(cancel_cleanup_error)
         })
+    }
+
+    fn after_successful_settlement(
+        &self,
+        context: OperationExecutionContext,
+    ) -> Pin<Box<dyn Future<Output = factory_coordinator::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.publish_settled_artifacts(&context).await })
     }
 }
 

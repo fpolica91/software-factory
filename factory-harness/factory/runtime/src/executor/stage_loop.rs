@@ -5,6 +5,7 @@ use factory_coordinator::NewAttemptEvent;
 use factory_coordinator::OperationCheckpoint;
 use factory_coordinator::OperationExecutionContext;
 use factory_extension::FactoryReviewVerdict;
+use factory_extension::FactoryState;
 use factory_extension::FactoryStateBackend;
 use serde_json::json;
 
@@ -73,6 +74,7 @@ impl CodexOperationExecutor {
                         }
                         return self.complete_stage(
                             checkpoint,
+                            &state,
                             final_checkpoint(
                                 checkpoint,
                                 workspace_metadata(context),
@@ -196,6 +198,7 @@ impl CodexOperationExecutor {
         }
         self.complete_stage(
             &completed.checkpoint,
+            &state,
             final_checkpoint(
                 &completed.checkpoint,
                 workspace_metadata(context),
@@ -257,14 +260,16 @@ impl CodexOperationExecutor {
                     let correlation_id = self
                         .append_checkpoint_turn_correlation(context, review)
                         .await?;
-                    return self.complete_stage(
+                    let completed = self.complete_stage(
                         &completed,
+                        &state,
                         encode_checkpoint(
                             &completed,
                             workspace_metadata(context),
                             Some(correlation_id),
                         )?,
-                    );
+                    )?;
+                    return Ok(completed);
                 }
                 ReviewLoopStep::Run {
                     role: StageTurnRole::Remediation,
@@ -353,6 +358,7 @@ impl CodexOperationExecutor {
                                     if review.verdict == FactoryReviewVerdict::Approve {
                                         return self.complete_stage(
                                             &checkpoint,
+                                            &state,
                                             final_checkpoint(
                                                 &checkpoint,
                                                 workspace_metadata(context),
@@ -380,6 +386,7 @@ impl CodexOperationExecutor {
                                     if review.verdict == FactoryReviewVerdict::Approve {
                                         return self.complete_stage(
                                             &checkpoint,
+                                            &state,
                                             final_checkpoint(
                                                 &checkpoint,
                                                 workspace_metadata(context),
@@ -624,8 +631,13 @@ impl CodexOperationExecutor {
     fn complete_stage(
         &self,
         checkpoint: &StageCheckpoint,
+        state: &FactoryState,
         durable_checkpoint: OperationCheckpoint,
     ) -> ExecutionResult<CompletedOperation> {
+        let findings = state
+            .review
+            .as_ref()
+            .map_or_else(|| json!([]), |review| json!(&review.findings));
         Ok(CompletedOperation {
             checkpoint: durable_checkpoint,
             completion_event: NewAttemptEvent {
@@ -636,6 +648,7 @@ impl CodexOperationExecutor {
                     "reviewCycle": checkpoint.review_cycle,
                     "threadId": checkpoint.active_thread_id,
                     "turnId": checkpoint.turn_id,
+                    "findings": findings,
                 }),
                 deduplication_key: None,
             },

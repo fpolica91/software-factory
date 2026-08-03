@@ -55,11 +55,14 @@ RUN mkdir -p \
     /var/lib/software-factory/codex \
     /var/lib/software-factory/coordinator \
     /var/lib/software-factory/provider \
+    /factory-artifacts/local/jobs \
+    /factory-artifacts/coordinator/jobs \
     /workspace/project \
     /workspaces
 
 ENV CODEX_HOME=/var/lib/software-factory/codex \
-    FACTORY_WORKSPACE_ROOT=/workspaces
+    FACTORY_WORKSPACE_ROOT=/workspaces \
+    FACTORY_ARTIFACT_ROOT=/factory-artifacts
 
 WORKDIR /workspace/project
 CMD ["factory", "--help"]

@@ -12,6 +12,8 @@ x-factory-worker-env: &factory-worker-env
   FACTORY_QDRANT_COLLECTION: ${FACTORY_QDRANT_COLLECTION:-factory_memories}
   # Deployment partition only; the worker also applies the durable repository ID.
   FACTORY_MEMORY_NAMESPACE: ${FACTORY_MEMORY_NAMESPACE:-factory-global}
+  FACTORY_ARTIFACT_ROOT: /factory-artifacts
+  FACTORY_HOST_REPOSITORY_ID: ${FACTORY_HOST_REPOSITORY_ID:-}
   FACTORY_MODEL: ${FACTORY_MODEL:-}
   FACTORY_PROVIDER_ADAPTER: ${FACTORY_PROVIDER_ADAPTER:-}
   FACTORY_PROVIDER_BASE_URL: ${FACTORY_PROVIDER_BASE_URL:-}
@@ -90,6 +92,8 @@ services:
     environment:
       FACTORY_DATABASE_URL: postgresql://factory:${POSTGRES_PASSWORD:-factory-local}@postgres:5432/factory
       FACTORY_WORKSPACE_ROOT: /workspaces
+      FACTORY_ARTIFACT_ROOT: /factory-artifacts
+      FACTORY_HOST_REPOSITORY_ID: ${FACTORY_HOST_REPOSITORY_ID:-}
       FACTORY_RUN_AS_UID: ${FACTORY_RUN_AS_UID:-}
       FACTORY_RUN_AS_GID: ${FACTORY_RUN_AS_GID:-}
     entrypoint: ["/usr/local/bin/factory-worker-entrypoint"]
@@ -99,6 +103,10 @@ services:
       - exec factoryd --database-url "$${FACTORY_DATABASE_URL}" serve --bind 0.0.0.0:8787
     volumes:
       - workspaces:/workspaces
+      - factory-artifacts:/factory-artifacts
+      - type: bind
+        source: ${FACTORY_ARTIFACT_HOST_DIR:-.factory}/jobs
+        target: /factory-artifacts/local/jobs
       - type: bind
         source: ${FACTORY_PROJECT_DIR:-.}
         target: /workspace/project
@@ -137,6 +145,10 @@ services:
     working_dir: /workspaces
     volumes:
       - workspaces:/workspaces
+      - factory-artifacts:/factory-artifacts
+      - type: bind
+        source: ${FACTORY_ARTIFACT_HOST_DIR:-.factory}/jobs
+        target: /factory-artifacts/local/jobs
       - codex-state:/var/lib/software-factory/codex
       - provider-state:/var/lib/software-factory/provider:ro
 
@@ -393,6 +405,7 @@ volumes:
   workspaces:
   codex-state:
   provider-state:
+  factory-artifacts:
   coordination-redis-data:
   artifact-data:
   ollama-data:

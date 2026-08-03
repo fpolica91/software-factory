@@ -41,6 +41,8 @@ factory run --repository https://host/org/repo.git --detach "Audit it"
 factory status JOB_ID                            # inspect current state
 factory attach JOB_ID                            # reconnect to live output
 factory attach --verbose JOB_ID                  # replay every event in full
+factory result JOB_ID                            # print the complete result
+factory artifacts JOB_ID                         # list fixed job artifacts
 factory stop JOB_ID                              # cancel durably
 factory apply JOB_ID                             # apply a completed result here
 factory export JOB_ID -o result.patch            # preserve a portable patch
@@ -55,6 +57,12 @@ deterministic compact text with no terminal escapes. Use `--verbose` for the
 complete human event replay or `--json` for the unchanged NDJSON stream. Pass
 `--detach` when a script should return immediately; otherwise non-interactive
 runs stream until completion.
+
+Every terminal success prints the complete result before exiting. Local jobs
+also write Factory-owned reports under `.factory/jobs/JOB_ID/`, outside the
+managed worktree and result patch. Jobs created for a remote or different
+checkout keep artifacts in coordinator storage; `factory result JOB_ID`
+remains readable without entering a container.
 
 A successful attached run against a local repository applies its result to the
 originating checkout by default; use `factory run --no-apply ...` to retain it
@@ -73,10 +81,11 @@ used from another repository.
 Export paths are host paths, including absolute paths. Factory downloads and
 verifies the complete patch before publishing it atomically without overwriting
 an existing file; use `-o -` when raw patch bytes should go to standard output.
-Status, stop, apply, and export start only PostgreSQL plus `factoryd`; completed
-results remain retrievable after a full shutdown without a provider key or
-model worker. Provider/model configuration uses that same control plane for
-the active-job check and never starts Qdrant, a provider bridge, or a worker.
+Status, stop, result, artifacts, apply, and export start only PostgreSQL plus
+`factoryd`; completed results remain retrievable after a full shutdown without
+a provider key or model worker. Provider/model configuration uses that same
+control plane for the active-job check and never starts Qdrant, a provider
+bridge, or a worker.
 
 ## Providers
 

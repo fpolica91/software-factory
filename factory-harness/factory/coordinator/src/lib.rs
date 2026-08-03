@@ -5,6 +5,7 @@
 //! retries. It stores only the durable Factory context needed around kernel
 //! execution.
 
+mod artifacts;
 mod correlation;
 mod domain;
 mod error;
@@ -13,9 +14,14 @@ mod ids;
 mod rows;
 mod runner;
 mod schema;
+mod stage_output;
 mod store;
 mod workspace;
 
+pub use artifacts::ArtifactManager;
+pub use artifacts::ArtifactPaths;
+pub use artifacts::ArtifactProjectionWarning;
+pub use artifacts::JobArtifactFile;
 pub use correlation::Correlation;
 pub use domain::AttemptFailure;
 pub use domain::AttemptFence;
@@ -74,6 +80,9 @@ pub use runner::OperationExecutionResult;
 pub use runner::OperationExecutor;
 pub use runner::OperationOutcome;
 pub use runner::RunnerConfig;
+pub use stage_output::CompletedStageOutput;
+pub use stage_output::reduce_settled_job_outputs;
+pub use stage_output::render_job_result;
 pub use store::CoordinatorStore;
 pub use store::WorkspaceExecutionGuard;
 pub use workspace::WorkspaceManager;

@@ -99,6 +99,8 @@ exit 0
     for args in [
         &["apply", "completed-job"][..],
         &["export", "completed-job", "-o", "-"][..],
+        &["result", "completed-job"][..],
+        &["artifacts", "completed-job"][..],
     ] {
         let log = fixture.0.join(format!("{}.log", args[0]));
         let commands = invoke(&launcher, &fake_bin, &log, args);
@@ -187,4 +189,79 @@ exit 0
             "configure unexpectedly used {forbidden}:\n{commands}"
         );
     }
+}
+
+#[test]
+fn launcher_creates_a_git_excluded_workspace_artifact_root() {
+    let fixture = TestRoot::new();
+    let fake_bin = fixture.0.join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let launcher = fixture.0.join("factory");
+    std::fs::copy(repository_root.join("factory"), &launcher).unwrap();
+    let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&launcher, permissions).unwrap();
+    std::fs::write(
+        fixture.0.join(".env"),
+        b"FACTORY_IMAGE=software-factory:local\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.0.join(".env.example"), b"").unwrap();
+    std::fs::write(fixture.0.join("docker-compose.yml"), b"services: {}\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&fixture.0)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    write_executable(
+        &fake_bin.join("docker"),
+        br##"#!/bin/sh
+printf 'artifact=%s repository=%s command=%s\n' "$FACTORY_ARTIFACT_HOST_DIR" "$FACTORY_HOST_REPOSITORY_ID" "$*" >> "$FACTORY_DOCKER_LOG"
+case " $* " in
+  *" config --environment "*) printf '%s\n' 'FACTORY_IMAGE=software-factory:local' ;;
+  *" ps --status running --quiet factoryd "*) printf '%s\n' 'fake-factoryd' ;;
+esac
+exit 0
+"##,
+    );
+
+    let log = fixture.0.join("status.log");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(&launcher)
+        .args(["status", "completed-job"])
+        .current_dir(&fixture.0)
+        .env("PATH", path)
+        .env("FACTORY_DOCKER_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "launcher failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(fixture.0.join(".factory/jobs").is_dir());
+    let exclude = std::fs::read_to_string(fixture.0.join(".git/info/exclude")).unwrap();
+    assert!(exclude.lines().any(|line| line == "/.factory/"));
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(&fixture.0)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&status.stdout).contains(".factory"));
+
+    let commands = std::fs::read_to_string(log).unwrap();
+    assert!(commands.contains(&format!("artifact={}/.factory", fixture.0.display())));
+    assert!(commands.contains("repository=local:"));
 }

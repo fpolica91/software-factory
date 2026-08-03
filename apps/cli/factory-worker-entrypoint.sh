@@ -16,12 +16,23 @@ case "$factory_uid:$factory_gid" in
 esac
 
 if [ "$(id -u)" -eq 0 ]; then
-  mkdir -p /var/lib/software-factory/codex /var/lib/software-factory/provider /workspaces
+  mkdir -p \
+    /var/lib/software-factory/codex \
+    /var/lib/software-factory/provider \
+    /workspaces \
+    /factory-artifacts/local/jobs \
+    /factory-artifacts/coordinator/jobs
   chown -R "$factory_uid:$factory_gid" /var/lib/software-factory/codex
   if [ "${FACTORY_PROVIDER_STATE_WRITABLE:-}" = 1 ]; then
     chown -R "$factory_uid:$factory_gid" /var/lib/software-factory/provider
   fi
   chown -R "$factory_uid:$factory_gid" /workspaces
+  chown "$factory_uid:$factory_gid" \
+    /factory-artifacts \
+    /factory-artifacts/local \
+    /factory-artifacts/local/jobs \
+    /factory-artifacts/coordinator \
+    /factory-artifacts/coordinator/jobs
   export HOME=/var/lib/software-factory/codex
   export XDG_CACHE_HOME=/var/lib/software-factory/codex/.cache
   exec setpriv --reuid "$factory_uid" --regid "$factory_gid" --clear-groups "$@"

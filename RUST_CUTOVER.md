@@ -149,6 +149,34 @@ unplanned and must be investigated before continuing.
   digest-labelled standard binary Git patch through
   `GET /jobs/{jobId}/result`; legacy workspace rows receive non-reusable
   `legacy:` identities rather than an ambiguous path-derived backfill.
+  Operational job artifact plumbing uses the single `FACTORY_ARTIFACT_ROOT`
+  seam. Durable jobs, operations, attempts, checkpoints, and events are the
+  only source of truth; artifact files are disposable renderings. Each job may
+  have a coordinator-side rendering plus `.factory/jobs/<job-id>/` in the
+  matching local checkout. Remote repositories and jobs from another mounted
+  checkout have no local projection. Artifact paths are separate from managed
+  worktrees and therefore never enter result patches. Job creation initializes
+  Factory-owned `job.json` and `task.md`; runtime repeats that step idempotently
+  for externally created jobs. Terminal observers regenerate either missing
+  inventory file under the publication lock and project existing bytes without
+  rewriting them, preserving any recorded base metadata. A successful stage
+  settlement atomically records the exact accepted turn and its findings in
+  `stage.completed`. The runtime
+  reconstructs all settled stage output from events under a per-job file lock
+  and atomically refreshes stage Markdown, exact accepted `findings.json`, and
+  cumulative `result.md`, with `result.md` written last. Legacy completion
+  events without a `findings` field mean that findings are unknown, not empty;
+  reconstruction removes any stale `findings.json` projection and reports that
+  file unavailable. A present empty array remains an exact, known empty result.
+  Terminal observers perform the same reconstruction before reporting a
+  succeeded job, so attach, status, result, and artifact reads repair missing
+  or stale renderings. A late
+  publisher cannot regress output because it reloads current settled events
+  after settlement and publication is serialized. Artifact failures never
+  change a validated stage settlement: they emit a normal durable warning plus
+  worker log. Remediation retains each accepted fix and re-review in cycle order
+  while failed, replaced, and unaccepted turns are excluded. Agents never author
+  these fixed files.
 - `factory-harness/factory/extension/`: native Factory state, tools, context,
   review provenance, subagent activity, and optional Qdrant memory. Sparse
   lexical recall requires a score of at least `2.0`, preventing a single generic
@@ -269,15 +297,24 @@ unplanned and must be investigated before continuing.
   key nor starts Qdrant, a provider bridge, or the model worker. Attach starts
   the full runtime and performs a final event-cursor drain after observing a
   terminal job, so the atomically committed final `stage.completed` event is
-  printed before the result. Provider/model configuration also starts only
+  printed before the complete untruncated result. `factory result` reconstructs
+  current settled output from durable events, refreshes disposable coordinator
+  and matching workspace renderings, and then prints that reconstruction.
+  `factory artifacts` uses the same event reducer and repair path, reports the
+  fixed artifact set, and prints a `.factory/jobs/<job-id>/` path only when its
+  regular files byte-match the refreshed coordinator rendering. Pre-artifact
+  jobs therefore self-heal through exact durable operation/attempt/accepted-turn
+  selectors rather than trusting old files. Result and artifact commands use
+  only PostgreSQL and `factoryd`, and JSON terminal output carries the full
+  result plus artifact metadata. Provider/model configuration also starts only
   PostgreSQL plus `factoryd` for its active-job check. `src/transcript.rs`
   reduces paired and streamed records into lossless display cells without
   discarding durable records, and `src/live.rs` renders a bounded Ratatui view
   with keyboard and mouse expansion. Non-TTY output is compact, `--verbose`
   retains the complete human replay, and `--json` preserves every event and
-  payload. Final per-stage agent answers remain as short previews after the
-  live view exits; their full text stays expandable in the completed view or
-  replayable with `--verbose`. The private Codex TUI modules were not exposed
+  payload. Final output replaces the former 180-character stage previews with
+  the complete durable result; `--verbose` remains lossless without repeating
+  the same result body at exit. The private Codex TUI modules were not exposed
   or copied: their cells depend on the full chat application and would add its
   entire dependency closure to the standalone Factory CLI.
 - `factory-harness/factory/providers/`: native Rust transport adapter and
@@ -353,9 +390,10 @@ The runnable distribution switched to Rust on 2026-08-02:
   provider health checks use `curl` instead of Node.
 - The root `factory` launcher owns only Docker/bootstrap and host-file
   lifecycle. It delegates onboarding, hidden key input,
-  provider/model switching, run, attach, status, stop, result apply, and result
-  export to the Rust CLI. It derives a stable local repository identity from
-  the canonical host Git root before crossing the fixed container mount. It
+  provider/model switching, run, attach, status, stop, result/artifact reads,
+  result apply, and result export to the Rust CLI. It derives a stable local
+  repository identity from the canonical host Git root before crossing the
+  fixed container mount. It
   reads the same Docker Compose-expanded provider, model, and key values used
   by the worker, and streams verified export bytes from container stdout into
   an atomic no-overwrite host file rather than passing host paths into `factoryd`.

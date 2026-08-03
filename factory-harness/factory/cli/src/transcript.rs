@@ -29,12 +29,6 @@ pub(crate) enum EventTone {
     Warning,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StageResult {
-    pub stage: String,
-    pub preview: String,
-}
-
 #[derive(Clone, Debug)]
 struct EventHeader {
     sequence: u64,
@@ -257,13 +251,6 @@ impl TranscriptRow {
         }
     }
 
-    fn last_sequence(&self) -> u64 {
-        self.events
-            .last()
-            .map(|event| event.sequence)
-            .unwrap_or_default()
-    }
-
     fn resolve_stage(&mut self, operations: &HashMap<String, String>) {
         if self.stage.is_some() {
             return;
@@ -324,54 +311,6 @@ impl Transcript {
         for row in &mut self.rows {
             row.resolve_stage(&operations);
         }
-    }
-
-    pub(crate) fn stage_results(&self) -> Vec<StageResult> {
-        #[derive(Clone)]
-        struct Candidate {
-            sequence: u64,
-            preferred: bool,
-            markdown: String,
-        }
-
-        let mut by_stage = BTreeMap::<String, Candidate>::new();
-        for row in self
-            .rows
-            .iter()
-            .filter(|row| row.family == EventFamily::Agent)
-        {
-            let Some(stage) = row.stage.clone() else {
-                continue;
-            };
-            let markdown = row.content();
-            if markdown.trim().is_empty() {
-                continue;
-            }
-            let preferred = row.phase.as_deref() != Some("commentary");
-            let candidate = Candidate {
-                sequence: row.last_sequence(),
-                preferred,
-                markdown,
-            };
-            let replace = by_stage.get(&stage).is_none_or(|current| {
-                (candidate.preferred && !current.preferred)
-                    || (candidate.preferred == current.preferred
-                        && candidate.sequence > current.sequence)
-            });
-            if replace {
-                by_stage.insert(stage, candidate);
-            }
-        }
-
-        let mut results = by_stage
-            .into_iter()
-            .map(|(stage, candidate)| StageResult {
-                stage,
-                preview: one_line(&candidate.markdown, 180),
-            })
-            .collect::<Vec<_>>();
-        results.sort_by_key(|result| stage_rank(&result.stage));
-        results
     }
 }
 
@@ -644,19 +583,8 @@ fn one_line(value: &str, max_chars: usize) -> String {
     output
 }
 
-fn stage_rank(stage: &str) -> u8 {
-    match stage {
-        "plan" => 0,
-        "execute" => 1,
-        "review" => 2,
-        "remediate" => 3,
-        _ => 4,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use factory_coordinator::DurableJob;
     use factory_coordinator::JobEventRecord;
     use serde_json::Value;
     use serde_json::json;
@@ -672,32 +600,6 @@ mod tests {
             "kind": kind,
             "payload": payload,
             "createdAt": "2026-08-02T00:00:00Z",
-        }))
-        .unwrap()
-    }
-
-    fn job(operation_kind: &str) -> DurableJob {
-        serde_json::from_value(json!({
-            "job": {
-                "jobId": "job-compact-output",
-                "kind": "factory.task",
-                "input": {},
-                "state": "running",
-                "createdAt": "2026-08-02T00:00:00Z",
-                "updatedAt": "2026-08-02T00:00:00Z",
-            },
-            "operations": [{
-                "operationId": "operation-review",
-                "jobId": "job-compact-output",
-                "ordinal": 0,
-                "kind": operation_kind,
-                "input": {},
-                "state": "running",
-                "maxAttempts": 3,
-                "nextEligibleAt": "2026-08-02T00:00:00Z",
-                "createdAt": "2026-08-02T00:00:00Z",
-                "updatedAt": "2026-08-02T00:00:00Z",
-            }],
         }))
         .unwrap()
     }
@@ -719,62 +621,6 @@ mod tests {
         assert_eq!(transcript.rows()[0].preview(200), "cargo check --workspace");
         assert!(transcript.rows()[0].detail().contains("tool.started"));
         assert!(transcript.rows()[0].detail().contains("tool.completed"));
-    }
-
-    #[test]
-    fn streamed_final_answer_is_retained_as_stage_result() {
-        let base = json!({
-            "itemId": "answer-1",
-            "threadId": "thread-1",
-            "turnId": "turn-1",
-        });
-        let mut transcript = Transcript::default();
-        let mut first = base.clone();
-        first["text"] = json!("Review ");
-        transcript.ingest(&event(1, "agent.message", first));
-        let mut second = base;
-        second["text"] = json!("passed.");
-        transcript.ingest(&event(2, "agent.message", second));
-        transcript.correlate_job(&job("codex.review"));
-
-        assert_eq!(
-            transcript.stage_results(),
-            vec![super::StageResult {
-                stage: "review".to_string(),
-                preview: "Review passed.".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn non_commentary_answer_wins_over_later_commentary() {
-        let mut transcript = Transcript::default();
-        transcript.ingest(&event(
-            1,
-            "agent.message.completed",
-            json!({
-                "itemId": "final-1",
-                "turnId": "turn-1",
-                "phase": null,
-                "text": "Implementation complete.",
-            }),
-        ));
-        transcript.ingest(&event(
-            2,
-            "agent.message.completed",
-            json!({
-                "itemId": "commentary-2",
-                "turnId": "turn-1",
-                "phase": "commentary",
-                "text": "Cleaning up.",
-            }),
-        ));
-        transcript.correlate_job(&job("codex.execute"));
-
-        assert_eq!(
-            transcript.stage_results()[0].preview,
-            "Implementation complete."
-        );
     }
 
     #[test]

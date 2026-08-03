@@ -1,9 +1,11 @@
+use crate::ArtifactManager;
 use crate::AttemptFence;
 use crate::CoordinatorError;
 use crate::CoordinatorInstanceId;
 use crate::CoordinatorStore;
 use crate::EnsureWorkspaceRequest;
 use crate::NewAttemptEvent;
+use crate::NewJobEvent;
 use crate::WorkspaceManager;
 use crate::ids::AttemptId;
 use crate::ids::JobId;
@@ -83,6 +85,7 @@ enum ApiError {
 struct ApiState {
     store: CoordinatorStore,
     workspaces: WorkspaceManager,
+    artifacts: ArtifactManager,
 }
 
 impl FromRef<ApiState> for CoordinatorStore {
@@ -177,9 +180,17 @@ pub async fn serve_http_with_workspaces(
     workspaces: WorkspaceManager,
     listener: TcpListener,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(ApiState { store, workspaces }))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    let artifacts = ArtifactManager::from_env().map_err(std::io::Error::other)?;
+    axum::serve(
+        listener,
+        router(ApiState {
+            store,
+            workspaces,
+            artifacts,
+        }),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
 }
 
 fn router(state: ApiState) -> Router {
@@ -243,10 +254,11 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn create_job(
-    State(store): State<CoordinatorStore>,
+    State(state): State<ApiState>,
     Json(definition): Json<crate::JobDefinition>,
 ) -> ApiResult {
-    let job = store.create_job(definition).await?;
+    let job = state.store.create_job(definition).await?;
+    initialize_job_artifacts(&state, &job, None).await;
     Ok((StatusCode::CREATED, Json(job)).into_response())
 }
 
@@ -347,7 +359,35 @@ async fn ensure_workspace(
         .workspaces
         .ensure(&state.store, &JobId::new(job_id), request)
         .await?;
+    if let Ok(job) = state.store.load_job(&workspace.job_id).await {
+        initialize_job_artifacts(&state, &job, Some(&workspace)).await;
+    }
     Ok((StatusCode::OK, Json(workspace)).into_response())
+}
+
+async fn initialize_job_artifacts(
+    state: &ApiState,
+    job: &crate::DurableJob,
+    workspace: Option<&crate::WorkspaceRecord>,
+) {
+    let result = state.artifacts.initialize_job_files(job, workspace).await;
+    let warning = match result {
+        Ok(warnings) if warnings.is_empty() => return,
+        Ok(warnings) => format!(
+            "{} local artifact projection file(s) could not be refreshed",
+            warnings.len()
+        ),
+        Err(error) => format!("job artifact initialization failed: {error}"),
+    };
+    eprintln!("factoryd: {warning}");
+    let _ = state
+        .store
+        .append_job_event(NewJobEvent {
+            job_id: job.job.job_id.clone(),
+            kind: "artifact.warning".to_string(),
+            payload: serde_json::json!({"message": warning}),
+        })
+        .await;
 }
 
 async fn load_workspace(State(state): State<ApiState>, Path(job_id): Path<String>) -> ApiResult {

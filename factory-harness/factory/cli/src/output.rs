@@ -14,7 +14,8 @@ use factory_providers::provider_profile;
 use serde_json::Value;
 use serde_json::json;
 
-use crate::transcript::StageResult;
+use crate::artifacts::ArtifactMetadata;
+use crate::artifacts::FullResult;
 use crate::transcript::compact_event_line;
 use crate::transcript::compact_lines;
 use crate::transcript::event_detail;
@@ -235,8 +236,9 @@ pub fn print_final(
     job: &DurableJob,
     stages: &[StageCheckpointRecord],
     attempts: &[AttemptRecord],
-    results: &[StageResult],
+    full_result: Option<&FullResult>,
     json_output: bool,
+    render_markdown: bool,
 ) -> Result<()> {
     if json_output {
         println!(
@@ -246,6 +248,7 @@ pub fn print_final(
                 "job": job,
                 "stageCheckpoints": stages,
                 "attempts": attempts,
+                "fullResult": full_result,
                 "applyCommand": (job.job.state == JobState::Succeeded)
                     .then(|| format!("factory apply {}", job.job.job_id)),
                 "exportCommand": (job.job.state == JobState::Succeeded)
@@ -286,12 +289,11 @@ pub fn print_final(
         }
     }
 
-    if !results.is_empty() {
-        println!("\nResults");
-        for result in results {
-            println!("  {:<10} {}", title_case(&result.stage), result.preview);
-        }
-        println!("  inspect    factory attach {}", job.job.job_id);
+    if let Some(result) = full_result {
+        print!(
+            "\n{}",
+            format_full_result(&job.job.job_id, result, render_markdown)
+        );
     }
 
     print_attempt_failures(job, attempts);
@@ -302,10 +304,86 @@ pub fn print_final(
     Ok(())
 }
 
+pub fn print_full_result(job_id: &JobId, result: &FullResult, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&full_result_json(job_id, result))?
+        );
+        return Ok(());
+    }
+    print!("{}", format_full_result(job_id, result, true));
+    Ok(())
+}
+
+fn full_result_json(job_id: &JobId, result: &FullResult) -> Value {
+    json!({
+        "type": "result",
+        "jobId": job_id,
+        "fullResult": result,
+    })
+}
+
+pub fn print_artifacts(
+    job_id: &JobId,
+    artifacts: &ArtifactMetadata,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "type": "artifacts",
+                "jobId": job_id,
+                "artifacts": artifacts,
+            }))?
+        );
+        return Ok(());
+    }
+    print!("{}", format_artifacts(artifacts));
+    Ok(())
+}
+
+fn format_artifacts(artifacts: &ArtifactMetadata) -> String {
+    let mut output = String::from("Artifacts\n");
+    for file in &artifacts.files {
+        let state = if file.local_available {
+            "available locally"
+        } else if file.available {
+            "available via coordinator"
+        } else {
+            "not materialized"
+        };
+        output.push_str(&format!("  {:<14} {state}\n", file.name));
+    }
+    if let Some(directory) = &artifacts.local_directory {
+        output.push_str(&format!("\nDirectory: {directory}\n"));
+    }
+    output.push_str(&format!("\n{}\n", artifacts.message));
+    output
+}
+
+fn format_full_result(job_id: &JobId, result: &FullResult, render_markdown: bool) -> String {
+    let mut output = String::new();
+    if render_markdown {
+        output.push_str(&result.markdown);
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    if let Some(path) = &result.artifacts.result_path {
+        output.push_str(&format!("\nFull result: {path}\n"));
+    }
+    output.push_str(&format!("\n{}\n", result.artifacts.message));
+    output.push_str(&format!("Inspect: factory result {job_id}\n"));
+    output
+}
+
 pub fn print_status_json(
     job: &DurableJob,
     stages: &[StageCheckpointRecord],
     attempts: &[AttemptRecord],
+    full_result: Option<&FullResult>,
 ) -> Result<()> {
     println!(
         "{}",
@@ -313,6 +391,7 @@ pub fn print_status_json(
             "job": job,
             "stageCheckpoints": stages,
             "attempts": attempts,
+            "fullResult": full_result,
         }))?
     );
     Ok(())
@@ -415,14 +494,6 @@ fn operation_state_label(state: OperationState) -> &'static str {
     }
 }
 
-fn title_case(value: &str) -> String {
-    let mut characters = value.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
-        None => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +509,24 @@ mod tests {
             "createdAt": "2026-08-02T00:00:00Z",
         }))
         .expect("job event fixture")
+    }
+
+    fn full_result() -> FullResult {
+        FullResult {
+            markdown: "# Result\n\n## Review\n\nApproved.\n\n- Finding one\n- Finding two\n"
+                .to_string(),
+            artifacts: ArtifactMetadata {
+                ownership: "local",
+                files: vec![crate::artifacts::ArtifactFileMetadata {
+                    name: "result.md",
+                    available: true,
+                    local_available: true,
+                }],
+                local_directory: Some(".factory/jobs/job-final/".to_string()),
+                result_path: Some(".factory/jobs/job-final/result.md".to_string()),
+                message: "Artifacts are available in the current workspace.".to_string(),
+            },
+        }
     }
 
     #[test]
@@ -569,5 +658,62 @@ mod tests {
             write_event(&mut output, &event(kind, payload), false).unwrap();
             assert_eq!(String::from_utf8(output).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn full_result_keeps_multiline_review_findings_and_local_path() {
+        let rendered = format_full_result(&JobId::new("job-final"), &full_result(), true);
+        assert!(rendered.contains("## Review\n\nApproved."));
+        assert!(rendered.contains("- Finding one\n- Finding two"));
+        assert!(rendered.contains("Full result: .factory/jobs/job-final/result.md"));
+        assert!(rendered.contains("Inspect: factory result job-final"));
+    }
+
+    #[test]
+    fn projection_warning_remains_visible_when_local_path_exists() {
+        let mut result = full_result();
+        result.artifacts.message =
+            "1 workspace artifact file could not be refreshed; durable event output is current."
+                .to_string();
+        let rendered = format_full_result(&JobId::new("job-final"), &result, true);
+        assert!(rendered.contains("Full result: .factory/jobs/job-final/result.md"));
+        assert!(rendered.contains("could not be refreshed"));
+        let inventory = format_artifacts(&result.artifacts);
+        assert!(inventory.contains("Directory: .factory/jobs/job-final/"));
+        assert!(inventory.contains("could not be refreshed"));
+    }
+
+    #[test]
+    fn full_result_replaces_compact_preview_and_verbose_does_not_duplicate_body() {
+        let compact = format_full_result(&JobId::new("job-final"), &full_result(), true);
+        assert!(compact.contains("Finding two"));
+        assert!(!compact.contains('…'));
+
+        let verbose_handoff = format_full_result(&JobId::new("job-final"), &full_result(), false);
+        assert!(!verbose_handoff.contains("## Review"));
+        assert_eq!(
+            verbose_handoff.matches("factory result job-final").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn json_result_contains_full_markdown_and_artifact_metadata() {
+        let payload = full_result_json(&JobId::new("job-final"), &full_result());
+        assert_eq!(payload["fullResult"]["markdown"], full_result().markdown);
+        assert!(payload["fullResult"].get("source").is_none());
+        assert_eq!(
+            payload["fullResult"]["artifacts"]["resultPath"],
+            ".factory/jobs/job-final/result.md"
+        );
+        assert!(payload.get("artifacts").is_none());
+    }
+
+    #[test]
+    fn succeeded_exit_zero_has_a_human_final_handoff() {
+        assert_eq!(job_state_exit_code(JobState::Succeeded), 0);
+        let rendered = format_full_result(&JobId::new("job-final"), &full_result(), true);
+        assert!(rendered.starts_with("# Result"));
+        assert!(rendered.ends_with("Inspect: factory result job-final\n"));
     }
 }

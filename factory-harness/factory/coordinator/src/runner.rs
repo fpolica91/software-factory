@@ -171,6 +171,17 @@ pub trait OperationExecutor: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Publishes executor-owned material derived from a successfully settled
+    /// operation. The runner invokes this only after the database transaction
+    /// has committed; hook failures are warning-only and never roll back or
+    /// retry the already-settled operation.
+    fn after_successful_settlement(
+        &self,
+        _context: OperationExecutionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Claims durable work, maintains its leases, and commits executor outcomes.
@@ -415,10 +426,18 @@ where
         },
     };
     match settle_outcome(&store, &fence, outcome).await {
+        Ok(settled_succeeded) => {
+            if settled_succeeded
+                && let Err(error) = executor.after_successful_settlement(cleanup_context).await
+            {
+                eprintln!("factory runner post-settlement publication warning: {error}");
+            }
+            Ok(())
+        }
         Err(CoordinatorError::JobCancellationRequested(_)) => {
             cleanup_and_acknowledge_cancellation(&store, executor.as_ref(), &cleanup_context).await
         }
-        result => result,
+        Err(error) => Err(error),
     }
 }
 
@@ -454,7 +473,7 @@ async fn settle_outcome(
     store: &CoordinatorStore,
     fence: &AttemptFence,
     outcome: OperationOutcome,
-) -> Result<()> {
+) -> Result<bool> {
     let (settlement, checkpoint, completion_event) = match outcome {
         OperationOutcome::Complete {
             checkpoint,
@@ -472,6 +491,7 @@ async fn settle_outcome(
             detail: json!({ "cause": "invalidFinalCheckpoint" }),
         },
     };
+    let settlement_succeeded = matches!(&settlement, AttemptSettlement::Succeeded);
     let checkpoint = checkpoint.map(|checkpoint| checkpoint.into_new(fence));
     let has_checkpoint = checkpoint.is_some();
     if checkpoint
@@ -481,19 +501,19 @@ async fn settle_outcome(
         store
             .settle_attempt(fence, AttemptSettlement::Failed(fallback_failure), None)
             .await?;
-        return Ok(());
+        return Ok(false);
     }
 
     match store
         .settle_attempt_with_event(fence, settlement, checkpoint, completion_event)
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(settlement_succeeded),
         Err(error) if has_checkpoint && invalid_checkpoint(&error) => {
             store
                 .settle_attempt(fence, AttemptSettlement::Failed(fallback_failure), None)
                 .await?;
-            Ok(())
+            Ok(false)
         }
         Err(error) => Err(error),
     }
