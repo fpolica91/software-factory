@@ -21,6 +21,16 @@ protocol. The adapter exposes only:
 | `deepseek` | Chat adapter | `deepseek-v4-pro` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com` |
 | `zai` | Chat adapter | `glm-5.2` | `ZAI_API_KEY` | Coding or Standard API |
 
+Claude onboarding offers `claude-haiku-4-5` for inexpensive runs plus
+`claude-sonnet-5`, `claude-opus-5`, and `claude-fable-5`. The adapter enables
+adaptive thinking and effort only on models that support them; Haiku runs with
+its 200k context metadata, 64k output ceiling, and no unsupported thinking
+parameters. Adaptive models translate Codex reasoning-summary intent to
+Anthropic's `thinking.display` contract so requested summaries remain visible.
+Custom Opus 4.5 aliases retain effort without falsely enabling adaptive
+thinking; an unknown custom model remains usable without effort, while an
+explicit effort is rejected instead of being silently discarded.
+
 Z.AI's Coding Developer Plan base is
 `https://api.z.ai/api/coding/paas/v4`; its Standard API base is
 `https://api.z.ai/api/paas/v4`. `provider_profiles()` is the canonical catalog

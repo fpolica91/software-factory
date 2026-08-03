@@ -5,6 +5,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::config::AdapterConfig;
+use crate::profiles::anthropic_model_capabilities;
 use crate::responses::ProviderState;
 use crate::responses::ResponsesStream;
 use crate::responses::ToolCatalog;
@@ -28,17 +29,76 @@ pub(crate) fn prepare_request(
     let model = request_model(request)?;
     let tools = ToolCatalog::from_request(request)?;
     let (system, messages) = build_messages(request_input(request)?, &tools, request)?;
+    let capabilities = anthropic_model_capabilities(model);
     let mut body = Map::new();
     body.insert("model".to_string(), Value::String(model.to_string()));
     body.insert("messages".to_string(), Value::Array(messages));
-    body.insert("max_tokens".to_string(), json!(config.max_tokens));
+    let max_tokens = capabilities
+        .map(|capabilities| config.max_tokens.min(capabilities.max_output_tokens))
+        .unwrap_or(config.max_tokens);
+    body.insert("max_tokens".to_string(), json!(max_tokens));
     body.insert("stream".to_string(), Value::Bool(true));
-    body.insert("thinking".to_string(), json!({"type": "adaptive"}));
+    if capabilities.is_some_and(|capabilities| capabilities.supports_adaptive_thinking) {
+        body.insert("thinking".to_string(), json!({"type": "adaptive"}));
+    }
     if !system.is_empty() {
         body.insert("system".to_string(), Value::String(system));
     }
     if let Some(effort) = request.pointer("/reasoning/effort").and_then(Value::as_str) {
-        body.insert("effort".to_string(), Value::String(effort.to_string()));
+        match effort {
+            "none"
+                if capabilities
+                    .is_some_and(|capabilities| capabilities.adaptive_thinking_is_required) =>
+            {
+                return Err(TranslationError::InvalidRequest(format!(
+                    "model {model} does not support disabling adaptive thinking"
+                )));
+            }
+            "none"
+                if capabilities
+                    .is_some_and(|capabilities| capabilities.supports_adaptive_thinking) =>
+            {
+                body.insert("thinking".to_string(), json!({"type": "disabled"}));
+            }
+            "none" => {}
+            supported
+                if capabilities
+                    .is_some_and(|capabilities| capabilities.effort.supports(supported)) =>
+            {
+                body.insert("output_config".to_string(), json!({"effort": effort}));
+            }
+            unsupported if capabilities.is_some() => {
+                return Err(TranslationError::InvalidRequest(format!(
+                    "model {model} does not support Anthropic effort {unsupported}"
+                )));
+            }
+            requested => {
+                return Err(TranslationError::InvalidRequest(format!(
+                    "cannot determine whether custom Anthropic model {model} supports effort {requested}; omit the reasoning effort or select a known model"
+                )));
+            }
+        }
+    }
+    if body
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("adaptive")
+        && capabilities.is_some_and(|capabilities| capabilities.supports_thinking_display)
+        && let Some(summary) = request
+            .pointer("/reasoning/summary")
+            .and_then(Value::as_str)
+    {
+        let display = match summary {
+            "auto" | "concise" | "detailed" => "summarized",
+            "none" => "omitted",
+            unsupported => {
+                return Err(TranslationError::InvalidRequest(format!(
+                    "unsupported reasoning summary {unsupported} for Anthropic model {model}"
+                )));
+            }
+        };
+        body["thinking"]["display"] = Value::String(display.to_string());
     }
     let anthropic_tools = tools.anthropic_tools();
     if !anthropic_tools.is_empty() {

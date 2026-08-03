@@ -9,7 +9,12 @@ pub const GENERATED_MODEL_CATALOG_PATH: &str =
     "/var/lib/software-factory/provider/codex-models.json";
 
 const OPENAI_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
-const ANTHROPIC_MODELS: &[&str] = &["claude-sonnet-5", "claude-opus-5", "claude-fable-5"];
+const ANTHROPIC_MODELS: &[&str] = &[
+    "claude-haiku-4-5",
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-fable-5",
+];
 const DEEPSEEK_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
 const ZAI_MODELS: &[&str] = &["glm-5.2", "glm-5.1", "glm-5"];
 
@@ -116,6 +121,128 @@ pub fn provider_profiles() -> &'static [ProviderProfile] {
 
 pub fn provider_profile(id: &str) -> Option<&'static ProviderProfile> {
     PROFILES.iter().find(|profile| profile.id == id)
+}
+
+#[cfg(feature = "adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnthropicEffortSupport {
+    Unsupported,
+    ThroughHigh,
+    ThroughMax,
+    ThroughXHighAndMax,
+}
+
+#[cfg(feature = "adapter")]
+impl AnthropicEffortSupport {
+    pub(crate) fn supports_any(self) -> bool {
+        self != Self::Unsupported
+    }
+
+    pub(crate) fn supports(self, effort: &str) -> bool {
+        match effort {
+            "low" | "medium" | "high" => self.supports_any(),
+            "xhigh" => self == Self::ThroughXHighAndMax,
+            "max" => matches!(self, Self::ThroughMax | Self::ThroughXHighAndMax),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnthropicModelCapabilities {
+    pub(crate) supports_adaptive_thinking: bool,
+    pub(crate) adaptive_thinking_is_required: bool,
+    pub(crate) supports_thinking_display: bool,
+    pub(crate) effort: AnthropicEffortSupport,
+    pub(crate) context_window: i64,
+    pub(crate) max_output_tokens: u32,
+}
+
+#[cfg(feature = "adapter")]
+pub(crate) fn anthropic_model_capabilities(model: &str) -> Option<AnthropicModelCapabilities> {
+    use AnthropicEffortSupport::ThroughHigh;
+    use AnthropicEffortSupport::ThroughMax;
+    use AnthropicEffortSupport::ThroughXHighAndMax;
+    use AnthropicEffortSupport::Unsupported;
+
+    let capabilities = if matches_alias_or_dated_snapshot(model, "claude-haiku-4-5") {
+        AnthropicModelCapabilities {
+            supports_adaptive_thinking: false,
+            adaptive_thinking_is_required: false,
+            supports_thinking_display: false,
+            effort: Unsupported,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+        }
+    } else if matches_alias_or_dated_snapshot(model, "claude-sonnet-4-5") {
+        AnthropicModelCapabilities {
+            supports_adaptive_thinking: false,
+            adaptive_thinking_is_required: false,
+            supports_thinking_display: false,
+            effort: Unsupported,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+        }
+    } else if matches_alias_or_dated_snapshot(model, "claude-opus-4-5") {
+        AnthropicModelCapabilities {
+            supports_adaptive_thinking: false,
+            adaptive_thinking_is_required: false,
+            supports_thinking_display: false,
+            effort: ThroughHigh,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+        }
+    } else {
+        match model {
+            "claude-sonnet-4-6" | "claude-opus-4-6" => AnthropicModelCapabilities {
+                supports_adaptive_thinking: true,
+                adaptive_thinking_is_required: false,
+                supports_thinking_display: true,
+                effort: ThroughMax,
+                context_window: 1_000_000,
+                max_output_tokens: 128_000,
+            },
+            "claude-sonnet-5" | "claude-opus-4-7" | "claude-opus-4-8" | "claude-opus-5" => {
+                AnthropicModelCapabilities {
+                    supports_adaptive_thinking: true,
+                    adaptive_thinking_is_required: false,
+                    supports_thinking_display: true,
+                    effort: ThroughXHighAndMax,
+                    context_window: 1_000_000,
+                    max_output_tokens: 128_000,
+                }
+            }
+            "claude-fable-5" | "claude-mythos-5" => AnthropicModelCapabilities {
+                supports_adaptive_thinking: true,
+                adaptive_thinking_is_required: true,
+                supports_thinking_display: true,
+                effort: ThroughXHighAndMax,
+                context_window: 1_000_000,
+                max_output_tokens: 128_000,
+            },
+            "claude-mythos-preview" => AnthropicModelCapabilities {
+                supports_adaptive_thinking: true,
+                adaptive_thinking_is_required: true,
+                supports_thinking_display: true,
+                effort: ThroughMax,
+                context_window: 1_000_000,
+                max_output_tokens: 128_000,
+            },
+            _ => return None,
+        }
+    };
+    Some(capabilities)
+}
+
+#[cfg(feature = "adapter")]
+fn matches_alias_or_dated_snapshot(model: &str, alias: &str) -> bool {
+    model == alias
+        || model.strip_prefix(alias).is_some_and(|suffix| {
+            suffix.strip_prefix('-').is_some_and(|date| {
+                date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
 }
 
 #[derive(Debug, Clone, PartialEq)]

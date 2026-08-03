@@ -17,6 +17,7 @@ use thiserror::Error;
 
 use crate::profiles::AdapterKind;
 use crate::profiles::ProviderProfile;
+use crate::profiles::anthropic_model_capabilities;
 use crate::profiles::provider_profile;
 
 pub const MODEL_CATALOG_FILE: &str = "codex-models.json";
@@ -139,6 +140,44 @@ pub async fn write_model_catalog(config: &AdapterConfig) -> Result<PathBuf, std:
 }
 
 fn model_catalog(profile: &ProviderProfile, model: &str) -> ModelsResponse {
+    let anthropic_capabilities = if profile.id == "anthropic" {
+        anthropic_model_capabilities(model)
+    } else {
+        None
+    };
+    let supports_effort = profile.id != "anthropic"
+        || anthropic_capabilities.is_some_and(|capabilities| capabilities.effort.supports_any());
+    let supports_reasoning_summary = profile.id != "anthropic"
+        || anthropic_capabilities
+            .is_some_and(|capabilities| capabilities.supports_thinking_display);
+    let supported_reasoning_levels = supports_effort
+        .then(|| {
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+            ]
+            .into_iter()
+            .filter(|effort| {
+                profile.id != "anthropic"
+                    || anthropic_capabilities
+                        .is_some_and(|capabilities| capabilities.effort.supports(effort.as_str()))
+            })
+            .map(|effort| {
+                let description = effort.to_string();
+                ReasoningEffortPreset {
+                    effort,
+                    description,
+                }
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    let context_window = anthropic_capabilities
+        .map(|capabilities| capabilities.context_window)
+        .unwrap_or(profile.context_window);
     ModelsResponse {
         models: vec![ModelInfo {
             slug: model.to_string(),
@@ -147,23 +186,8 @@ fn model_catalog(profile: &ProviderProfile, model: &str) -> ModelsResponse {
                 "{} through the Factory transport adapter.",
                 profile.label
             )),
-            default_reasoning_level: Some(ReasoningEffort::Medium),
-            supported_reasoning_levels: [
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::XHigh,
-                ReasoningEffort::Max,
-            ]
-            .into_iter()
-            .map(|effort| {
-                let description = effort.to_string();
-                ReasoningEffortPreset {
-                    effort,
-                    description,
-                }
-            })
-            .collect(),
+            default_reasoning_level: supports_effort.then_some(ReasoningEffort::Medium),
+            supported_reasoning_levels,
             shell_type: ConfigShellToolType::ShellCommand,
             visibility: ModelVisibility::List,
             supported_in_api: true,
@@ -176,8 +200,12 @@ fn model_catalog(profile: &ProviderProfile, model: &str) -> ModelsResponse {
             base_instructions: BASE_INSTRUCTIONS.to_string(),
             model_messages: None,
             include_skills_usage_instructions: true,
-            supports_reasoning_summary_parameter: true,
-            default_reasoning_summary: ReasoningSummary::Auto,
+            supports_reasoning_summary_parameter: supports_reasoning_summary,
+            default_reasoning_summary: if supports_reasoning_summary {
+                ReasoningSummary::Auto
+            } else {
+                ReasoningSummary::None
+            },
             support_verbosity: false,
             default_verbosity: None,
             apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
@@ -185,8 +213,8 @@ fn model_catalog(profile: &ProviderProfile, model: &str) -> ModelsResponse {
             truncation_policy: TruncationPolicyConfig::tokens(10_000),
             supports_parallel_tool_calls: true,
             supports_image_detail_original: false,
-            context_window: Some(profile.context_window),
-            max_context_window: Some(profile.context_window),
+            context_window: Some(context_window),
+            max_context_window: Some(context_window),
             auto_compact_token_limit: None,
             comp_hash: None,
             effective_context_window_percent: 95,
@@ -199,5 +227,91 @@ fn model_catalog(profile: &ProviderProfile, model: &str) -> ModelsResponse {
             tool_mode: None,
             multi_agent_version: None,
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_catalog;
+    use crate::profiles::provider_profile;
+
+    #[test]
+    fn haiku_aliases_disable_reasoning_controls_and_use_their_real_context_window() {
+        let profile = provider_profile("anthropic").unwrap();
+        for model_id in ["claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
+            let catalog = model_catalog(profile, model_id);
+            let model = &catalog.models[0];
+
+            assert_eq!(model.context_window, Some(200_000));
+            assert_eq!(model.max_context_window, Some(200_000));
+            assert_eq!(model.default_reasoning_level, None);
+            assert!(model.supported_reasoning_levels.is_empty());
+            assert!(!model.supports_reasoning_summary_parameter);
+        }
+    }
+
+    #[test]
+    fn sonnet_45_aliases_disable_reasoning_controls_and_use_their_real_context_window() {
+        let profile = provider_profile("anthropic").unwrap();
+        for model_id in ["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"] {
+            let catalog = model_catalog(profile, model_id);
+            let model = &catalog.models[0];
+
+            assert_eq!(model.context_window, Some(200_000));
+            assert_eq!(model.max_context_window, Some(200_000));
+            assert_eq!(model.default_reasoning_level, None);
+            assert!(model.supported_reasoning_levels.is_empty());
+            assert!(!model.supports_reasoning_summary_parameter);
+        }
+    }
+
+    #[test]
+    fn opus_45_aliases_advertise_effort_without_adaptive_thinking() {
+        let profile = provider_profile("anthropic").unwrap();
+        for model_id in ["claude-opus-4-5", "claude-opus-4-5-20251101"] {
+            let catalog = model_catalog(profile, model_id);
+            let model = &catalog.models[0];
+            let efforts = model
+                .supported_reasoning_levels
+                .iter()
+                .map(|preset| preset.effort.to_string())
+                .collect::<Vec<_>>();
+
+            assert_eq!(model.context_window, Some(200_000));
+            assert_eq!(model.max_context_window, Some(200_000));
+            assert_eq!(efforts, ["low", "medium", "high"]);
+            assert!(!model.supports_reasoning_summary_parameter);
+        }
+    }
+
+    #[test]
+    fn anthropic_catalog_only_advertises_effort_levels_supported_by_the_model() {
+        let profile = provider_profile("anthropic").unwrap();
+        let sonnet_5 = model_catalog(profile, "claude-sonnet-5");
+        let sonnet_46 = model_catalog(profile, "claude-sonnet-4-6");
+
+        assert!(
+            sonnet_5.models[0]
+                .supported_reasoning_levels
+                .iter()
+                .any(|preset| preset.effort.to_string() == "xhigh")
+        );
+        assert!(sonnet_5.models[0].supports_reasoning_summary_parameter);
+        assert_eq!(
+            sonnet_5.models[0].default_reasoning_summary,
+            codex_protocol::config_types::ReasoningSummary::Auto
+        );
+        assert!(
+            !sonnet_46.models[0]
+                .supported_reasoning_levels
+                .iter()
+                .any(|preset| preset.effort.to_string() == "xhigh")
+        );
+        assert!(
+            sonnet_46.models[0]
+                .supported_reasoning_levels
+                .iter()
+                .any(|preset| preset.effort.to_string() == "max")
+        );
     }
 }

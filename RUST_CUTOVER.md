@@ -287,6 +287,17 @@ unplanned and must be investigated before continuing.
   `CodexProviderSelection` compile without the adapter feature for lightweight
   CLI/runtime use; `responses.rs`, `tools.rs`, and `response_stream.rs` keep
   request parsing, tool mapping, and streaming output as separate concerns.
+  Claude selection includes low-cost Haiku 4.5 alongside Sonnet 5, Opus 5, and
+  Fable 5. Anthropic request generation emits the current nested
+  `output_config.effort` contract only for models that support effort; Haiku
+  uses its 200k context metadata and 64k output ceiling without unsupported
+  thinking controls. Adaptive models translate requested reasoning summaries
+  through `thinking.display`. Generated model metadata advertises `xhigh` only
+  where Anthropic supports it, and always-adaptive models cannot be translated
+  to a disabled-thinking request.
+  The centralized Anthropic capability resolver recognizes dated 4.5 aliases,
+  preserves Opus 4.5 effort without adaptive thinking, and rejects explicit
+  effort for unknown custom models instead of silently discarding it.
   Adapter-backed selections default an absent or legacy-blank catalog setting
   to the bridge-generated shared catalog, while an explicit override wins;
   direct OpenAI keeps no catalog override unless one is explicitly supplied.

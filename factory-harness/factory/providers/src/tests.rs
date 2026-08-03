@@ -37,7 +37,170 @@ fn profile_catalog_is_canonical_and_lightweight() {
         );
         assert!(profile.models.contains(&profile.default_model));
     }
+    let anthropic = provider_profile("anthropic").unwrap();
+    assert_eq!(
+        anthropic.models,
+        [
+            "claude-haiku-4-5",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5"
+        ]
+    );
     assert!(provider_profile("claude").is_none());
+}
+
+#[test]
+fn anthropic_request_uses_current_adaptive_thinking_contract() {
+    let mut request = base_request();
+    request["model"] = json!("claude-sonnet-5");
+    request["reasoning"]["summary"] = json!("auto");
+    let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
+
+    assert_eq!(
+        prepared.body["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
+    assert_eq!(prepared.body["output_config"]["effort"], "high");
+    assert!(prepared.body.get("effort").is_none());
+}
+
+#[test]
+fn anthropic_haiku_request_omits_unsupported_thinking_controls() {
+    let mut request = base_request();
+    request["model"] = json!("claude-haiku-4-5");
+    request.as_object_mut().unwrap().remove("reasoning");
+    let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
+
+    assert!(prepared.body.get("thinking").is_none());
+    assert!(prepared.body.get("output_config").is_none());
+    assert!(prepared.body.get("effort").is_none());
+    assert_eq!(prepared.body["max_tokens"], 64_000);
+}
+
+#[test]
+fn anthropic_haiku_preserves_a_lower_configured_output_limit() {
+    let mut request = base_request();
+    request["model"] = json!("claude-haiku-4-5-20251001");
+    request.as_object_mut().unwrap().remove("reasoning");
+    let mut adapter = config("anthropic");
+    adapter.max_tokens = 4_096;
+    let prepared = anthropic::prepare_request(&request, &adapter).unwrap();
+
+    assert_eq!(prepared.body["max_tokens"], 4_096);
+}
+
+#[test]
+fn anthropic_sonnet_45_aliases_clamp_the_default_output_limit() {
+    for model in ["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"] {
+        let mut request = base_request();
+        request["model"] = json!(model);
+        request.as_object_mut().unwrap().remove("reasoning");
+        let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
+
+        assert_eq!(prepared.body["max_tokens"], 64_000);
+        assert!(prepared.body.get("thinking").is_none());
+        assert!(prepared.body.get("output_config").is_none());
+    }
+}
+
+#[test]
+fn anthropic_summary_none_requests_omitted_thinking_display() {
+    let mut request = base_request();
+    request["model"] = json!("claude-sonnet-5");
+    request["reasoning"]["summary"] = json!("none");
+    let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
+
+    assert_eq!(
+        prepared.body["thinking"],
+        json!({"type": "adaptive", "display": "omitted"})
+    );
+}
+
+#[test]
+fn anthropic_disabled_thinking_never_includes_a_display() {
+    let mut request = base_request();
+    request["model"] = json!("claude-sonnet-5");
+    request["reasoning"] = json!({"effort": "none", "summary": "auto"});
+    let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
+
+    assert_eq!(prepared.body["thinking"], json!({"type": "disabled"}));
+}
+
+#[test]
+fn anthropic_opus_45_snapshot_uses_effort_without_adaptive_thinking() {
+    let mut request = base_request();
+    request["model"] = json!("claude-opus-4-5-20251101");
+    let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
+
+    assert!(prepared.body.get("thinking").is_none());
+    assert_eq!(prepared.body["output_config"]["effort"], "high");
+}
+
+#[test]
+fn anthropic_rejects_effort_levels_the_selected_model_does_not_support() {
+    let mut request = base_request();
+    request["model"] = json!("claude-sonnet-4-6");
+    request["reasoning"]["effort"] = json!("xhigh");
+
+    let error = match anthropic::prepare_request(&request, &config("anthropic")) {
+        Ok(_) => panic!("Sonnet 4.6 must reject xhigh effort"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not support Anthropic effort xhigh")
+    );
+}
+
+#[test]
+fn anthropic_unknown_custom_model_remains_usable_without_effort() {
+    for effort in [None, Some("none")] {
+        let mut request = base_request();
+        request["model"] = json!("claude-private-model");
+        match effort {
+            Some(effort) => request["reasoning"]["effort"] = json!(effort),
+            None => {
+                request.as_object_mut().unwrap().remove("reasoning");
+            }
+        }
+        let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
+
+        assert!(prepared.body.get("thinking").is_none());
+        assert!(prepared.body.get("output_config").is_none());
+    }
+}
+
+#[test]
+fn anthropic_rejects_explicit_effort_for_an_unknown_custom_model() {
+    let mut request = base_request();
+    request["model"] = json!("claude-private-model");
+
+    let error = match anthropic::prepare_request(&request, &config("anthropic")) {
+        Ok(_) => panic!("an unknown custom model must not silently discard explicit effort"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains(
+        "cannot determine whether custom Anthropic model claude-private-model supports effort high"
+    ));
+}
+
+#[test]
+fn anthropic_rejects_disabling_thinking_on_always_adaptive_models() {
+    let mut request = base_request();
+    request["model"] = json!("claude-fable-5");
+    request["reasoning"]["effort"] = json!("none");
+
+    let error = match anthropic::prepare_request(&request, &config("anthropic")) {
+        Ok(_) => panic!("Fable 5 must reject disabled thinking"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not support disabling adaptive thinking")
+    );
 }
 
 #[test]
@@ -212,7 +375,7 @@ fn chat_request_replays_apply_patch_with_the_chat_schema() {
 
 #[test]
 fn anthropic_keeps_the_generic_custom_tool_schema() {
-    let prepared = anthropic::prepare_request(&base_request(), &config("anthropic")).unwrap();
+    let prepared = anthropic::prepare_request(&anthropic_request(), &config("anthropic")).unwrap();
     let apply_patch = prepared.body["tools"]
         .as_array()
         .unwrap()
@@ -529,7 +692,8 @@ fn anthropic_request_replays_signed_thinking_and_tool_results_unchanged() {
             "signature": "opaque-signature"
         })],
     });
-    let request = request_fixture(state);
+    let mut request = request_fixture(state);
+    request["model"] = json!("claude-sonnet-5");
     let prepared = anthropic::prepare_request(&request, &config).unwrap();
     let messages = prepared.body["messages"].as_array().unwrap();
     let assistant = messages
@@ -548,7 +712,8 @@ fn anthropic_request_replays_signed_thinking_and_tool_results_unchanged() {
 
 #[test]
 fn anthropic_request_replays_a_tool_hidden_from_the_current_turn() {
-    let request = request_with_hidden_goal_history();
+    let mut request = request_with_hidden_goal_history();
+    request["model"] = json!("claude-sonnet-5");
     let prepared = anthropic::prepare_request(&request, &config("anthropic")).unwrap();
     let messages = prepared.body["messages"].as_array().unwrap();
     let assistant = messages
@@ -566,7 +731,7 @@ fn anthropic_request_replays_a_tool_hidden_from_the_current_turn() {
 #[test]
 fn anthropic_stream_preserves_signature_and_streamed_tool_arguments() {
     let config = config("anthropic");
-    let prepared = anthropic::prepare_request(&base_request(), &config).unwrap();
+    let prepared = anthropic::prepare_request(&anthropic_request(), &config).unwrap();
     let mut stream = AnthropicStreamTranslator::new("claude-sonnet-5", prepared.tools);
     let arguments = json!({"input": valid_patch()}).to_string();
     let split = arguments.len() / 2;
@@ -614,7 +779,7 @@ fn anthropic_stream_preserves_signature_and_streamed_tool_arguments() {
 
 #[test]
 fn anthropic_stream_rejects_open_blocks_and_missing_message_stop() {
-    let prepared = anthropic::prepare_request(&base_request(), &config("anthropic")).unwrap();
+    let prepared = anthropic::prepare_request(&anthropic_request(), &config("anthropic")).unwrap();
     let mut open_block = AnthropicStreamTranslator::new("claude-sonnet-5", prepared.tools.clone());
     open_block
         .push(&json!({
@@ -707,6 +872,12 @@ fn base_request() -> Value {
         "stream": true,
         "include": ["reasoning.encrypted_content"]
     })
+}
+
+fn anthropic_request() -> Value {
+    let mut request = base_request();
+    request["model"] = json!("claude-sonnet-5");
+    request
 }
 
 fn valid_patch() -> &'static str {
