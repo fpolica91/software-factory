@@ -284,7 +284,13 @@ pub(super) fn validate_checkpoint_state(
                 .operation
                 .validate(state, None)
                 .map_err(|error| error.to_string())?;
-            if state.revision <= checkpoint.state_revision_baseline {
+            // An iterate round starts with every unit already completed and
+            // the progress tool rejects rewriting a completed unit, so no
+            // Factory state mutation is possible; the round's detached
+            // review judges the workspace changes instead.
+            if checkpoint.operation != OperationKind::Iterate
+                && state.revision <= checkpoint.state_revision_baseline
+            {
                 return Err(format!(
                     "Factory state revision {} did not advance beyond {}",
                     state.revision, checkpoint.state_revision_baseline

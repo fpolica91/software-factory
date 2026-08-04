@@ -763,3 +763,30 @@ Recorded on 2026-08-02:
 Automatic token-triggered context compaction is therefore accepted through the
 unchanged native Codex path. Factory observes and durably replays its lifecycle;
 it does not implement a second compactor.
+
+Recorded on 2026-08-03 (clarification gate and continuation rounds):
+
+- The interactive clarification gate is CLI-only and fail-open: real DeepSeek
+  calls produced five numbered questions for an ambiguous task, an `expect`
+  driven terminal session paired marker answers to their exact questions, the
+  composed prompt was persisted to `.factory/prompts/prompt_<sha12>.md`, and an
+  unreachable coordinator failed job creation only after the prompt file was
+  saved. Piped, `--json`, and `--no-clarify` runs skip the gate.
+- `POST /jobs/{id}/continue` reopens a succeeded factory.task: remote job
+  `e8059bc3-68e2-4dd9-847f-d1509c29478d` ran the base four stages, then two
+  live continuation rounds (ten durable operations) against real
+  `deepseek/deepseek-v4-pro`. Each round appended its feedback to the durable
+  task, appended `codex.iterate`, `codex.review`, `codex.remediate`, and
+  requeued; the recovery claim SQL was unchanged. The iterate turns resumed
+  the original parent Codex thread (three turns on one thread across rounds
+  and a container image swap), each round's detached review approved against
+  the amended task, and the final result exported one cumulative patch against
+  the immutable base containing every round's changes.
+- Iterate turns are exempt from the execute-stage state-revision-advance
+  requirement because `factory_update_progress` rejects rewriting a completed
+  unit: failed job `61adaadd-ca47-44d1-873b-1ad38bd5fdbd` is the recorded
+  counterexample, where three correct iterate attempts were rejected by that
+  invariant before the exemption. Its round's detached review remains the
+  functional gate for iterate output. Settled `iterate` stages project to the
+  fixed `iterate.md` artifact; repeated stages keep one file per stage kind
+  holding the latest settled output.

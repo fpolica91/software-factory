@@ -19,6 +19,7 @@ pub enum JobArtifactFile {
     Task,
     Plan,
     Execute,
+    Iterate,
     Review,
     Remediate,
     Result,
@@ -26,11 +27,12 @@ pub enum JobArtifactFile {
 }
 
 impl JobArtifactFile {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Job,
         Self::Task,
         Self::Plan,
         Self::Execute,
+        Self::Iterate,
         Self::Review,
         Self::Remediate,
         Self::Result,
@@ -43,6 +45,7 @@ impl JobArtifactFile {
             Self::Task => "task.md",
             Self::Plan => "plan.md",
             Self::Execute => "execute.md",
+            Self::Iterate => "iterate.md",
             Self::Review => "review.md",
             Self::Remediate => "remediate.md",
             Self::Result => "result.md",
@@ -50,10 +53,13 @@ impl JobArtifactFile {
         }
     }
 
+    /// Repeated stages (continuation reviews, remediations, and iterates)
+    /// project onto one file per stage kind holding the latest settled output.
     pub fn for_stage(stage: &str) -> Option<Self> {
         match stage {
             "plan" => Some(Self::Plan),
             "execute" => Some(Self::Execute),
+            "iterate" => Some(Self::Iterate),
             "review" => Some(Self::Review),
             "remediate" => Some(Self::Remediate),
             _ => None,

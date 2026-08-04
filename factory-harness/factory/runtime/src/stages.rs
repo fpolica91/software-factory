@@ -17,7 +17,7 @@ pub const PLAN_PROMPT: &str = "Inspect the repository without modifying it. On e
 pub const EXECUTE_PROMPT: &str = "Implement every incomplete work unit in dependency order. For each unit, implement and verify the result, then call factory_update_progress exactly once with completed and a concise evidence-based summary. Do not mark a unit completed before its work and verification are finished. Do not finish while any unit is incomplete.";
 pub const REVIEW_PROMPT: &str = "Independently inspect the completed changes and verification results. Treat task instructions explicitly scoped to execution as evidence to verify, not actions to repeat during review. Call factory_record_review exactly once. An approve verdict must use an empty findings array and put passing evidence in the summary. A request_changes or blocked verdict must include at least one concrete finding tied to a work-unit ID. Do not modify files during review.";
 pub const REMEDIATE_PROMPT: &str = "Address every current review finding, verify each fix, and call factory_record_remediation exactly once with one matching disposition per finding. Do not leave any finding undispositioned.";
-pub const ITERATE_PROMPT: &str = "Address the newest follow-up feedback section appended to the task. Implement and verify every requested change. After verifying, call factory_update_progress exactly once for each affected work unit with completed and an updated evidence-based summary covering the follow-up work; update at least one unit. Do not create a new decomposition. Do not call factory_record_review or factory_record_remediation.";
+pub const ITERATE_PROMPT: &str = "Address the newest follow-up feedback section appended to the task. Implement and verify every requested change in the workspace. Work units from earlier rounds stay completed and must not be rewritten: do not call factory_update_progress, factory_decompose, factory_record_review, or factory_record_remediation. Finish only when the follow-up feedback is fully applied and verified.";
 
 pub type StageResult<T = ()> = std::result::Result<T, StageValidationError>;
 
@@ -687,7 +687,7 @@ mod tests {
             FactoryTurnStage::Execute
         );
         assert!(ITERATE_PROMPT.contains("follow-up feedback"));
-        assert!(ITERATE_PROMPT.contains("factory_update_progress"));
-        assert!(ITERATE_PROMPT.contains("Do not create a new decomposition"));
+        assert!(ITERATE_PROMPT.contains("do not call factory_update_progress"));
+        assert!(ITERATE_PROMPT.contains("must not be rewritten"));
     }
 }
