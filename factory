@@ -208,6 +208,26 @@ run_config_cli() {
   fi
 }
 
+provider_key_variable() {
+  case $1 in
+    openai) printf '%s' OPENAI_API_KEY ;;
+    anthropic | claude) printf '%s' ANTHROPIC_API_KEY ;;
+    deepseek) printf '%s' DEEPSEEK_API_KEY ;;
+    zai) printf '%s' ZAI_API_KEY ;;
+    *) die "unsupported provider in .env: $1" ;;
+  esac
+}
+
+provider_upstream_base_variable() {
+  case $1 in
+    openai) printf '%s' FACTORY_OPENAI_BASE_URL ;;
+    anthropic | claude) printf '%s' FACTORY_CLAUDE_BASE_URL ;;
+    deepseek) printf '%s' FACTORY_DEEPSEEK_BASE_URL ;;
+    zai) printf '%s' FACTORY_ZAI_BASE_URL ;;
+    *) die "unsupported provider in .env: $1" ;;
+  esac
+}
+
 ensure_provider_configuration() {
   local provider model key_name key
   provider=$(compose_environment_value FACTORY_PROVIDER_ADAPTER)
@@ -221,13 +241,7 @@ ensure_provider_configuration() {
     die 'provider is not configured; run `factory configure` first'
   fi
   [[ -n "$model" ]] || die 'model is not configured; run `factory model <id>`'
-  case "$provider" in
-    openai) key_name=OPENAI_API_KEY ;;
-    anthropic | claude) key_name=ANTHROPIC_API_KEY ;;
-    deepseek) key_name=DEEPSEEK_API_KEY ;;
-    zai) key_name=ZAI_API_KEY ;;
-    *) die "unsupported provider in .env: $provider" ;;
-  esac
+  key_name=$(provider_key_variable "$provider")
   key=$(compose_environment_value "$key_name")
   [[ -n "$key" ]] || die "$key_name is missing; run `factory provider $provider`"
 }
@@ -291,10 +305,24 @@ require_service() {
 }
 
 exec_factory_cli() {
-  local provider model
+  local provider model key_name key base_name base
+  local -a provider_environment
   require_service factoryd
   provider=$(compose_environment_value FACTORY_PROVIDER_ADAPTER)
   model=$(compose_environment_value FACTORY_MODEL)
+  key_name=$(provider_key_variable "$provider")
+  key=$(compose_environment_value "$key_name")
+  [[ -n "$key" ]] || die "$key_name is missing; run `factory provider $provider`"
+  base_name=$(provider_upstream_base_variable "$provider")
+  base=$(compose_environment_value "$base_name")
+
+  # Compose expands the configured values for the worker and provider bridge,
+  # but `compose exec` does not automatically add them to the factory CLI
+  # process. Export them locally and pass only their names so secret values do
+  # not appear in the Docker command line or launcher output.
+  export "$key_name=$key"
+  export "$base_name=$base"
+  provider_environment=(--env "$key_name" --env "$base_name")
   if [[ -t 0 && -t 1 ]]; then
     exec "${COMPOSE[@]}" exec \
       --user "$HOST_UID:$HOST_GID" \
@@ -303,6 +331,7 @@ exec_factory_cli() {
       --env "FACTORY_HOST_REPOSITORY_ID=$HOST_REPOSITORY_ID" \
       --env "FACTORY_PROVIDER_ADAPTER=$provider" \
       --env "FACTORY_MODEL=$model" \
+      "${provider_environment[@]}" \
       factoryd factory "$@"
   else
     exec "${COMPOSE[@]}" exec -T \
@@ -312,6 +341,7 @@ exec_factory_cli() {
       --env "FACTORY_HOST_REPOSITORY_ID=$HOST_REPOSITORY_ID" \
       --env "FACTORY_PROVIDER_ADAPTER=$provider" \
       --env "FACTORY_MODEL=$model" \
+      "${provider_environment[@]}" \
       factoryd factory "$@"
   fi
 }

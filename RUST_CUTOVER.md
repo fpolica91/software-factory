@@ -772,6 +772,12 @@ Recorded on 2026-08-03 (clarification gate and continuation rounds):
   composed prompt was persisted to `.factory/prompts/prompt_<sha12>.md`, and an
   unreachable coordinator failed job creation only after the prompt file was
   saved. Piped, `--json`, and `--no-clarify` runs skip the gate.
+- Root-launcher regression job `182c36c3-785d-41dc-967f-38f46ec10a99`
+  proved the configured DeepSeek key and upstream base reach the interactive
+  CLI process by environment-variable name rather than command-line value.
+  The live gate asked five questions, saved the exact paired answers to
+  `prompt_66f16bd5202e.md`, pinned the same composed task in the durable job,
+  and emitted no key bytes. The disposable job was then cancelled terminally.
 - `POST /jobs/{id}/continue` reopens a succeeded factory.task: remote job
   `e8059bc3-68e2-4dd9-847f-d1509c29478d` ran the base four stages, then two
   live continuation rounds (ten durable operations) against real
