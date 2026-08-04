@@ -166,16 +166,9 @@ pub(crate) fn anthropic_model_capabilities(model: &str) -> Option<AnthropicModel
     use AnthropicEffortSupport::ThroughXHighAndMax;
     use AnthropicEffortSupport::Unsupported;
 
-    let capabilities = if matches_alias_or_dated_snapshot(model, "claude-haiku-4-5") {
-        AnthropicModelCapabilities {
-            supports_adaptive_thinking: false,
-            adaptive_thinking_is_required: false,
-            supports_thinking_display: false,
-            effort: Unsupported,
-            context_window: 200_000,
-            max_output_tokens: 64_000,
-        }
-    } else if matches_alias_or_dated_snapshot(model, "claude-sonnet-4-5") {
+    let capabilities = if matches_alias_or_dated_snapshot(model, "claude-haiku-4-5")
+        || matches_alias_or_dated_snapshot(model, "claude-sonnet-4-5")
+    {
         AnthropicModelCapabilities {
             supports_adaptive_thinking: false,
             adaptive_thinking_is_required: false,

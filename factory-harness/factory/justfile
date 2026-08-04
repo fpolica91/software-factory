@@ -12,7 +12,7 @@ build:
       --bin factory-provider-bridge
 
 clippy:
-    cargo clippy --locked --all-targets -- -D warnings
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 
 test:
     cargo nextest run --locked

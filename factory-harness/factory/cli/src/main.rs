@@ -1,5 +1,6 @@
 mod api;
 mod artifacts;
+mod clarify;
 mod config;
 mod live;
 mod output;
@@ -143,6 +144,10 @@ struct RunArgs {
     /// Leave a successful result in Factory for an explicit apply/export.
     #[arg(long)]
     no_apply: bool,
+
+    /// Submit the task without the interactive clarification gate.
+    #[arg(long)]
+    no_clarify: bool,
 
     /// Emit newline-delimited JSON instead of human-readable output.
     #[arg(long)]
@@ -330,6 +335,11 @@ async fn run_job(client: &FactorydClient, args: RunArgs) -> Result<i32> {
     let output_mode = OutputMode::from_flags(args.json, args.verbose);
     let repository = repository_location(&args)?;
     let task = task_text(args.task)?;
+    let skip_gate = args.no_clarify
+        || output_mode.json()
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal();
+    let task = clarify::gate(task, skip_gate, repository.local_root.as_deref()).await;
     let definition = job_definition(
         task,
         execution_profile_from_env()?,

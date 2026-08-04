@@ -104,12 +104,14 @@ pub async fn configure(path: &Path, client: &FactorydClient, args: ConfigureArgs
     apply_provider(
         &mut env,
         profile,
-        args.model,
-        args.api_key,
-        args.base,
+        ProviderOverrides {
+            model: args.model,
+            api_key: args.api_key,
+            base: args.base,
+            force: args.force,
+        },
         interactive,
         client,
-        args.force,
     )
     .await?;
     Ok(0)
@@ -136,12 +138,14 @@ pub async fn provider(path: &Path, client: &FactorydClient, args: ProviderArgs) 
     apply_provider(
         &mut env,
         profile,
-        args.model,
-        args.api_key,
-        args.base,
+        ProviderOverrides {
+            model: args.model,
+            api_key: args.api_key,
+            base: args.base,
+            force: args.force,
+        },
         interactive,
         client,
-        args.force,
     )
     .await?;
     Ok(0)
@@ -179,16 +183,27 @@ pub async fn model(path: &Path, client: &FactorydClient, args: ModelArgs) -> Res
     Ok(0)
 }
 
+/// Requested configuration overrides shared by `configure` and `provider`.
+struct ProviderOverrides {
+    model: Option<String>,
+    api_key: Option<String>,
+    base: Option<String>,
+    force: bool,
+}
+
 async fn apply_provider(
     env: &mut EnvFile,
     profile: &'static ProviderProfile,
-    requested_model: Option<String>,
-    requested_key: Option<String>,
-    requested_base: Option<String>,
+    overrides: ProviderOverrides,
     interactive: bool,
     client: &FactorydClient,
-    force: bool,
 ) -> Result<()> {
+    let ProviderOverrides {
+        model: requested_model,
+        api_key: requested_key,
+        base: requested_base,
+        force,
+    } = overrides;
     let current_provider = env.get("FACTORY_PROVIDER_ADAPTER");
     let current_model = (current_provider == Some(profile.id))
         .then(|| env.get("FACTORY_MODEL"))
@@ -464,7 +479,7 @@ fn runtime_base_url(profile: &ProviderProfile, upstream_base: &str) -> String {
     }
 }
 
-fn upstream_base_variable(profile: &ProviderProfile) -> &'static str {
+pub(crate) fn upstream_base_variable(profile: &ProviderProfile) -> &'static str {
     match profile.id {
         "openai" => "FACTORY_OPENAI_BASE_URL",
         "anthropic" => "FACTORY_CLAUDE_BASE_URL",
@@ -537,7 +552,7 @@ fn interactive_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
-fn prompt_line(prompt: &str) -> Result<String> {
+pub(crate) fn prompt_line(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
     std::io::stderr().flush().context("show prompt")?;
     let mut answer = String::new();
@@ -785,12 +800,14 @@ mod tests {
         apply_provider(
             &mut env,
             profile,
-            Some("custom-responses-model".to_string()),
-            Some("test-api-key".to_string()),
-            Some("https://responses.example.test/v1".to_string()),
+            ProviderOverrides {
+                model: Some("custom-responses-model".to_string()),
+                api_key: Some("test-api-key".to_string()),
+                base: Some("https://responses.example.test/v1".to_string()),
+                force: false,
+            },
             false,
             &client,
-            false,
         )
         .await
         .unwrap();

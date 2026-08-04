@@ -9,14 +9,18 @@ struct TestRoot(PathBuf);
 
 impl TestRoot {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "factory-launcher-control-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        )))
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // The launcher resolves physical paths (`pwd -P`); canonicalize so
+        // path assertions agree on hosts where the temp dir is a symlink.
+        Self(std::fs::canonicalize(&root).unwrap())
     }
 }
 

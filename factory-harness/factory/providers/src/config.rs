@@ -150,31 +150,31 @@ fn model_catalog(profile: &ProviderProfile, model: &str) -> ModelsResponse {
     let supports_reasoning_summary = profile.id != "anthropic"
         || anthropic_capabilities
             .is_some_and(|capabilities| capabilities.supports_thinking_display);
-    let supported_reasoning_levels = supports_effort
-        .then(|| {
-            [
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::XHigh,
-                ReasoningEffort::Max,
-            ]
-            .into_iter()
-            .filter(|effort| {
-                profile.id != "anthropic"
-                    || anthropic_capabilities
-                        .is_some_and(|capabilities| capabilities.effort.supports(effort.as_str()))
-            })
-            .map(|effort| {
-                let description = effort.to_string();
-                ReasoningEffortPreset {
-                    effort,
-                    description,
-                }
-            })
-            .collect()
+    let supported_reasoning_levels = if supports_effort {
+        [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ]
+        .into_iter()
+        .filter(|effort| {
+            profile.id != "anthropic"
+                || anthropic_capabilities
+                    .is_some_and(|capabilities| capabilities.effort.supports(effort.as_str()))
         })
-        .unwrap_or_default();
+        .map(|effort| {
+            let description = effort.to_string();
+            ReasoningEffortPreset {
+                effort,
+                description,
+            }
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
     let context_window = anthropic_capabilities
         .map(|capabilities| capabilities.context_window)
         .unwrap_or(profile.context_window);

@@ -141,7 +141,6 @@ impl ToolContributor for FactoryMemoryExtension {
             .memory_tool_kinds()
             .iter()
             .copied()
-            .into_iter()
             .map(|kind| {
                 Arc::new(FactoryMemoryToolExecutor {
                     kind,

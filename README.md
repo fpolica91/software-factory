@@ -58,6 +58,15 @@ complete human event replay or `--json` for the unchanged NDJSON stream. Pass
 `--detach` when a script should return immediately; otherwise non-interactive
 runs stream until completion.
 
+On an interactive terminal, `factory run` gates the task before submission:
+the configured model reviews it and, when it is ambiguous, asks up to five
+clarifying questions. Answers are appended to the task and the submitted
+prompt is saved under `.factory/prompts/prompt_<id>.md`; a clear task is
+submitted unchanged. Jobs themselves stay fully autonomous — clarification
+happens only at this gate. Use `--no-clarify` to skip it; piped and `--json`
+runs skip it automatically, and a gate failure falls back to submitting the
+task as written.
+
 Every terminal success prints the complete result before exiting. Local jobs
 also write Factory-owned reports under `.factory/jobs/JOB_ID/`, outside the
 managed worktree and result patch. Jobs created for a remote or different
