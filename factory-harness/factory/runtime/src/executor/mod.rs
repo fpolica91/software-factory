@@ -234,7 +234,10 @@ impl CodexOperationExecutor {
                 self.acknowledge_detached_review_mutation(workspace).await?;
             }
             match operation {
-                OperationKind::Plan | OperationKind::Execute | OperationKind::Review => {
+                OperationKind::Plan
+                | OperationKind::Execute
+                | OperationKind::Review
+                | OperationKind::Iterate => {
                     self.run_single_stage(
                         SingleStageRun {
                             context,
@@ -355,7 +358,7 @@ impl CodexOperationExecutor {
                             .await?;
                     }
                 }
-                OperationKind::Execute => {}
+                OperationKind::Execute | OperationKind::Iterate => {}
             }
             Ok(())
         }

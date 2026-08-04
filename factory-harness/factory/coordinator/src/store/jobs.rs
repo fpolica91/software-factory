@@ -75,6 +75,123 @@ impl CoordinatorStore {
         })
     }
 
+    /// Reopens a succeeded factory.task with user feedback: appends the
+    /// feedback to the durable task text, appends one iterate, review,
+    /// remediate continuation round, and requeues the job. The managed
+    /// worktree and parent Codex thread are reused by the appended stages.
+    pub async fn continue_job(&self, job_id: &JobId, feedback: &str) -> Result<DurableJob> {
+        let feedback = feedback.trim();
+        if feedback.is_empty() {
+            return Err(CoordinatorError::InvalidInput(
+                "continuation feedback must not be empty".to_string(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let job_row = sqlx::query_as::<_, JobRow>(
+            r#"
+            SELECT job_id, kind, input, status, created_at, updated_at
+            FROM factory_jobs
+            WHERE job_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(job_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| CoordinatorError::JobNotFound(job_id.clone()))?;
+        let job = JobRecord::try_from(job_row)?;
+        if job.kind != "factory.task" {
+            return Err(CoordinatorError::InvalidInput(format!(
+                "job kind {:?} does not support continuation",
+                job.kind
+            )));
+        }
+        if job.state != JobState::Succeeded {
+            return Err(CoordinatorError::JobNotContinuable {
+                job_id: job_id.clone(),
+                state: job.state.as_database_value().to_string(),
+            });
+        }
+        let workspace_active = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM factory_workspaces
+                WHERE job_id = $1 AND status = 'active'
+            )
+            "#,
+        )
+        .bind(job_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !workspace_active {
+            return Err(CoordinatorError::WorkspaceNotFound(job_id.clone()));
+        }
+
+        let next_ordinal = sqlx::query_scalar::<_, i32>(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM factory_operations WHERE job_id = $1",
+        )
+        .bind(job_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let round = continuation_round(next_ordinal)?;
+
+        let mut input = job.input.clone();
+        let task = input
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                CoordinatorError::InvalidInput("job input has no task text".to_string())
+            })?;
+        input["task"] = serde_json::Value::String(format!(
+            "{}\n\n## Follow-up feedback (round {round})\n\n{feedback}",
+            task.trim_end()
+        ));
+        sqlx::query(
+            r#"
+            UPDATE factory_jobs
+            SET input = $2, status = 'queued', updated_at = clock_timestamp()
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id.as_str())
+        .bind(&input)
+        .execute(&mut *transaction)
+        .await?;
+
+        const CONTINUATION_KINDS: [&str; 3] = ["codex.iterate", "codex.review", "codex.remediate"];
+        for (offset, kind) in CONTINUATION_KINDS.into_iter().enumerate() {
+            let operation_input = if offset == 0 {
+                serde_json::json!({ "feedback": feedback, "round": round })
+            } else {
+                serde_json::json!({})
+            };
+            sqlx::query(
+                r#"
+                INSERT INTO factory_operations (
+                    operation_id, job_id, ordinal, kind, input, status, max_attempts
+                ) VALUES ($1, $2, $3, $4, $5, 'ready', 3)
+                "#,
+            )
+            .bind(new_id())
+            .bind(job_id.as_str())
+            .bind(next_ordinal + i32::try_from(offset).expect("offset is 0..3"))
+            .bind(kind)
+            .bind(&operation_input)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+
+        let _ = self
+            .append_job_event(crate::domain::NewJobEvent {
+                job_id: job_id.clone(),
+                kind: "job.continued".to_string(),
+                payload: serde_json::json!({ "feedback": feedback, "round": round }),
+            })
+            .await;
+        self.load_job(job_id).await
+    }
+
     pub async fn load_job(&self, job_id: &JobId) -> Result<DurableJob> {
         let job = sqlx::query_as::<_, JobRow>(
             r#"
@@ -421,6 +538,20 @@ async fn cancel_unfinished_operations(
     Ok(())
 }
 
+/// Continuation round for the next appended ordinal. The four base stages
+/// occupy ordinals 0..=3; each complete round appends exactly three stages.
+fn continuation_round(next_ordinal: i32) -> Result<u32> {
+    let next = u32::try_from(next_ordinal).map_err(|_| CoordinatorError::NumericRange {
+        field: "operation ordinal",
+    })?;
+    if next < 4 || (next - 4) % 3 != 0 {
+        return Err(CoordinatorError::InvalidInput(format!(
+            "job operations are not a complete factory.task lifecycle (next ordinal {next})"
+        )));
+    }
+    Ok((next - 4) / 3 + 1)
+}
+
 fn validate_job_definition(definition: &JobDefinition) -> Result<()> {
     if definition.kind.trim().is_empty() {
         return Err(CoordinatorError::InvalidJobDefinition(
@@ -452,4 +583,19 @@ fn validate_job_definition(definition: &JobDefinition) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::continuation_round;
+
+    #[test]
+    fn continuation_rounds_start_after_the_four_base_stages() {
+        assert_eq!(continuation_round(4).unwrap(), 1);
+        assert_eq!(continuation_round(7).unwrap(), 2);
+        assert_eq!(continuation_round(10).unwrap(), 3);
+        assert!(continuation_round(3).is_err());
+        assert!(continuation_round(5).is_err());
+        assert!(continuation_round(-1).is_err());
+    }
 }

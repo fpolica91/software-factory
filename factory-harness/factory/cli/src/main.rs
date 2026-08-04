@@ -119,6 +119,9 @@ enum FactoryCommand {
     Model(config::ModelArgs),
     /// Start a durable four-stage Factory job.
     Run(RunArgs),
+    /// Reopen a succeeded job with follow-up feedback and requeue it.
+    #[command(name = "continue")]
+    Continue(ContinueArgs),
     /// Stream durable events and wait for a job to finish.
     Attach(AttachArgs),
     /// Print the current durable job state and results.
@@ -176,6 +179,28 @@ struct RunArgs {
     /// Task to complete. When omitted on a terminal, Factory prompts for it.
     #[arg(value_name = "TASK", num_args = 0.., trailing_var_arg = true)]
     task: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ContinueArgs {
+    /// Return after the continuation round is queued.
+    #[arg(long)]
+    detach: bool,
+
+    /// Emit newline-delimited JSON instead of human-readable output.
+    #[arg(long)]
+    json: bool,
+
+    /// Print every durable event and its full detail instead of the compact view.
+    #[arg(long, conflicts_with = "json")]
+    verbose: bool,
+
+    /// Durable Factory job ID.
+    job_id: String,
+
+    /// Follow-up feedback. When omitted on a terminal, Factory prompts for it.
+    #[arg(value_name = "FEEDBACK", num_args = 0.., trailing_var_arg = true)]
+    feedback: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -262,6 +287,9 @@ async fn run() -> Result<i32> {
         }
         Some(FactoryCommand::Run(args)) => {
             run_job(&FactorydClient::new(&cli.factoryd_url)?, args).await
+        }
+        Some(FactoryCommand::Continue(args)) => {
+            continue_job(&FactorydClient::new(&cli.factoryd_url)?, args).await
         }
         Some(FactoryCommand::Attach(args)) => {
             attach(
@@ -371,7 +399,16 @@ async fn run_job(client: &FactorydClient, args: RunArgs) -> Result<i32> {
     if args.detach {
         return Ok(0);
     }
-    let exit_code = attach(client, job_id.clone(), output_mode).await?;
+    let mut exit_code = attach(client, job_id.clone(), output_mode).await?;
+    while exit_code == 0 && output_mode == OutputMode::Interactive {
+        let feedback = config::prompt_line("Follow-up feedback (Enter to accept): ")?;
+        if feedback.is_empty() {
+            break;
+        }
+        client.continue_job(&job_id, &feedback).await?;
+        println!("Queued continuation round for job {job_id}.");
+        exit_code = attach(client, job_id.clone(), output_mode).await?;
+    }
     if exit_code == 0
         && !args.no_apply
         && let Some(root) = repository.local_root
@@ -386,6 +423,51 @@ async fn run_job(client: &FactorydClient, args: RunArgs) -> Result<i32> {
         .await?;
     }
     Ok(exit_code)
+}
+
+async fn continue_job(client: &FactorydClient, args: ContinueArgs) -> Result<i32> {
+    let output_mode = OutputMode::from_flags(args.json, args.verbose);
+    let job_id = validate_job_id(&args.job_id)?;
+    let feedback = feedback_text(args.feedback)?;
+    let job = client.continue_job(&job_id, &feedback).await?;
+    if output_mode.json() {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "type": "continued",
+                "jobId": job_id.as_str(),
+                "state": job.job.state,
+                "operations": job.operations.len(),
+            }))?
+        );
+    } else {
+        println!(
+            "Queued continuation round for job {job_id} ({} durable stages).",
+            job.operations.len()
+        );
+        println!("Attach: factory attach {job_id}");
+    }
+    if args.detach {
+        return Ok(0);
+    }
+    attach(client, job_id, output_mode).await
+}
+
+fn feedback_text(parts: Vec<String>) -> Result<String> {
+    let feedback = parts.join(" ").trim().to_string();
+    if !feedback.is_empty() {
+        return Ok(feedback);
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(anyhow!(
+            "feedback is required when Factory is not attached to a terminal"
+        ));
+    }
+    let feedback = config::prompt_line("Feedback: ")?;
+    if feedback.is_empty() {
+        return Err(anyhow!("feedback must not be empty"));
+    }
+    Ok(feedback)
 }
 
 async fn attach(client: &FactorydClient, job_id: JobId, output_mode: OutputMode) -> Result<i32> {
@@ -989,6 +1071,7 @@ fn normalize_shorthand(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
                 | "provider"
                 | "model"
                 | "run"
+                | "continue"
                 | "attach"
                 | "status"
                 | "result"

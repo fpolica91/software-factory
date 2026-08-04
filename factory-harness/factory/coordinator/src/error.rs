@@ -19,6 +19,10 @@ pub enum CoordinatorError {
     JobNotFound(JobId),
     #[error("job {job_id} is already terminal ({state})")]
     JobNotCancellable { job_id: JobId, state: String },
+    #[error(
+        "job {job_id} is {state}, not succeeded; only a succeeded job accepts continuation feedback"
+    )]
+    JobNotContinuable { job_id: JobId, state: String },
     #[error("job {0} has a pending cancellation request")]
     JobCancellationRequested(JobId),
     #[error("workspace for job {0} was not found")]

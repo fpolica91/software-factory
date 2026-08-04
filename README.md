@@ -38,6 +38,7 @@ not required to keep the job running.
 factory run "Implement authentication"           # submit and attach
 factory run --detach "Audit this repository"     # print the job ID and exit
 factory run --repository https://host/org/repo.git --detach "Audit it"
+factory continue JOB_ID "Also rate-limit login"  # reopen a succeeded job
 factory status JOB_ID                            # inspect current state
 factory attach JOB_ID                            # reconnect to live output
 factory attach --verbose JOB_ID                  # replay every event in full
@@ -72,6 +73,16 @@ also write Factory-owned reports under `.factory/jobs/JOB_ID/`, outside the
 managed worktree and result patch. Jobs created for a remote or different
 checkout keep artifacts in coordinator storage; `factory result JOB_ID`
 remains readable without entering a container.
+
+A succeeded job is not closed to further work. `factory continue JOB_ID
+"feedback"` reopens it durably: the feedback is appended to the durable task,
+one iterate, review, remediate continuation round is appended to the same job,
+and the same managed worktree and parent Codex thread continue where the
+previous round finished. After an interactive `factory run` completes, Factory
+also prompts once for follow-up feedback; entering text queues a continuation
+round and reattaches, while Enter accepts the result. While a continuation
+round is queued or running the job is no longer `succeeded`, so `apply` and
+`export` become available again only after the round completes.
 
 A successful attached run against a local repository applies its result to the
 originating checkout by default; use `factory run --no-apply ...` to retain it

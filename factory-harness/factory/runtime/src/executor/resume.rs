@@ -181,11 +181,11 @@ impl ResumePoint {
                 correlation_id: record.correlation_id.clone(),
             });
         }
-        let ordinal = context.operation().ordinal as usize;
-        let predecessor = ordinal
+        let predecessor = context
+            .operation()
+            .ordinal
             .checked_sub(1)
-            .and_then(|index| OperationKind::ALL.get(index))
-            .copied()
+            .map(OperationKind::at_ordinal)
             .ok_or_else(|| {
                 ExecutionFailure::terminal("plan stage resumed from another operation")
             })?;

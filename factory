@@ -85,6 +85,7 @@ Usage:
   factory configure --show          Show configuration without displaying keys
   factory provider [list|show|name] List, inspect, or switch providers
   factory model [list|model-id]      List or switch models
+  factory continue <job-id> [text]   Reopen a succeeded job with follow-up feedback
   factory attach <job-id>            Reattach with compact expandable output
   factory attach --verbose <job-id>  Replay every durable event in full
   factory status <job-id>            Show durable job and stage status
@@ -440,6 +441,11 @@ main() {
       shift
       up_stack
       exec_factory_cli "$command" "$@"
+      ;;
+    continue)
+      shift
+      up_stack
+      exec_factory_cli continue "$@"
       ;;
     status | stop | result | artifacts)
       shift

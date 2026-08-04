@@ -17,6 +17,7 @@ pub const PLAN_PROMPT: &str = "Inspect the repository without modifying it. On e
 pub const EXECUTE_PROMPT: &str = "Implement every incomplete work unit in dependency order. For each unit, implement and verify the result, then call factory_update_progress exactly once with completed and a concise evidence-based summary. Do not mark a unit completed before its work and verification are finished. Do not finish while any unit is incomplete.";
 pub const REVIEW_PROMPT: &str = "Independently inspect the completed changes and verification results. Treat task instructions explicitly scoped to execution as evidence to verify, not actions to repeat during review. Call factory_record_review exactly once. An approve verdict must use an empty findings array and put passing evidence in the summary. A request_changes or blocked verdict must include at least one concrete finding tied to a work-unit ID. Do not modify files during review.";
 pub const REMEDIATE_PROMPT: &str = "Address every current review finding, verify each fix, and call factory_record_remediation exactly once with one matching disposition per finding. Do not leave any finding undispositioned.";
+pub const ITERATE_PROMPT: &str = "Address the newest follow-up feedback section appended to the task. Implement and verify every requested change. After verifying, call factory_update_progress exactly once for each affected work unit with completed and an updated evidence-based summary covering the follow-up work; update at least one unit. Do not create a new decomposition. Do not call factory_record_review or factory_record_remediation.";
 
 pub type StageResult<T = ()> = std::result::Result<T, StageValidationError>;
 
@@ -26,10 +27,27 @@ pub enum OperationKind {
     Execute,
     Review,
     Remediate,
+    Iterate,
 }
 
 impl OperationKind {
+    /// The four base stages every factory.task begins with. Continuation
+    /// rounds append iterate, review, remediate triples after them.
     pub const ALL: [Self; 4] = [Self::Plan, Self::Execute, Self::Review, Self::Remediate];
+
+    /// The stage kind required at a durable factory.task ordinal: the base
+    /// stages, then repeating iterate, review, remediate rounds.
+    pub fn at_ordinal(ordinal: u32) -> Self {
+        let ordinal = ordinal as usize;
+        if let Some(kind) = Self::ALL.get(ordinal) {
+            return *kind;
+        }
+        match (ordinal - Self::ALL.len()) % 3 {
+            0 => Self::Iterate,
+            1 => Self::Review,
+            _ => Self::Remediate,
+        }
+    }
 
     pub const fn as_wire_name(self) -> &'static str {
         match self {
@@ -37,6 +55,7 @@ impl OperationKind {
             Self::Execute => "codex.execute",
             Self::Review => "codex.review",
             Self::Remediate => "codex.remediate",
+            Self::Iterate => "codex.iterate",
         }
     }
 
@@ -46,19 +65,22 @@ impl OperationKind {
             Self::Execute => EXECUTE_PROMPT,
             Self::Review => REVIEW_PROMPT,
             Self::Remediate => REMEDIATE_PROMPT,
+            Self::Iterate => ITERATE_PROMPT,
         }
     }
 
     pub(crate) const fn collaboration_mode(self) -> ModeKind {
         match self {
-            Self::Plan | Self::Execute | Self::Review | Self::Remediate => ModeKind::Default,
+            Self::Plan | Self::Execute | Self::Review | Self::Remediate | Self::Iterate => {
+                ModeKind::Default
+            }
         }
     }
 
     pub(crate) const fn turn_stage(self) -> FactoryTurnStage {
         match self {
             Self::Plan => FactoryTurnStage::Plan,
-            Self::Execute => FactoryTurnStage::Execute,
+            Self::Execute | Self::Iterate => FactoryTurnStage::Execute,
             Self::Review => FactoryTurnStage::Review,
             Self::Remediate => FactoryTurnStage::Remediate,
         }
@@ -69,7 +91,9 @@ impl OperationKind {
             Self::Plan => SandboxPolicy::ReadOnly {
                 network_access: true,
             },
-            Self::Execute | Self::Review | Self::Remediate => SandboxPolicy::DangerFullAccess,
+            Self::Execute | Self::Review | Self::Remediate | Self::Iterate => {
+                SandboxPolicy::DangerFullAccess
+            }
         }
     }
 
@@ -97,6 +121,7 @@ impl FromStr for OperationKind {
             "codex.execute" => Ok(Self::Execute),
             "codex.review" => Ok(Self::Review),
             "codex.remediate" => Ok(Self::Remediate),
+            "codex.iterate" => Ok(Self::Iterate),
             _ => Err(StageValidationError::UnknownOperationKind(
                 value.to_string(),
             )),
@@ -191,7 +216,9 @@ pub fn validate_stage(
 ) -> StageResult {
     match kind {
         OperationKind::Plan => validate_plan(state),
-        OperationKind::Execute => validate_execute(state),
+        // A completed iterate turn must leave the same durable shape as
+        // execute: every unit completed with an evidence-based summary.
+        OperationKind::Execute | OperationKind::Iterate => validate_execute(state),
         OperationKind::Review => validate_review(
             state,
             review_baseline.ok_or(StageValidationError::Missing("review baseline"))?,
@@ -615,5 +642,52 @@ mod tests {
         assert!(EXECUTE_PROMPT.contains("exactly once with completed"));
         assert!(EXECUTE_PROMPT.contains("evidence-based summary"));
         assert!(!EXECUTE_PROMPT.contains("in_progress"));
+    }
+
+    #[test]
+    fn ordinals_map_to_base_stages_then_continuation_rounds() {
+        let expected = [
+            OperationKind::Plan,
+            OperationKind::Execute,
+            OperationKind::Review,
+            OperationKind::Remediate,
+            OperationKind::Iterate,
+            OperationKind::Review,
+            OperationKind::Remediate,
+            OperationKind::Iterate,
+            OperationKind::Review,
+            OperationKind::Remediate,
+        ];
+        for (ordinal, kind) in expected.into_iter().enumerate() {
+            assert_eq!(OperationKind::at_ordinal(ordinal as u32), kind);
+        }
+        assert_eq!(
+            "codex.iterate".parse::<OperationKind>().unwrap(),
+            OperationKind::Iterate
+        );
+    }
+
+    #[test]
+    fn iterate_reuses_the_execute_state_contract_with_full_access() {
+        validate_stage(
+            OperationKind::Iterate,
+            &state_with_unit(
+                FactoryProgressStatus::Completed,
+                Some("follow-up verified against the repository"),
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            OperationKind::Iterate.sandbox_policy(),
+            SandboxPolicy::DangerFullAccess
+        );
+        assert_eq!(
+            OperationKind::Iterate.turn_stage(),
+            FactoryTurnStage::Execute
+        );
+        assert!(ITERATE_PROMPT.contains("follow-up feedback"));
+        assert!(ITERATE_PROMPT.contains("factory_update_progress"));
+        assert!(ITERATE_PROMPT.contains("Do not create a new decomposition"));
     }
 }

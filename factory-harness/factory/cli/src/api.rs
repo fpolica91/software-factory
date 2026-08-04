@@ -87,6 +87,14 @@ impl FactorydClient {
             .await
     }
 
+    pub async fn continue_job(&self, job_id: &JobId, feedback: &str) -> Result<DurableJob> {
+        self.json(
+            self.request(Method::POST, &["jobs", job_id.as_str(), "continue"])?
+                .json(&serde_json::json!({ "feedback": feedback })),
+        )
+        .await
+    }
+
     pub async fn list_events(
         &self,
         job_id: &JobId,

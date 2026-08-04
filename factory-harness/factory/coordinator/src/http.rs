@@ -124,6 +124,9 @@ impl IntoResponse for ApiError {
                     CoordinatorError::JobNotCancellable { .. } => {
                         (StatusCode::CONFLICT, "jobNotCancellable")
                     }
+                    CoordinatorError::JobNotContinuable { .. } => {
+                        (StatusCode::CONFLICT, "jobNotContinuable")
+                    }
                     CoordinatorError::JobCancellationRequested(_) => {
                         (StatusCode::CONFLICT, "jobCancellationRequested")
                     }
@@ -200,6 +203,7 @@ fn router(state: ApiState) -> Router {
         .route("/jobs/active", get(list_active_jobs))
         .route("/jobs/{job_id}", get(load_job))
         .route("/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/jobs/{job_id}/continue", post(continue_job))
         .route("/jobs/{job_id}/attempts", get(list_job_attempts))
         .route("/jobs/{job_id}/events", get(list_job_events))
         .route("/jobs/{job_id}/result", get(export_workspace_result))
@@ -277,6 +281,26 @@ async fn cancel_job(
     Path(job_id): Path<String>,
 ) -> ApiResult {
     let job = store.cancel_job(&JobId::new(job_id)).await?;
+    Ok(Json(job).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinueJobRequest {
+    feedback: String,
+}
+
+async fn continue_job(
+    State(state): State<ApiState>,
+    Path(job_id): Path<String>,
+    Json(request): Json<ContinueJobRequest>,
+) -> ApiResult {
+    let job = state
+        .store
+        .continue_job(&JobId::new(job_id), &request.feedback)
+        .await?;
+    let workspace = state.store.load_workspace(&job.job.job_id).await?;
+    initialize_job_artifacts(&state, &job, workspace.as_ref()).await;
     Ok(Json(job).into_response())
 }
 

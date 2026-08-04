@@ -229,7 +229,11 @@ impl StageCheckpoint {
         self.lineage().validate()?;
 
         match (self.operation, self.turn_role, self.review_cycle) {
-            (OperationKind::Plan | OperationKind::Execute, StageTurnRole::Stage, 0) => {}
+            (
+                OperationKind::Plan | OperationKind::Execute | OperationKind::Iterate,
+                StageTurnRole::Stage,
+                0,
+            ) => {}
             (OperationKind::Review, StageTurnRole::Review, 0) => {}
             (
                 OperationKind::Remediate,

@@ -32,25 +32,21 @@ impl CodexOperationExecutor {
             .load_job(&context.job().job_id)
             .await
             .map_err(ExecutionFailure::Coordinator)?;
-        if job.operations.len() != OperationKind::ALL.len() {
+        let base = OperationKind::ALL.len();
+        if job.operations.len() < base || !(job.operations.len() - base).is_multiple_of(3) {
             return Err(ExecutionFailure::terminal(
-                "factory.task must contain exactly plan, execute, review, and remediate",
+                "factory.task must contain plan, execute, review, remediate, plus complete iterate, review, remediate continuation rounds",
             ));
         }
-        for (ordinal, expected) in OperationKind::ALL.into_iter().enumerate() {
-            let actual = &job.operations[ordinal];
+        for (ordinal, actual) in job.operations.iter().enumerate() {
+            let expected = OperationKind::at_ordinal(ordinal as u32);
             if actual.ordinal != ordinal as u32 || actual.kind != expected.as_wire_name() {
                 return Err(ExecutionFailure::terminal(
-                    "factory.task operations must be ordered plan, execute, review, remediate",
+                    "factory.task operations must follow plan, execute, review, remediate, then iterate, review, remediate rounds",
                 ));
             }
         }
-        let expected = OperationKind::ALL
-            .get(context.operation().ordinal as usize)
-            .copied()
-            .ok_or_else(|| {
-                ExecutionFailure::terminal("operation ordinal is outside the Factory stages")
-            })?;
+        let expected = OperationKind::at_ordinal(context.operation().ordinal);
         if expected != operation {
             return Err(ExecutionFailure::terminal(
                 "claimed operation kind does not match its Factory stage ordinal",
