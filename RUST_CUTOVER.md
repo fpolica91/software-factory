@@ -796,3 +796,27 @@ Recorded on 2026-08-03 (clarification gate and continuation rounds):
   functional gate for iterate output. Settled `iterate` stages project to the
   fixed `iterate.md` artifact; repeated stages keep one file per stage kind
   holding the latest settled output.
+
+Recorded on 2026-08-05 (verification-residue cleanup):
+
+- Execute and Iterate now require full verification followed by removal of
+  only untracked residue created solely by verification. Review checks the
+  complete diff, including untracked files, and Remediate cleans any finding.
+  Every stage explicitly preserves tracked files and task-required outputs,
+  including requested generated files. Result export remains complete and
+  unfiltered so it cannot silently underproduce.
+- Real `deepseek/deepseek-v4-pro` job
+  `6c0407e2-be31-43af-8c3f-4c3293b1a56b` completed Plan, Execute, detached
+  Review, and Remediate on the Python normalization fixture. Execute ran five
+  standard-library tests and reported cleanup; Review independently approved
+  the requested implementation, test file, and README example with no
+  transient residue. Applying the exported result produced exactly modified
+  `normalize.py`, modified `README.md`, and untracked `test_normalize.py`;
+  `python3 -B -m unittest -v` passed all five tests and a host scan found no
+  `__pycache__`, `.pytest_cache`, `*.pyc`, or `*.pyo` path.
+- Two fresh `zai/glm-5.2` jobs did not reach the cleanup gate. Jobs
+  `98c2e4ad-79eb-48e9-bf93-1f8beaa954ed` and
+  `88183e16-7b52-46f4-9501-8d804345cc77` each exhausted three Execute
+  attempts because the provider repeatedly supplied malformed `apply_patch`
+  arguments, either a bare `@@` hunk or a missing `*** End Patch`. These runs
+  are recorded provider/tool-format failures, not cleanup acceptance evidence.

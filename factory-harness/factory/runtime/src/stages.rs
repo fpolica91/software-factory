@@ -14,10 +14,25 @@ use std::str::FromStr;
 
 pub const AUTONOMOUS_PROMPT: &str = "Work autonomously until this stage is complete. Persist the required Factory state with the named Factory tools. Do not stop at advice or ask for confirmation.";
 pub const PLAN_PROMPT: &str = "Inspect the repository without modifying it. On every Plan attempt, create a fresh, dependency-ordered decomposition after rollback. The only permitted Factory state mutation during Plan is exactly one call to factory_decompose. Do not call factory_update_progress, factory_record_review, or factory_record_remediation. Every persisted work unit must remain pending with no progress or result summary. Do not implement any work during planning.";
-pub const EXECUTE_PROMPT: &str = "Implement every incomplete work unit in dependency order. For each unit, implement and verify the result, then call factory_update_progress exactly once with completed and a concise evidence-based summary. Do not mark a unit completed before its work and verification are finished. Do not finish while any unit is incomplete.";
-pub const REVIEW_PROMPT: &str = "Independently inspect the completed changes and verification results. Treat task instructions explicitly scoped to execution as evidence to verify, not actions to repeat during review. Call factory_record_review exactly once. An approve verdict must use an empty findings array and put passing evidence in the summary. A request_changes or blocked verdict must include at least one concrete finding tied to a work-unit ID. Do not modify files during review.";
-pub const REMEDIATE_PROMPT: &str = "Address every current review finding, verify each fix, and call factory_record_remediation exactly once with one matching disposition per finding. Do not leave any finding undispositioned.";
-pub const ITERATE_PROMPT: &str = "Address the newest follow-up feedback section appended to the task. Implement and verify every requested change in the workspace. Work units from earlier rounds stay completed and must not be rewritten: do not call factory_update_progress, factory_decompose, factory_record_review, or factory_record_remediation. Finish only when the follow-up feedback is fully applied and verified.";
+pub const EXECUTE_PROMPT: &str = concat!(
+    "Implement every incomplete work unit in dependency order. For each unit, implement and verify the result, then call factory_update_progress exactly once with completed and a concise evidence-based summary. ",
+    "Run the required verification; never skip or weaken it to avoid generated files. Before finishing, inspect the complete workspace diff and remove only untracked transient residue created solely by verification, such as __pycache__/, *.pyc, and .pytest_cache/. ",
+    "Preserve every tracked file and every output required by the original task, even when it is generated. Do not mark a unit completed before its work and verification are finished. Do not finish while any unit is incomplete."
+);
+pub const REVIEW_PROMPT: &str = concat!(
+    "Independently inspect the completed changes, the complete workspace diff including untracked files, and the verification results. Treat task instructions explicitly scoped to execution as evidence to verify, not actions to repeat during review. ",
+    "Request changes for transient verification residue only when it is untracked and not an output required by the original task. Do not reject or undercount tracked files or task-required generated outputs merely because they are generated. ",
+    "Call factory_record_review exactly once. An approve verdict must use an empty findings array and put passing evidence in the summary. A request_changes or blocked verdict must include at least one concrete finding tied to a work-unit ID. Do not modify files during review."
+);
+pub const REMEDIATE_PROMPT: &str = concat!(
+    "Address every current review finding, verify each fix, and call factory_record_remediation exactly once with one matching disposition per finding. Do not leave any finding undispositioned. ",
+    "For a transient-residue finding, remove only untracked residue that is not required by the original task. Preserve every tracked file and requested output, rerun the required verification, then clean any new transient verification residue before recording remediation."
+);
+pub const ITERATE_PROMPT: &str = concat!(
+    "Address the newest follow-up feedback section appended to the task. Implement and verify every requested change in the workspace. Run the required verification; never skip or weaken it to avoid generated files. ",
+    "Before finishing, inspect the complete workspace diff and remove only untracked transient residue created solely by verification, such as __pycache__/, *.pyc, and .pytest_cache/. Preserve every tracked file and every output required by the original task, even when it is generated. ",
+    "Work units from earlier rounds stay completed and must not be rewritten: do not call factory_update_progress, factory_decompose, factory_record_review, or factory_record_remediation. Finish only when the follow-up feedback is fully applied and verified."
+);
 
 pub type StageResult<T = ()> = std::result::Result<T, StageValidationError>;
 
@@ -642,6 +657,22 @@ mod tests {
         assert!(EXECUTE_PROMPT.contains("exactly once with completed"));
         assert!(EXECUTE_PROMPT.contains("evidence-based summary"));
         assert!(!EXECUTE_PROMPT.contains("in_progress"));
+    }
+
+    #[test]
+    fn workspace_hygiene_contract_preserves_required_outputs() {
+        for prompt in [EXECUTE_PROMPT, ITERATE_PROMPT] {
+            assert!(prompt.contains("never skip or weaken"));
+            assert!(prompt.contains("untracked transient residue"));
+            assert!(prompt.contains("Preserve every tracked file"));
+            assert!(prompt.contains("output required by the original task"));
+        }
+        assert!(REVIEW_PROMPT.contains("including untracked files"));
+        assert!(REVIEW_PROMPT.contains("only when it is untracked"));
+        assert!(REVIEW_PROMPT.contains("task-required generated outputs"));
+        assert!(REMEDIATE_PROMPT.contains("remove only untracked residue"));
+        assert!(REMEDIATE_PROMPT.contains("Preserve every tracked file"));
+        assert!(REMEDIATE_PROMPT.contains("rerun the required verification"));
     }
 
     #[test]
