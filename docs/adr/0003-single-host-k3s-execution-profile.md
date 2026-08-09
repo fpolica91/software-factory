@@ -1,4 +1,4 @@
-# ADR 0003: Optional Single-Host K3s Execution Profile
+# ADR 0003: Optional Kubernetes Execution Profile
 
 - Status: Accepted; runc and Kata live acceptance passed
 - Date: 2026-08-08
@@ -7,8 +7,10 @@
 
 Factory needs a scheduler-backed execution option without rebuilding node,
 Pod, or runtime management and without moving its durable lifecycle into
-Kubernetes. The first runnable profile targets one Linux K3s node sharing the
-coordinator's local workspace directory.
+Kubernetes. The default local-storage profile targets one Linux K3s node
+sharing the coordinator's local workspace directory. Multi-node execution uses
+operator-managed shared storage; high availability of the Compose control
+plane is outside this decision.
 
 ## Decision
 
@@ -18,14 +20,17 @@ a read-only K3s kubeconfig, and no Docker socket. The entrypoint copies the
 root-readable kubeconfig into the worker's Codex state before dropping to the
 configured host UID/GID.
 
-The launcher validates the Kubernetes configuration and node before recording
-one immutable backend marker beside its installation configuration. An upgrade
-without a marker infers Docker when existing Compose-labelled workspace or
-PostgreSQL volumes exist. A mismatch is refused; Factory never deletes or
-migrates either backend's data.
-K3s therefore requires a fresh checkout with a separate Compose project.
-That project identity deterministically derives the default namespace, PV, PVC,
-and host workspace directory; explicit overrides must remain unique.
+The launcher validates the Kubernetes configuration and, in `local` workspace
+mode, the sole K3s node before recording one immutable backend marker beside its
+installation configuration. An upgrade without a marker infers Docker when
+existing Compose-labelled workspace or PostgreSQL volumes exist. A mismatch is
+refused; Factory never deletes or migrates either backend's data.
+The Kubernetes profile therefore requires a fresh checkout with a separate
+Compose project in either workspace mode. In `local` mode, that project identity
+deterministically derives the default namespace, PV, PVC, and host workspace
+directory; explicit overrides must remain unique. In `existing-pvc` mode, the
+operator must explicitly provide the namespace, PVC, and host mount; Factory
+validates them and does not create or manage a PV.
 The Kubernetes execution image is required to be an immutable,
 cluster-reachable `registry/repository@sha256:<64 lowercase hex>` reference.
 The deliberately conservative supported subset accepts a lowercase
@@ -35,12 +40,20 @@ tag+digest references are unsupported. The launcher and Rust runtime both
 enforce this invariant; an invalid value is rejected before the backend marker,
 host workspace, or cluster is changed.
 
-`factoryd` and the worker bind the same host workspace at `/workspaces`. The
-launcher discovers the sole K3s node and applies only a Namespace, static local
-PV with node affinity, and PVC. The Factory Kubernetes provisioner creates one
-plain `restartPolicy: Never` Pod per durable environment and mounts only its
-worktree and Git common directory as PVC subpaths. It connects directly to the
-Pod IP; no Service, Deployment, Job, operator, CRD, or workflow engine is added.
+`factoryd` and the worker bind the same host workspace at `/workspaces`.
+In the default `local` mode, the launcher discovers the sole K3s node and
+applies only a Namespace, static local PV with node affinity, and PVC. In
+`existing-pvc` mode, it instead validates an operator-owned Bound Filesystem
+`ReadWriteMany` claim and writable host mount without creating or changing
+storage; Kubernetes may then schedule execution Pods across multiple Ready
+nodes. The operator must provide the same backing filesystem at both endpoints
+and must grant the configured `FACTORY_RUN_AS_UID` and
+`FACTORY_RUN_AS_GID` access in advance. Factory preserves that ownership and
+omits Pod `fsGroup` while retaining `runAsUser` and `runAsGroup`.
+The Factory Kubernetes provisioner creates one plain `restartPolicy: Never`
+Pod per durable environment and mounts only its worktree and Git common
+directory as PVC subpaths. It connects directly to the Pod IP; no Service,
+Deployment, Job, operator, CRD, or workflow engine is added.
 
 PostgreSQL, Qdrant, `factoryd`, provider bridges, artifacts, and the Codex model
 loop remain in Compose. Kubernetes owns Pod placement and runtime execution;
@@ -52,9 +65,12 @@ handler before starting the worker.
 
 ## Limits and Acceptance
 
-This host-local PV is deliberately single-node and is not a multi-node storage
-design. Factory ships a pinned Kata values profile for operators but does not
-auto-install it. Installing Kata runs a privileged host-mounted DaemonSet that
+The `local` mode's host-local PV is deliberately single-node. The
+`existing-pvc` mode is the multi-node execution seam, but its shared storage
+and permissions are an operator contract and it does not provide a highly
+available Factory control plane. Factory ships a pinned Kata values profile for
+operators but does not auto-install it. Installing Kata runs a privileged
+host-mounted DaemonSet that
 modifies K3s/containerd and can temporarily restart the node runtime. Shell
 syntax, both Compose models, and manifest rendering remain configuration gates.
 

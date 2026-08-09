@@ -73,7 +73,9 @@ COMPOSE=("${BASE_COMPOSE[@]}")
 EXECUTION_BACKEND=''
 KUBECTL=()
 KUBERNETES_PREFLIGHTED=0
+KUBERNETES_WORKSPACE_MODE=''
 KUBERNETES_NODE_NAME=''
+KUBERNETES_SCHEDULABLE_NODE_COUNT=''
 KUBERNETES_WORKSPACE_HOST_DIR=''
 KUBERNETES_NAMESPACE=''
 KUBERNETES_WORKSPACE_PVC=''
@@ -164,7 +166,7 @@ base_compose_environment_value() {
 }
 
 select_execution_backend() {
-  local backend workspace_host_dir kubeconfig namespace pvc pv slug
+  local backend workspace_mode workspace_host_dir kubeconfig namespace pvc pv slug
   [[ -z "$EXECUTION_BACKEND" ]] || return
   validate_factory_project_name
   backend=$(base_compose_environment_value FACTORY_EXECUTION_ENVIRONMENT_BACKEND)
@@ -175,8 +177,16 @@ select_execution_backend() {
       ;;
     kubernetes)
       [[ -f "$KUBERNETES_COMPOSE_FILE" ]] || die "missing $KUBERNETES_COMPOSE_FILE"
+      workspace_mode=$(base_compose_environment_value FACTORY_KUBERNETES_WORKSPACE_MODE)
+      workspace_mode=${workspace_mode:-local}
+      case "$workspace_mode" in
+        local | existing-pvc) ;;
+        *) die 'FACTORY_KUBERNETES_WORKSPACE_MODE must be local or existing-pvc' ;;
+      esac
       workspace_host_dir=$(base_compose_environment_value FACTORY_KUBERNETES_WORKSPACE_HOST_DIR)
-      if [[ -z "$workspace_host_dir" ]]; then
+      if [[ "$workspace_mode" == existing-pvc && -z "$workspace_host_dir" ]]; then
+        die 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR is required when FACTORY_KUBERNETES_WORKSPACE_MODE=existing-pvc'
+      elif [[ -z "$workspace_host_dir" ]]; then
         workspace_host_dir=${XDG_DATA_HOME:-$HOME/.local/share}/software-factory/$FACTORY_PROJECT_NAME/workspaces
       fi
       validate_workspace_host_path "$workspace_host_dir"
@@ -184,14 +194,31 @@ select_execution_backend() {
       kubeconfig=${kubeconfig:-${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/k3s.yaml}
       slug=$(kubernetes_project_slug)
       namespace=$(base_compose_environment_value FACTORY_KUBERNETES_NAMESPACE)
-      namespace=${namespace:-$slug-execution}
       pvc=$(base_compose_environment_value FACTORY_KUBERNETES_WORKSPACE_PVC)
-      pvc=${pvc:-$slug-workspaces}
       pv=$(base_compose_environment_value FACTORY_KUBERNETES_WORKSPACE_PV)
-      pv=${pv:-$slug-workspaces-pv}
+      if [[ "$workspace_mode" == existing-pvc ]]; then
+        [[ -n "$namespace" ]] ||
+          die 'FACTORY_KUBERNETES_NAMESPACE is required when FACTORY_KUBERNETES_WORKSPACE_MODE=existing-pvc'
+        [[ -n "$pvc" ]] ||
+          die 'FACTORY_KUBERNETES_WORKSPACE_PVC is required when FACTORY_KUBERNETES_WORKSPACE_MODE=existing-pvc'
+        pv=''
+      else
+        namespace=${namespace:-$slug-execution}
+        pvc=${pvc:-$slug-workspaces}
+        pv=${pv:-$slug-workspaces-pv}
+      fi
       validate_dns_label FACTORY_KUBERNETES_NAMESPACE "$namespace"
       validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PVC "$pvc"
-      validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PV "$pv"
+      if [[ "$workspace_mode" == local ]]; then
+        validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PV "$pv"
+      fi
+      KUBERNETES_WORKSPACE_MODE=$workspace_mode
+      export FACTORY_KUBERNETES_WORKSPACE_MODE=$workspace_mode
+      if [[ "$workspace_mode" == existing-pvc ]]; then
+        export FACTORY_WORKSPACE_OWNERSHIP_MODE=preserve
+      else
+        export FACTORY_WORKSPACE_OWNERSHIP_MODE=manage
+      fi
       export FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
       export FACTORY_KUBERNETES_KUBECONFIG=$kubeconfig
       export FACTORY_KUBERNETES_NAMESPACE=$namespace
@@ -381,9 +408,10 @@ sed_replacement() {
 }
 
 preflight_kubernetes_profile() {
-  local kubeconfig image workspace_host_dir workspace_root namespace pvc pv
+  local kubeconfig image workspace_mode workspace_host_dir workspace_root namespace pvc pv
   local cpu_request memory_request cpu_limit memory_limit readiness_seconds storage_gib
-  local nodes node_count node_name kubeconfig_quoted runtime_class runtime_handler=''
+  local nodes node_rows node_count node_name kubeconfig_quoted runtime_class runtime_handler=''
+  local pvc_state pvc_phase pvc_volume_mode pvc_access_modes
 
   (( KUBERNETES_PREFLIGHTED == 0 )) || return
 
@@ -400,48 +428,86 @@ preflight_kubernetes_profile() {
   validate_kubernetes_image_reference "$image"
   export FACTORY_KUBERNETES_IMAGE=$image
 
+  workspace_mode=$KUBERNETES_WORKSPACE_MODE
   workspace_host_dir=$FACTORY_KUBERNETES_WORKSPACE_HOST_DIR
   validate_workspace_host_path "$workspace_host_dir"
+  if [[ "$workspace_mode" == existing-pvc ]]; then
+    [[ -d "$workspace_host_dir" ]] ||
+      die 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR must already exist when FACTORY_KUBERNETES_WORKSPACE_MODE=existing-pvc'
+    [[ -w "$workspace_host_dir" ]] ||
+      die 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR must be writable when FACTORY_KUBERNETES_WORKSPACE_MODE=existing-pvc'
+    workspace_host_dir=$(cd -P "$workspace_host_dir" && pwd) ||
+      die 'cannot resolve FACTORY_KUBERNETES_WORKSPACE_HOST_DIR'
+    validate_workspace_host_path "$workspace_host_dir"
+    export FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
+  fi
 
   workspace_root=$(compose_environment_value FACTORY_KUBERNETES_WORKSPACE_ROOT)
   workspace_root=${workspace_root:-/workspaces}
   [[ "$workspace_root" == /workspaces ]] ||
-    die 'the single-node profile requires FACTORY_KUBERNETES_WORKSPACE_ROOT=/workspaces'
+    die 'the Kubernetes profile requires FACTORY_KUBERNETES_WORKSPACE_ROOT=/workspaces'
   namespace=$(compose_environment_value FACTORY_KUBERNETES_NAMESPACE)
   pvc=$(compose_environment_value FACTORY_KUBERNETES_WORKSPACE_PVC)
   pv=$FACTORY_KUBERNETES_WORKSPACE_PV
   validate_dns_label FACTORY_KUBERNETES_NAMESPACE "$namespace"
   validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PVC "$pvc"
-  validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PV "$pv"
+  if [[ "$workspace_mode" == local ]]; then
+    validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PV "$pv"
+  fi
 
   cpu_request=$(compose_environment_value FACTORY_KUBERNETES_CPU_REQUEST_MILLIS)
   memory_request=$(compose_environment_value FACTORY_KUBERNETES_MEMORY_REQUEST_MIB)
   cpu_limit=$(compose_environment_value FACTORY_KUBERNETES_CPU_LIMIT_MILLIS)
   memory_limit=$(compose_environment_value FACTORY_KUBERNETES_MEMORY_LIMIT_MIB)
   readiness_seconds=$(compose_environment_value FACTORY_KUBERNETES_READINESS_TIMEOUT_SECONDS)
-  storage_gib=$(compose_environment_value FACTORY_KUBERNETES_WORKSPACE_SIZE_GIB)
   cpu_request=${cpu_request:-500}
   memory_request=${memory_request:-1024}
   cpu_limit=${cpu_limit:-2000}
   memory_limit=${memory_limit:-4096}
   readiness_seconds=${readiness_seconds:-120}
-  storage_gib=${storage_gib:-50}
   positive_integer FACTORY_KUBERNETES_CPU_REQUEST_MILLIS "$cpu_request"
   positive_integer FACTORY_KUBERNETES_MEMORY_REQUEST_MIB "$memory_request"
   positive_integer FACTORY_KUBERNETES_CPU_LIMIT_MILLIS "$cpu_limit"
   positive_integer FACTORY_KUBERNETES_MEMORY_LIMIT_MIB "$memory_limit"
   positive_integer FACTORY_KUBERNETES_READINESS_TIMEOUT_SECONDS "$readiness_seconds"
-  positive_integer FACTORY_KUBERNETES_WORKSPACE_SIZE_GIB "$storage_gib"
+  if [[ "$workspace_mode" == local ]]; then
+    storage_gib=$(compose_environment_value FACTORY_KUBERNETES_WORKSPACE_SIZE_GIB)
+    storage_gib=${storage_gib:-50}
+    positive_integer FACTORY_KUBERNETES_WORKSPACE_SIZE_GIB "$storage_gib"
+  else
+    storage_gib=''
+  fi
   (( cpu_limit >= cpu_request )) || die 'Kubernetes CPU limit must be at least its request'
   (( memory_limit >= memory_request )) || die 'Kubernetes memory limit must be at least its request'
 
   select_kubectl "$kubeconfig"
-  nodes=$("${KUBECTL[@]}" get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}') ||
-    die 'cannot list Kubernetes nodes with the configured kubeconfig'
-  node_count=$(printf '%s\n' "$nodes" | awk 'NF { count++ } END { print count + 0 }')
-  [[ "$node_count" == 1 ]] || die "the single-node profile requires exactly one Kubernetes node; found $node_count"
-  node_name=$(printf '%s\n' "$nodes" | awk 'NF { print; exit }')
-  [[ -n "$node_name" && "$node_name" != *$'\n'* ]] || die 'Kubernetes returned an invalid node name'
+  if [[ "$workspace_mode" == local ]]; then
+    nodes=$("${KUBECTL[@]}" get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}') ||
+      die 'cannot list Kubernetes nodes with the configured kubeconfig'
+    node_count=$(printf '%s\n' "$nodes" | awk 'NF { count++ } END { print count + 0 }')
+    [[ "$node_count" == 1 ]] || die "the local workspace profile requires exactly one Kubernetes node; found $node_count"
+    node_name=$(printf '%s\n' "$nodes" | awk 'NF { print; exit }')
+    [[ -n "$node_name" && "$node_name" != *$'\n'* ]] || die 'Kubernetes returned an invalid node name'
+  else
+    node_rows=$("${KUBECTL[@]}" get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.spec.unschedulable}{"|"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}') ||
+      die 'cannot list Kubernetes nodes with the configured kubeconfig'
+    nodes=$(printf '%s\n' "$node_rows" | awk -F '|' '$2 != "true" && $3 == "True" { print $1 }')
+    node_count=$(printf '%s\n' "$nodes" | awk 'NF { count++ } END { print count + 0 }')
+    (( node_count >= 1 )) || die 'the existing-pvc workspace mode requires at least one Ready schedulable Kubernetes node'
+    node_name=''
+
+    pvc_state=$("${KUBECTL[@]}" -n "$namespace" get pvc "$pvc" -o 'jsonpath={.status.phase}{"|"}{.spec.volumeMode}{"|"}{range .spec.accessModes[*]}{.}{","}{end}') ||
+      die "cannot read existing Kubernetes workspace PVC '$namespace/$pvc'"
+    IFS='|' read -r pvc_phase pvc_volume_mode pvc_access_modes <<< "$pvc_state"
+    [[ "$pvc_phase" == Bound ]] ||
+      die "existing Kubernetes workspace PVC '$namespace/$pvc' must be Bound; found '${pvc_phase:-empty}'"
+    [[ -z "$pvc_volume_mode" || "$pvc_volume_mode" == Filesystem ]] ||
+      die "existing Kubernetes workspace PVC '$namespace/$pvc' must use Filesystem volume mode"
+    case ",$pvc_access_modes" in
+      *,ReadWriteMany,*) ;;
+      *) die "existing Kubernetes workspace PVC '$namespace/$pvc' must include ReadWriteMany access" ;;
+    esac
+  fi
 
   runtime_class=$(compose_environment_value FACTORY_KUBERNETES_RUNTIME_CLASS)
   if [[ -n "$runtime_class" ]]; then
@@ -452,9 +518,13 @@ preflight_kubernetes_profile() {
     [[ -n "$runtime_handler" ]] ||
       die "configured Kubernetes RuntimeClass '$runtime_class' has no handler"
   fi
-  [[ -f "$KUBERNETES_WORKSPACE_TEMPLATE" ]] || die "missing $KUBERNETES_WORKSPACE_TEMPLATE"
+  if [[ "$workspace_mode" == local ]]; then
+    [[ -f "$KUBERNETES_WORKSPACE_TEMPLATE" ]] || die "missing $KUBERNETES_WORKSPACE_TEMPLATE"
+  fi
 
+  KUBERNETES_WORKSPACE_MODE=$workspace_mode
   KUBERNETES_NODE_NAME=$node_name
+  KUBERNETES_SCHEDULABLE_NODE_COUNT=$node_count
   KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
   KUBERNETES_NAMESPACE=$namespace
   KUBERNETES_WORKSPACE_PVC=$pvc
@@ -470,6 +540,18 @@ prepare_kubernetes_profile() {
 
   preflight_kubernetes_profile
   workspace_host_dir=$KUBERNETES_WORKSPACE_HOST_DIR
+  if [[ "$KUBERNETES_WORKSPACE_MODE" == existing-pvc ]]; then
+    export FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
+    if [[ -n "$KUBERNETES_RUNTIME_CLASS" ]]; then
+      printf 'Factory execution backend: kubernetes (worker factory-worker, existing PVC %s/%s, %s Ready schedulable node(s), RuntimeClass %s, handler %s)\n' \
+        "$KUBERNETES_NAMESPACE" "$KUBERNETES_WORKSPACE_PVC" "$KUBERNETES_SCHEDULABLE_NODE_COUNT" \
+        "$KUBERNETES_RUNTIME_CLASS" "$KUBERNETES_RUNTIME_HANDLER" >&2
+    else
+      printf 'Factory execution backend: kubernetes (worker factory-worker, existing PVC %s/%s, %s Ready schedulable node(s), cluster-default runtime)\n' \
+        "$KUBERNETES_NAMESPACE" "$KUBERNETES_WORKSPACE_PVC" "$KUBERNETES_SCHEDULABLE_NODE_COUNT" >&2
+    fi
+    return
+  fi
   mkdir -p -- "$workspace_host_dir"
   workspace_host_dir=$(cd -P "$workspace_host_dir" && pwd)
   validate_workspace_host_path "$workspace_host_dir"

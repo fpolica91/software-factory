@@ -22,6 +22,7 @@ pub mod stages;
 
 pub use kubernetes_pod::KubernetesExecutionEnvironmentConfig;
 pub use kubernetes_pod::KubernetesResourceConfig;
+pub use kubernetes_pod::WorkspaceOwnershipMode;
 
 /// Upstream typed client surface for Rust hosts embedding the full app-server
 /// lifecycle. These types retain upstream semantics without a parallel

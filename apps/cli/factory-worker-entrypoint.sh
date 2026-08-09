@@ -3,9 +3,15 @@ set -eu
 
 factory_uid="${FACTORY_RUN_AS_UID:-}"
 factory_gid="${FACTORY_RUN_AS_GID:-}"
+factory_workspace_ownership_mode="${FACTORY_WORKSPACE_OWNERSHIP_MODE:-manage}"
 factory_codex_home="${CODEX_HOME:-/var/lib/software-factory/codex}"
 factory_kubeconfig_source=/run/factory/k3s.yaml
 factory_kubeconfig_target="$factory_codex_home/kubeconfig/k3s.yaml"
+
+case "$factory_workspace_ownership_mode" in
+  manage | preserve) ;;
+  *) echo 'FACTORY_WORKSPACE_OWNERSHIP_MODE must be manage or preserve' >&2; exit 2 ;;
+esac
 
 if [ -z "$factory_uid" ] && [ -z "$factory_gid" ]; then
   exec "$@"
@@ -38,7 +44,9 @@ if [ "$(id -u)" -eq 0 ]; then
   if [ "${FACTORY_PROVIDER_STATE_WRITABLE:-}" = 1 ]; then
     chown -R "$factory_uid:$factory_gid" /var/lib/software-factory/provider
   fi
-  chown -R "$factory_uid:$factory_gid" /workspaces
+  if [ "$factory_workspace_ownership_mode" = manage ]; then
+    chown -R "$factory_uid:$factory_gid" /workspaces
+  fi
   chown "$factory_uid:$factory_gid" \
     /factory-artifacts \
     /factory-artifacts/local \

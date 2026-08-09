@@ -293,20 +293,40 @@ unplanned and must be investigated before continuing.
   `STATUS=needs-remediation` defect, so it proves only concurrency, scoped
   isolation, and release. Both environments finished `released/released` with
   no remaining container and complete host artifacts.
-  The optional single-host K3s distribution profile is wired through
-  `docker-compose.kubernetes.yml`, the existing `factory-worker`, and
+  The optional Kubernetes distribution profile is wired through
+  `docker-compose.kubernetes.yml` and the existing `factory-worker`; its default
+  `local` workspace mode additionally uses
   `deploy/k3s/single-node-workspaces.yaml`. Docker remains the exact default.
-  K3s mode keeps shared state services in Compose, gives the worker host-local
-  service URLs and no Docker socket, bind-mounts the same host workspace into
-  `factoryd` and the worker, and exposes it to execution Pods through one static
-  local PV/PVC pinned to the discovered node. The launcher validates and applies
-  that template before starting the worker. A configured RuntimeClass must exist
+  Kubernetes mode keeps shared state services in Compose, gives the worker
+  host-local service URLs and no Docker socket, and bind-mounts the same host
+  workspace into `factoryd` and the worker. In `local` mode only, Factory exposes
+  that directory to execution Pods through one static local PV/PVC pinned to the
+  discovered node, and the launcher validates and applies that template before
+  starting the worker. A configured RuntimeClass must exist
   during launcher preflight; its exact name and handler are reported before the
   worker starts, then the class is only passed through. The overlay overrides the existing
   `factory-worker`; it does not define a second worker service or retain a
   backend-selection reconciliation layer. Pod reuse checks Factory-owned fields
   directly on native Kubernetes types. No Factory Pod schema version, shadow
   struct, desired-spec hash, or quantity parser remains.
+  `FACTORY_KUBERNETES_WORKSPACE_MODE=local` preserves that exact default.
+  The alternative `existing-pvc` launcher mode is the smallest truthful
+  multi-node workspace seam: it requires an explicit writable host mount,
+  namespace, and existing PVC; accepts one or more Ready schedulable nodes; and
+  read-only preflights a Bound Filesystem `ReadWriteMany` claim. It skips host
+  directory creation/chown, local storage size handling, and namespace/PV/PVC
+  manifest application. Kubernetes remains the scheduler. The operator owns the
+  contract that the host mount shared by `factoryd` and the worker has the same
+  backing filesystem as the PVC mounted by execution Pods; the launcher reports
+  both endpoints but cannot mechanically prove that storage identity. The
+  launcher derives `FACTORY_WORKSPACE_OWNERSHIP_MODE=preserve` for both host-side
+  services, so their shared entrypoint does not recursively chown the
+  operator-managed workspace mount. The worker validates that same mode and
+  renders execution Pods without `fsGroup` in `preserve` mode, while retaining
+  the configured `runAsUser` and `runAsGroup`. The operator-managed filesystem
+  must already permit those UID/GID values to access the required subpaths.
+  Docker and `local` mode retain the default `manage` behavior and unchanged
+  Pod `fsGroup`.
   Final K3s/runc acceptance passed on ARM64 node `spark-91b3` with acceptance
   image `sha256:df6e4338afc7428dc11786085f8ca5ad8cf6f27628b4509de9e216b444592d5e`
   and immutable execution manifest
@@ -348,8 +368,11 @@ unplanned and must be investigated before continuing.
   containing `KATA-FINAL-OK\n`.
   Before first persisting the immutable per-installation backend marker, the
   launcher runs a read-only Kubernetes preflight over configuration,
-  kubeconfig, immutable registry image digest, resource values, and the single
-  node. The launcher and Rust runtime both require
+  kubeconfig, immutable registry image digest, and resource values. Default
+  `local` workspace mode additionally requires exactly one Kubernetes node;
+  `existing-pvc` mode accepts one or more Ready schedulable nodes and read-only
+  validates the operator-managed Bound Filesystem `ReadWriteMany` PVC and its
+  existing writable host mount. The launcher and Rust runtime both require
   `registry/repository@sha256:<64 lowercase hex>` from a deliberately
   conservative subset: a lowercase DNS/IPv4-style registry with an optional
   numeric port and lowercase repository components separated by single `.`,
@@ -359,13 +382,20 @@ unplanned and must be investigated before continuing.
   kubeconfig regression exits with no marker; a live-node preflight records
   `kubernetes` only after success. Markerless upgrades infer Docker from existing
   Compose-labelled workspace/PostgreSQL volumes; mismatches refuse rather than
-  deleting or migrating data. K3s is fresh-install/separate-project only. Its
-  kubeconfig must be readable by the invoking host user, and workspace paths use
-  a conservative YAML-safe character set before directory creation or manifest
-  rendering.
-  Default K3s namespace, PV, PVC, and host workspace identities derive
+  deleting or migrating data. Selecting Kubernetes remains
+  fresh-install/separate-project only. Its kubeconfig must be readable by the
+  invoking host user. In `local` mode, workspace paths use a conservative
+  YAML-safe character set before Factory creates the host directory and renders
+  or applies the single-node local-PV manifest. In `existing-pvc` mode, Factory
+  creates, changes, and applies no storage resources; the operator must mount
+  the same shared backing filesystem at the validated host path and through the
+  PVC used by execution Pods.
+  In `local` mode, the default K3s namespace, PV, PVC, and host workspace
+  identities derive
   deterministically from the validated Compose project name, preventing two
   separate Factory projects from sharing those resources accidentally.
+  In `existing-pvc` mode, the namespace, PVC, and host mount are
+  explicit operator-owned inputs, and Factory does not manage a PV.
   The four-stage executor has one unversioned module tree: `src/executor/mod.rs`
   owns its public lifecycle, `src/executor/task.rs` owns task/config validation,
   `src/executor/stage_loop.rs` owns stage and remediation turns, and
@@ -577,9 +607,11 @@ The runnable distribution switched to Rust on 2026-08-02:
   `logs` follows the active Rust services and `build` invokes the root Dockerfile
   directly.
 - `apps/README.md` now documents the Rust ownership boundary.
-- `apps/cli/factory-worker-entrypoint.sh` was audited during the switch and
-  intentionally left unchanged; it is a generic UID/GID entrypoint used by
-  the Rust services, not a workflow runtime.
+- `apps/cli/factory-worker-entrypoint.sh` is Factory-owned distribution wiring
+  and now validates the workspace ownership policy used by the Rust services.
+  Its default `manage` mode retains the local recursive ownership setup, while
+  `preserve` leaves an operator-owned `existing-pvc` workspace mount untouched.
+  This deliberate entrypoint seam does not modify the protected Codex kernel.
 
 These root paths are distribution wiring, not separate application
 implementations:

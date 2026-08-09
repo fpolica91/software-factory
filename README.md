@@ -160,13 +160,13 @@ factory down     # stop services while preserving data
 factory build    # maintainer-only local image build
 ```
 
-## Optional single-host K3s execution
+## Optional Kubernetes execution
 
 Docker remains the default execution backend. The backend is immutable for one
-Factory installation because Docker volumes and K3s host workspaces are not
+Factory installation because Docker volumes and Kubernetes workspaces are not
 automatically migrated. Use this profile only from a fresh checkout with its
 own `FACTORY_PROJECT_NAME` and data volumes. On a Linux host with an existing
-single-node K3s installation, set
+Kubernetes cluster, set
 `FACTORY_EXECUTION_ENVIRONMENT_BACKEND=kubernetes` in `.env` and review the
 `FACTORY_KUBERNETES_*` values copied from `.env.example`. `factory up` validates
 the user-readable kubeconfig and requires `FACTORY_KUBERNETES_IMAGE` to be a
@@ -177,19 +177,34 @@ an optional numeric port and lowercase repository components separated by
 single `.`, `_`, or `-` characters; bracketed IPv6 and tag+digest references
 are unsupported. Both the launcher and Rust runtime enforce this invariant.
 Invalid references fail before the backend marker, workspace, or cluster is
-changed. The launcher then creates the host workspace directory, applies the
-static local PV/PVC template, and starts the host-networked `factory-worker`.
+changed. The launcher then starts the host-networked `factory-worker`.
 PostgreSQL, Qdrant, `factoryd`, and the selected provider bridge remain shared
 Compose services; only per-job Codex execution runs in Kubernetes Pods.
 
-The profile is intentionally single-node because coordinator worktrees and
-Pods share one host directory. An empty runtime class uses the K3s default.
-By default the Compose project deterministically supplies a unique namespace,
-PV, PVC, and host workspace directory. Explicit overrides remain supported but
-must also be unique between installations. When a RuntimeClass is configured,
-`factory up` verifies that it exists before starting the worker and prints its
-exact class and handler. A missing or misspelled class therefore fails during
-preflight instead of leaving execution Pods pending until timeout.
+`FACTORY_KUBERNETES_WORKSPACE_MODE=local` remains the default. It is the
+single-node K3s profile: the launcher creates the host workspace directory and
+applies the static local PV/PVC template pinned to the one cluster node. The
+Compose project deterministically supplies a unique namespace, PV, PVC, and
+host workspace directory unless they are overridden.
+
+`FACTORY_KUBERNETES_WORKSPACE_MODE=existing-pvc` is the multi-node seam. It
+requires an explicit existing writable host workspace directory, namespace,
+and PVC. Preflight reads but never creates or changes cluster storage: the
+claim must already be Bound, use the default or `Filesystem` volume mode, and
+include `ReadWriteMany`. At least one Ready schedulable node is required, and
+Kubernetes remains the scheduler. The operator must mount one shared
+filesystem at the host directory used by `factoryd` and the worker and expose
+that same backing storage through the PVC to execution Pods. Factory validates
+both endpoints but cannot mechanically prove they share the same backing
+filesystem. The launcher also tells both host-side services to preserve the
+mounted workspace's existing ownership; it never recursively changes ownership
+inside operator-managed shared storage. Local-PV and Docker profiles retain
+Factory-managed workspace ownership.
+
+An empty runtime class uses the cluster default. When a RuntimeClass is
+configured, `factory up` verifies that it exists before starting the worker
+and prints its exact class and handler. A missing or misspelled class therefore
+fails during preflight instead of leaving execution Pods pending until timeout.
 
 Live K3s/runc acceptance completed on Linux ARM64 with a real DeepSeek job. It
 proved planning, remote commands and patches, native subagent delegation,

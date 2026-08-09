@@ -22,6 +22,13 @@ pub struct KubernetesResourceConfig {
     pub memory_limit_mib: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceOwnershipMode {
+    #[default]
+    Manage,
+    Preserve,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KubernetesExecutionEnvironmentConfig {
     pub namespace: String,
@@ -31,6 +38,7 @@ pub struct KubernetesExecutionEnvironmentConfig {
     pub runtime_class_name: Option<String>,
     pub run_as_uid: Option<i64>,
     pub run_as_gid: Option<i64>,
+    pub workspace_ownership_mode: WorkspaceOwnershipMode,
     pub readiness_timeout: Duration,
     pub resources: KubernetesResourceConfig,
 }
@@ -252,7 +260,10 @@ impl OwnedPod {
                 security_context: config.run_as_uid.map(|uid| PodSecurityContext {
                     run_as_user: Some(uid),
                     run_as_group: config.run_as_gid,
-                    fs_group: config.run_as_gid,
+                    fs_group: match config.workspace_ownership_mode {
+                        WorkspaceOwnershipMode::Manage => config.run_as_gid,
+                        WorkspaceOwnershipMode::Preserve => None,
+                    },
                     ..PodSecurityContext::default()
                 }),
                 containers: vec![Container {
@@ -983,6 +994,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_ownership_mode_changes_only_fs_group() {
+        let managed = OwnedPod::new(&config(TEST_IMAGE), &request()).expect("managed Pod");
+        let managed_context = managed
+            .manifest
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.security_context.as_ref())
+            .expect("managed security context");
+        assert_eq!(managed_context.run_as_user, Some(1000));
+        assert_eq!(managed_context.run_as_group, Some(1000));
+        assert_eq!(managed_context.fs_group, Some(1000));
+
+        let mut preserve_config = config(TEST_IMAGE);
+        preserve_config.workspace_ownership_mode = WorkspaceOwnershipMode::Preserve;
+        let preserved = OwnedPod::new(&preserve_config, &request()).expect("preserved Pod");
+        let preserved_context = preserved
+            .manifest
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.security_context.as_ref())
+            .expect("preserved security context");
+        assert_eq!(preserved_context.run_as_user, Some(1000));
+        assert_eq!(preserved_context.run_as_group, Some(1000));
+        assert_eq!(preserved_context.fs_group, None);
+
+        let mut expected_preserved = managed.manifest;
+        expected_preserved
+            .spec
+            .as_mut()
+            .and_then(|spec| spec.security_context.as_mut())
+            .expect("expected security context")
+            .fs_group = None;
+        assert_eq!(preserved.manifest, expected_preserved);
+    }
+
     fn observed(expected: &OwnedPod) -> Pod {
         let mut pod = expected.manifest.clone();
         pod.metadata.uid = Some("replacement".to_string());
@@ -1015,6 +1062,7 @@ mod tests {
             runtime_class_name: Some("kata".to_string()),
             run_as_uid: Some(1000),
             run_as_gid: Some(1000),
+            workspace_ownership_mode: WorkspaceOwnershipMode::Manage,
             readiness_timeout: Duration::from_secs(30),
             resources: KubernetesResourceConfig {
                 cpu_request_millis: Some(500),

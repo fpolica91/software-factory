@@ -35,11 +35,18 @@ decomposition. Native Rust functional acceptance is recorded in
 Each execution environment mounts only its exact managed worktree and matching
 repository Git common directory at the absolute paths selected for Codex turns.
 Docker, the default backend, derives those scoped mounts from the worker's
-broader `/workspaces` backing mount. The optional single-host Kubernetes backend
-uses one plain Pod and PVC subpaths from a static local workspace PV. Its
-Compose worker uses host networking and a copied, unprivileged kubeconfig; it
-does not receive the Docker socket. An optional RuntimeClass name is passed
-through after launcher preflight verifies the class and reports its handler.
+broader `/workspaces` backing mount. The optional Kubernetes backend uses one
+plain Pod and PVC subpaths. Its default `local` workspace mode uses a static
+local PV and is deliberately single-node. Its `existing-pvc` mode supports
+multi-node execution scheduling through an operator-owned `ReadWriteMany` PVC
+and a matching shared host mount; it does not make the Compose control plane
+highly available. That shared filesystem must already allow the configured
+`FACTORY_RUN_AS_UID` and `FACTORY_RUN_AS_GID` to access every required
+subpath. Factory preserves operator ownership and omits Pod `fsGroup` in this
+mode while retaining `runAsUser` and `runAsGroup`. The Compose worker uses
+host networking and a copied, unprivileged kubeconfig; it does not receive the
+Docker socket. An optional RuntimeClass name is passed through after launcher
+preflight verifies the class and reports its handler.
 Kubernetes execution requires an immutable cluster-reachable
 `registry/repository@sha256:<64 lowercase hex>` reference. Its conservative
 supported subset accepts a lowercase DNS/IPv4-style registry with an optional

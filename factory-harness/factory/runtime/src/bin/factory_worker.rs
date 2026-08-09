@@ -22,6 +22,7 @@ use factory_providers::CodexProviderSelection;
 use factory_providers::provider_profile;
 use factory_runtime::KubernetesExecutionEnvironmentConfig;
 use factory_runtime::KubernetesResourceConfig;
+use factory_runtime::WorkspaceOwnershipMode;
 use factory_runtime::bootstrap::WorkerBootstrap;
 use factory_runtime::bootstrap::build_worker_start_args;
 use factory_runtime::execution_environment::DOCKER_EXECUTION_ENVIRONMENT_BACKEND;
@@ -105,6 +106,14 @@ struct WorkerArgs {
     /// Numeric group identity shared by the worker and Kubernetes execution Pod.
     #[arg(long, env = "FACTORY_RUN_AS_GID")]
     run_as_gid: Option<String>,
+
+    /// Whether Factory manages workspace group ownership or preserves operator ownership.
+    #[arg(
+        long,
+        env = "FACTORY_WORKSPACE_OWNERSHIP_MODE",
+        default_value = "manage"
+    )]
+    workspace_ownership_mode: String,
 
     /// Kubernetes namespace used when the execution-environment backend is Kubernetes.
     #[arg(long, env = "FACTORY_KUBERNETES_NAMESPACE", default_value = "default")]
@@ -286,6 +295,9 @@ async fn build_execution_environment_provisioner(
                 runtime_class_name: args.kubernetes_runtime_class.clone(),
                 run_as_uid: parse_run_as_id("FACTORY_RUN_AS_UID", args.run_as_uid.as_deref())?,
                 run_as_gid: parse_run_as_id("FACTORY_RUN_AS_GID", args.run_as_gid.as_deref())?,
+                workspace_ownership_mode: parse_workspace_ownership_mode(
+                    &args.workspace_ownership_mode,
+                )?,
                 readiness_timeout: Duration::from_secs(args.kubernetes_readiness_timeout_seconds),
                 resources: KubernetesResourceConfig {
                     cpu_request_millis: args.kubernetes_cpu_request_millis,
@@ -320,6 +332,16 @@ fn parse_run_as_id(field: &str, value: Option<&str>) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
+fn parse_workspace_ownership_mode(value: &str) -> Result<WorkspaceOwnershipMode> {
+    match value.trim() {
+        "manage" => Ok(WorkspaceOwnershipMode::Manage),
+        "preserve" => Ok(WorkspaceOwnershipMode::Preserve),
+        _ => Err(anyhow::anyhow!(
+            "FACTORY_WORKSPACE_OWNERSHIP_MODE must be manage or preserve"
+        )),
+    }
+}
+
 fn validate_args(args: &WorkerArgs) -> Result<()> {
     ensure!(
         !args.database_url.trim().is_empty(),
@@ -340,6 +362,7 @@ fn validate_args(args: &WorkerArgs) -> Result<()> {
         !args.execution_environment_backend.trim().is_empty(),
         "execution-environment backend must not be empty"
     );
+    parse_workspace_ownership_mode(&args.workspace_ownership_mode)?;
     ensure!(
         (1..=CoordinatorStore::MAX_WORKER_SLOTS).contains(&args.slots),
         "worker slots must be between 1 and {}",
@@ -354,4 +377,23 @@ fn generated_worker_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("factory-worker-{}-{started_at}", process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_ownership_configuration_accepts_only_manage_or_preserve() {
+        assert_eq!(
+            parse_workspace_ownership_mode("manage").unwrap(),
+            WorkspaceOwnershipMode::Manage
+        );
+        assert_eq!(
+            parse_workspace_ownership_mode(" preserve ").unwrap(),
+            WorkspaceOwnershipMode::Preserve
+        );
+        assert!(parse_workspace_ownership_mode("").is_err());
+        assert!(parse_workspace_ownership_mode("existing-pvc").is_err());
+    }
 }

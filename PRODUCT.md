@@ -64,14 +64,22 @@ common directory. Normal Plan reset preserves the mounted worktree inode;
 exceptional worktree recreation first removes and later reprovisions the job's
 backend under the same durable generation.
 
-Docker remains the default accepted execution backend. An optional Linux-only,
-single-host K3s profile maps the same coordinator workspace root into a static
-local PV and creates one plain execution Pod per job environment. Kubernetes
-owns Pod placement and RuntimeClass execution; Factory still owns durable
-retries, generations, cancellation, and release. PostgreSQL, Qdrant, providers,
-and the model loop remain outside those Pods. Kata is a configured RuntimeClass,
-not a bundled dependency. Both the K3s/runc and optional Kata paths have passed
-full real-model lifecycles; operators still install Kata separately.
+Docker remains the default accepted execution backend. The optional Linux
+Kubernetes profile creates one plain execution Pod per job environment.
+Its default `local` workspace mode is the accepted single-node K3s profile and
+maps the coordinator workspace root through a static local PV. The alternative
+`existing-pvc` mode uses an operator-owned `ReadWriteMany` PVC and the same
+shared filesystem mounted into `factoryd` and the worker, allowing Kubernetes
+to place execution Pods across multiple nodes. This is multi-node execution,
+not a highly available Factory control plane; PostgreSQL, Qdrant, providers,
+and the model loop remain outside those Pods. Existing shared storage must
+already permit the configured `FACTORY_RUN_AS_UID` and
+`FACTORY_RUN_AS_GID`: Factory preserves its ownership and omits Pod `fsGroup`
+in this mode. Kubernetes owns Pod placement and RuntimeClass execution while
+Factory owns durable retries, generations, cancellation, and release. Kata is
+a configured RuntimeClass, not a bundled dependency. Both the K3s/runc and
+optional Kata paths have passed full real-model lifecycles; operators still
+install Kata separately.
 Kubernetes execution requires an immutable, cluster-reachable
 `registry/repository@sha256:<64 lowercase hex>` reference. Its conservative
 supported subset accepts a lowercase DNS/IPv4-style registry with an optional

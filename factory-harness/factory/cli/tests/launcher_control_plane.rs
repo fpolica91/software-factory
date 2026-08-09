@@ -514,3 +514,302 @@ exit 0
         }
     }
 }
+
+#[test]
+fn existing_pvc_workspace_mode_validates_operator_resources_without_mutating_them() {
+    let fixture = TestRoot::new();
+    let fake_bin = fixture.0.join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let launcher = fixture.0.join("factory");
+    std::fs::copy(repository_root.join("factory"), &launcher).unwrap();
+    let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&launcher, permissions).unwrap();
+    std::fs::write(fixture.0.join(".env"), b"").unwrap();
+    std::fs::write(fixture.0.join(".env.example"), b"").unwrap();
+    std::fs::write(fixture.0.join("docker-compose.yml"), b"services: {}\n").unwrap();
+    std::fs::write(
+        fixture.0.join("docker-compose.kubernetes.yml"),
+        b"services: {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.0.join(".factory-execution-backend"),
+        b"kubernetes\n",
+    )
+    .unwrap();
+    let kubeconfig = fixture.0.join("kubeconfig");
+    std::fs::write(&kubeconfig, b"apiVersion: v1\n").unwrap();
+    let workspace = fixture.0.join("shared-workspaces");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace_text = workspace.to_string_lossy().into_owned();
+
+    write_executable(
+        &fake_bin.join("docker"),
+        br##"#!/bin/sh
+printf 'ownership=%s docker %s\n' "${FACTORY_WORKSPACE_OWNERSHIP_MODE:-unset}" "$*" >> "$FACTORY_DOCKER_LOG"
+case " $* " in
+  *" config --environment "*)
+    printf '%s\n' \
+      'FACTORY_EXECUTION_ENVIRONMENT_BACKEND=kubernetes' \
+      'FACTORY_IMAGE=software-factory:local' \
+      'FACTORY_PROVIDER_ADAPTER=openai' \
+      'FACTORY_MODEL=gpt-5.6-sol' \
+      'FACTORY_KUBERNETES_WORKSPACE_MODE=existing-pvc' \
+      'FACTORY_KUBERNETES_WORKSPACE_PV=INVALID_VALUE' \
+      'FACTORY_KUBERNETES_WORKSPACE_SIZE_GIB=not-a-size'
+    printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"
+    printf 'FACTORY_KUBERNETES_IMAGE=%s\n' "$FACTORY_TEST_KUBERNETES_IMAGE"
+    printf 'FACTORY_KUBERNETES_KUBECONFIG=%s\n' "$FACTORY_TEST_KUBECONFIG"
+    printf 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=%s\n' "$FACTORY_TEST_WORKSPACE"
+    printf 'FACTORY_KUBERNETES_NAMESPACE=%s\n' "$FACTORY_TEST_NAMESPACE"
+    printf 'FACTORY_KUBERNETES_WORKSPACE_PVC=%s\n' "$FACTORY_TEST_PVC"
+    ;;
+esac
+exit 0
+"##,
+    );
+    write_executable(
+        &fake_bin.join("kubectl"),
+        br##"#!/bin/sh
+printf 'kubectl %s\n' "$*" >> "$FACTORY_DOCKER_LOG"
+case " $* " in
+  *" get nodes -o "*) printf '%s\n' "$FACTORY_TEST_NODES" ;;
+  *" get pvc "*) printf '%s' "$FACTORY_TEST_PVC_STATE" ;;
+  *) exit 64 ;;
+esac
+"##,
+    );
+    write_executable(
+        &fake_bin.join("chown"),
+        br##"#!/bin/sh
+printf 'chown %s\n' "$*" >> "$FACTORY_DOCKER_LOG"
+exit 91
+"##,
+    );
+
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let digest = "a".repeat(64);
+    let image = format!("ghcr.io/example/software-factory@sha256:{digest}");
+    let ready_nodes = "ready-a||True\nready-b|false|True\ncordoned|true|True\nnot-ready||False";
+
+    let run = |name: &str,
+               workspace_value: &str,
+               namespace: &str,
+               pvc: &str,
+               nodes: &str,
+               pvc_state: &str| {
+        let log = fixture.0.join(format!("existing-pvc-{name}.log"));
+        let output = output_retrying_executable_file_busy(
+            Command::new(&launcher)
+                .arg("up")
+                .current_dir(&fixture.0)
+                .env("PATH", &path)
+                .env("FACTORY_DOCKER_LOG", &log)
+                .env("OPENAI_API_KEY", SENTINEL_KEY)
+                .env("FACTORY_TEST_KUBERNETES_IMAGE", &image)
+                .env("FACTORY_TEST_KUBECONFIG", &kubeconfig)
+                .env("FACTORY_TEST_WORKSPACE", workspace_value)
+                .env("FACTORY_TEST_NAMESPACE", namespace)
+                .env("FACTORY_TEST_PVC", pvc)
+                .env("FACTORY_TEST_NODES", nodes)
+                .env("FACTORY_TEST_PVC_STATE", pvc_state),
+        );
+        (log, output)
+    };
+
+    for (name, workspace_value, namespace, pvc, expected) in [
+        (
+            "missing-workspace",
+            "",
+            "shared-factory",
+            "shared-workspaces",
+            "FACTORY_KUBERNETES_WORKSPACE_HOST_DIR is required",
+        ),
+        (
+            "missing-namespace",
+            workspace_text.as_str(),
+            "",
+            "shared-workspaces",
+            "FACTORY_KUBERNETES_NAMESPACE is required",
+        ),
+        (
+            "missing-pvc",
+            workspace_text.as_str(),
+            "shared-factory",
+            "",
+            "FACTORY_KUBERNETES_WORKSPACE_PVC is required",
+        ),
+    ] {
+        let (log, output) = run(
+            name,
+            workspace_value,
+            namespace,
+            pvc,
+            ready_nodes,
+            "Bound||ReadWriteMany,",
+        );
+        assert!(!output.status.success(), "{name} unexpectedly passed");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{name} produced unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!std::fs::read_to_string(log).unwrap().contains("kubectl"));
+    }
+
+    for (name, nodes, pvc_state, expected) in [
+        (
+            "no-ready-nodes",
+            "cordoned|true|True\nnot-ready||False",
+            "Bound||ReadWriteMany,",
+            "at least one Ready schedulable Kubernetes node",
+        ),
+        (
+            "pending-claim",
+            ready_nodes,
+            "Pending||ReadWriteMany,",
+            "must be Bound",
+        ),
+        (
+            "block-claim",
+            ready_nodes,
+            "Bound|Block|ReadWriteMany,",
+            "must use Filesystem volume mode",
+        ),
+        (
+            "read-write-once-claim",
+            ready_nodes,
+            "Bound|Filesystem|ReadWriteOnce,",
+            "must include ReadWriteMany access",
+        ),
+    ] {
+        let (log, output) = run(
+            name,
+            &workspace_text,
+            "shared-factory",
+            "shared-workspaces",
+            nodes,
+            pvc_state,
+        );
+        assert!(!output.status.success(), "{name} unexpectedly passed");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{name} produced unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let commands = std::fs::read_to_string(log).unwrap();
+        assert!(!commands.contains("apply -f"));
+        assert!(!commands.contains("chown "));
+        assert!(!commands.contains(" up "));
+    }
+
+    let (log, output) = run(
+        "valid",
+        &workspace_text,
+        "shared-factory",
+        "shared-workspaces",
+        ready_nodes,
+        "Bound||ReadWriteMany,ReadWriteOnce,",
+    );
+    assert!(
+        output.status.success(),
+        "valid existing PVC failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let visible_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        visible_output
+            .contains("existing PVC shared-factory/shared-workspaces, 2 Ready schedulable node(s)")
+    );
+    assert!(!visible_output.contains(SENTINEL_KEY));
+
+    let commands = std::fs::read_to_string(log).unwrap();
+    assert!(commands.contains("get pvc shared-workspaces"));
+    assert!(commands.contains("ownership=preserve docker"));
+    assert!(!commands.contains("apply -f"));
+    assert!(!commands.contains("chown "));
+    assert!(!commands.contains(SENTINEL_KEY));
+}
+
+#[test]
+fn entrypoint_preserves_existing_pvc_workspace_ownership_and_compose_propagates_policy() {
+    let fixture = TestRoot::new();
+    let fake_bin = fixture.0.join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let entrypoint = repository_root.join("apps/cli/factory-worker-entrypoint.sh");
+    let compose_overlay =
+        std::fs::read_to_string(repository_root.join("docker-compose.kubernetes.yml")).unwrap();
+    let ownership_mapping =
+        "FACTORY_WORKSPACE_OWNERSHIP_MODE: ${FACTORY_WORKSPACE_OWNERSHIP_MODE:-manage}";
+    assert_eq!(
+        compose_overlay.matches(ownership_mapping).count(),
+        2,
+        "the Kubernetes overlay must pass the derived policy to factoryd and factory-worker"
+    );
+
+    for command in ["mkdir", "chown", "cp", "chmod", "setpriv"] {
+        write_executable(
+            &fake_bin.join(command),
+            format!(
+                "#!/bin/sh\nprintf '{command} %s\\n' \"$*\" >> \"$FACTORY_ENTRYPOINT_LOG\"\nexit 0\n"
+            )
+            .as_bytes(),
+        );
+    }
+    write_executable(
+        &fake_bin.join("id"),
+        b"#!/bin/sh\n[ \"${1:-}\" = -u ] && printf '0\\n'\n",
+    );
+    write_executable(&fake_bin.join("stat"), b"#!/bin/sh\nprintf '999\\n'\n");
+
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |name: &str, ownership_mode: Option<&str>| {
+        let log = fixture.0.join(format!("entrypoint-{name}.log"));
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg(&entrypoint)
+            .arg("/bin/true")
+            .env("PATH", &path)
+            .env("FACTORY_ENTRYPOINT_LOG", &log)
+            .env("FACTORY_RUN_AS_UID", "1000")
+            .env("FACTORY_RUN_AS_GID", "1000");
+        if let Some(mode) = ownership_mode {
+            command.env("FACTORY_WORKSPACE_OWNERSHIP_MODE", mode);
+        } else {
+            command.env_remove("FACTORY_WORKSPACE_OWNERSHIP_MODE");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "entrypoint {name} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(log).unwrap()
+    };
+
+    let managed = run("managed", None);
+    assert!(managed.contains("chown -R 1000:1000 /workspaces"));
+
+    let preserved = run("preserved", Some("preserve"));
+    assert!(preserved.contains("chown -R 1000:1000 /var/lib/software-factory/codex"));
+    assert!(!preserved.contains("chown -R 1000:1000 /workspaces"));
+}
