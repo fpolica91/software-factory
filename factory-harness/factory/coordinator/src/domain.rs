@@ -2,6 +2,7 @@ use crate::correlation::Correlation;
 use crate::error::CoordinatorError;
 use crate::error::Result;
 use crate::ids::AttemptId;
+use crate::ids::ExecutionEnvironmentId;
 use crate::ids::JobId;
 use crate::ids::OperationId;
 use crate::ids::ThreadId;
@@ -145,6 +146,52 @@ impl AttemptState {
             "abandoned" => Ok(Self::Abandoned),
             value => Err(CoordinatorError::UnsupportedState {
                 kind: "attempt",
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionEnvironmentDesiredState {
+    Active,
+    Released,
+}
+
+impl ExecutionEnvironmentDesiredState {
+    pub(crate) fn from_database_value(value: &str) -> Result<Self> {
+        match value {
+            "active" => Ok(Self::Active),
+            "released" => Ok(Self::Released),
+            value => Err(CoordinatorError::UnsupportedState {
+                kind: "execution environment desired state",
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionEnvironmentStatus {
+    Provisioning,
+    Ready,
+    Releasing,
+    Released,
+    Failed,
+}
+
+impl ExecutionEnvironmentStatus {
+    pub(crate) fn from_database_value(value: &str) -> Result<Self> {
+        match value {
+            "provisioning" => Ok(Self::Provisioning),
+            "ready" => Ok(Self::Ready),
+            "releasing" => Ok(Self::Releasing),
+            "released" => Ok(Self::Released),
+            "failed" => Ok(Self::Failed),
+            value => Err(CoordinatorError::UnsupportedState {
+                kind: "execution environment lifecycle",
                 value: value.to_string(),
             }),
         }
@@ -323,6 +370,27 @@ pub struct WorkspaceResult {
     pub base_revision: String,
     pub patch_sha256: String,
     pub patch: Vec<u8>,
+}
+
+/// One durable execution-environment identity for a Factory job.
+///
+/// Retries and lease transfers retain the identity and generation. A
+/// continuation reactivates the same identity with a new generation, fencing
+/// teardown work that began for the preceding terminal job generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionEnvironmentRecord {
+    pub job_id: JobId,
+    pub environment_id: ExecutionEnvironmentId,
+    pub backend: String,
+    pub generation: u64,
+    pub desired_state: ExecutionEnvironmentDesiredState,
+    pub status: ExecutionEnvironmentStatus,
+    pub backend_ref: Option<String>,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

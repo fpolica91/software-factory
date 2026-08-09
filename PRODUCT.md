@@ -59,6 +59,36 @@ and cancel while the job continues independently. Repository identity is
 separate from the fixed container mount path, so changing the host repository
 does not alias or lose detached jobs.
 
+The job's execution container sees only that worktree and its required Git
+common directory. Normal Plan reset preserves the mounted worktree inode;
+exceptional worktree recreation first removes and later reprovisions the job's
+backend under the same durable generation.
+
+Docker remains the default accepted execution backend. An optional Linux-only,
+single-host K3s profile maps the same coordinator workspace root into a static
+local PV and creates one plain execution Pod per job environment. Kubernetes
+owns Pod placement and RuntimeClass execution; Factory still owns durable
+retries, generations, cancellation, and release. PostgreSQL, Qdrant, providers,
+and the model loop remain outside those Pods. Kata is a configured RuntimeClass,
+not a bundled dependency. Both the K3s/runc and optional Kata paths have passed
+full real-model lifecycles; operators still install Kata separately.
+Kubernetes execution requires an immutable, cluster-reachable
+`registry/repository@sha256:<64 lowercase hex>` reference. Its conservative
+supported subset accepts a lowercase DNS/IPv4-style registry with an optional
+numeric port and lowercase repository components separated by single `.`, `_`,
+or `-` characters; bracketed IPv6 and tag+digest references are unsupported.
+On Pod-producing startup, the launcher enforces this invariant before changing
+the backend marker, workspace, or cluster. The Rust runtime independently
+validates the reference during configuration normalization and again
+immediately before Pod construction.
+The launcher fails before worker startup when a selected RuntimeClass cannot be
+read and reports the exact class and handler when selection succeeds.
+The selected backend is persisted per Factory installation and cannot be
+switched in place; the K3s profile requires a fresh checkout and separate
+Compose project/data volumes. Factory performs no automatic data migration.
+Its default namespace, PV, PVC, and host workspace path derive from that unique
+Compose project identity.
+
 Each job pins the canonical provider and exact model it was created with. A
 worker can claim the job only when it serves that profile; switching the active
 configuration cannot silently recover an older attempt with another model. The
@@ -98,6 +128,10 @@ memory retrieval. The 2026-08-02 cutover run proved every Factory-owned part of
 that flow, including crash resume and an actual changes-requested remediation
 cycle. Automatic context compaction remains the preserved native Codex kernel's
 responsibility rather than a second Factory implementation.
+
+Changing an execution boundary such as mount shape, backend lifecycle, or
+workspace restoration requires a fresh current-image real-model gate;
+historical acceptance does not silently accept later boundary changes.
 
 Do not add unrelated security architecture or security-only test programs.
 Preserve user-owned files, and do not commit or push without explicit user

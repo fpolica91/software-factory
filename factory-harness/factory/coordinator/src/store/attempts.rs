@@ -340,6 +340,11 @@ impl CoordinatorStore {
                     .bind(&context.job_id)
                     .execute(&mut *transaction)
                     .await?;
+                    super::environments::request_release_in_transaction(
+                        &mut transaction,
+                        &crate::ids::JobId::new(context.job_id.clone()),
+                    )
+                    .await?;
                 }
             }
             AttemptSettlement::Failed(failure) => {
@@ -413,6 +418,11 @@ impl CoordinatorStore {
             .bind(&context.job_id)
             .execute(&mut **transaction)
             .await?;
+            super::environments::request_release_in_transaction(
+                transaction,
+                &crate::ids::JobId::new(context.job_id.clone()),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -422,7 +432,7 @@ impl CoordinatorStore {
 pub(super) struct AttemptContextRow {
     pub(super) operation_id: String,
     pub(super) job_id: String,
-    job_status: String,
+    pub(super) job_status: String,
     attempt_number: i32,
     max_attempts: i32,
 }

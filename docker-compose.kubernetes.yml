@@ -1,0 +1,68 @@
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+  qdrant:
+    ports: !override
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+
+  factoryd:
+    volumes: !override
+      - type: bind
+        source: ${FACTORY_KUBERNETES_WORKSPACE_HOST_DIR}
+        target: /workspaces
+      - factory-artifacts:/factory-artifacts
+      - type: bind
+        source: ${FACTORY_ARTIFACT_HOST_DIR:-.factory}/jobs
+        target: /factory-artifacts/local/jobs
+      - type: bind
+        source: ${FACTORY_PROJECT_DIR:-.}
+        target: /workspace/project
+    ports: !override
+      - "127.0.0.1:${FACTORYD_PORT:-8787}:8787"
+
+  factory-worker:
+    network_mode: host
+    environment:
+      FACTORYD_URL: http://127.0.0.1:${FACTORYD_PORT:-8787}
+      FACTORY_DATABASE_URL: postgresql://factory:${POSTGRES_PASSWORD:-factory-local}@127.0.0.1:${POSTGRES_PORT:-5432}/factory
+      FACTORY_QDRANT_URL: http://127.0.0.1:${QDRANT_PORT:-6333}
+      FACTORY_PROVIDER_BASE_URL: ${FACTORY_KUBERNETES_PROVIDER_BASE_URL:-}
+      FACTORY_EXECUTION_ENVIRONMENT_BACKEND: kubernetes
+      FACTORY_KUBERNETES_NAMESPACE: ${FACTORY_KUBERNETES_NAMESPACE}
+      FACTORY_KUBERNETES_IMAGE: ${FACTORY_KUBERNETES_IMAGE:-}
+      FACTORY_KUBERNETES_WORKSPACE_PVC: ${FACTORY_KUBERNETES_WORKSPACE_PVC}
+      FACTORY_KUBERNETES_WORKSPACE_ROOT: ${FACTORY_KUBERNETES_WORKSPACE_ROOT:-/workspaces}
+      FACTORY_KUBERNETES_RUNTIME_CLASS: ${FACTORY_KUBERNETES_RUNTIME_CLASS:-}
+      FACTORY_KUBERNETES_READINESS_TIMEOUT_SECONDS: ${FACTORY_KUBERNETES_READINESS_TIMEOUT_SECONDS:-120}
+      FACTORY_KUBERNETES_CPU_REQUEST_MILLIS: ${FACTORY_KUBERNETES_CPU_REQUEST_MILLIS:-500}
+      FACTORY_KUBERNETES_MEMORY_REQUEST_MIB: ${FACTORY_KUBERNETES_MEMORY_REQUEST_MIB:-1024}
+      FACTORY_KUBERNETES_CPU_LIMIT_MILLIS: ${FACTORY_KUBERNETES_CPU_LIMIT_MILLIS:-2000}
+      FACTORY_KUBERNETES_MEMORY_LIMIT_MIB: ${FACTORY_KUBERNETES_MEMORY_LIMIT_MIB:-4096}
+    volumes: !override
+      - type: bind
+        source: ${FACTORY_KUBERNETES_WORKSPACE_HOST_DIR}
+        target: /workspaces
+      - factory-artifacts:/factory-artifacts
+      - type: bind
+        source: ${FACTORY_ARTIFACT_HOST_DIR:-.factory}/jobs
+        target: /factory-artifacts/local/jobs
+      - codex-state:/var/lib/software-factory/codex
+      - provider-state:/var/lib/software-factory/provider:ro
+      - type: bind
+        source: ${FACTORY_KUBERNETES_KUBECONFIG}
+        target: /run/factory/k3s.yaml
+        read_only: true
+
+  zai-provider:
+    ports: !override
+      - "127.0.0.1:${FACTORY_PROVIDER_PORT:-10101}:10101"
+
+  deepseek-provider:
+    ports: !override
+      - "127.0.0.1:${DEEPSEEK_PROVIDER_PORT:-10102}:10101"
+
+  claude-provider:
+    ports: !override
+      - "127.0.0.1:${CLAUDE_PROVIDER_PORT:-10103}:10101"

@@ -133,8 +133,17 @@ impl IntoResponse for ApiError {
                     CoordinatorError::WorkspaceNotFound(_) => {
                         (StatusCode::NOT_FOUND, "workspaceNotFound")
                     }
+                    CoordinatorError::ExecutionEnvironmentNotFound(_) => {
+                        (StatusCode::NOT_FOUND, "executionEnvironmentNotFound")
+                    }
+                    CoordinatorError::ExecutionEnvironmentGenerationStale { .. } => {
+                        (StatusCode::CONFLICT, "executionEnvironmentGenerationStale")
+                    }
                     CoordinatorError::Workspace(_) => {
                         (StatusCode::UNPROCESSABLE_ENTITY, "workspaceOperationFailed")
+                    }
+                    CoordinatorError::WorkspaceRebindRequired { .. } => {
+                        (StatusCode::CONFLICT, "workspaceRebindRequired")
                     }
                     CoordinatorError::AttemptNotRunning(_) => {
                         (StatusCode::CONFLICT, "attemptNotRunning")

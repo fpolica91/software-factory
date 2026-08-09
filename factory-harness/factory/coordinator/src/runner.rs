@@ -172,6 +172,23 @@ pub trait OperationExecutor: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// Releases the cancelling job's execution environment after runtime and
+    /// worktree cleanup but before terminal cancellation acknowledgement.
+    fn release_cancelled_execution_environment(
+        &self,
+        _context: OperationExecutionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Completes durable `releasing` environment rows. Implementations must be
+    /// idempotent because startup, polling, and terminal settlement can race.
+    fn reconcile_execution_environments(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Publishes executor-owned material derived from a successfully settled
     /// operation. The runner invokes this only after the database transaction
     /// has committed; hook failures are warning-only and never roll back or
@@ -209,10 +226,14 @@ where
     pub async fn run(&self, shutdown: CancellationHandle) -> Result<()> {
         let mut attempts = JoinSet::new();
 
+        reconcile_execution_environments(self.executor.as_ref()).await;
+
         'claiming: loop {
             if shutdown.is_cancelled() {
                 break;
             }
+
+            reconcile_execution_environments(self.executor.as_ref()).await;
 
             while attempts.len() < self.config.slots {
                 if shutdown.is_cancelled() {
@@ -427,6 +448,7 @@ where
     };
     match settle_outcome(&store, &fence, outcome).await {
         Ok(settled_succeeded) => {
+            reconcile_execution_environments(executor.as_ref()).await;
             if settled_succeeded
                 && let Err(error) = executor.after_successful_settlement(cleanup_context).await
             {
@@ -441,6 +463,12 @@ where
     }
 }
 
+async fn reconcile_execution_environments<E: OperationExecutor>(executor: &E) {
+    if let Err(error) = executor.reconcile_execution_environments().await {
+        eprintln!("factory execution-environment reconciliation warning: {error}");
+    }
+}
+
 async fn cleanup_and_acknowledge_cancellation<E: OperationExecutor>(
     store: &CoordinatorStore,
     executor: &E,
@@ -450,10 +478,23 @@ async fn cleanup_and_acknowledge_cancellation<E: OperationExecutor>(
         let _ = store.relinquish_attempt(&context.lease().fence).await;
         return Err(error);
     }
-    store
+    if let Err(error) = executor
+        .release_cancelled_execution_environment(context.clone())
+        .await
+    {
+        let _ = store.relinquish_attempt(&context.lease().fence).await;
+        return Err(error);
+    }
+    match store
         .acknowledge_job_cancellation(&context.lease().fence)
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = store.relinquish_attempt(&context.lease().fence).await;
+            Err(error)
+        }
+    }
 }
 
 async fn cleanup_and_relinquish<E: OperationExecutor>(

@@ -13,9 +13,15 @@ use codex_app_server::AppServerExtensionInstaller;
 pub mod bootstrap;
 pub mod checkpoint;
 pub mod events;
+pub mod execution_environment;
 pub mod executor;
+pub mod kubernetes_execution_environment;
+mod kubernetes_pod;
 pub mod session;
 pub mod stages;
+
+pub use kubernetes_pod::KubernetesExecutionEnvironmentConfig;
+pub use kubernetes_pod::KubernetesResourceConfig;
 
 /// Upstream typed client surface for Rust hosts embedding the full app-server
 /// lifecycle. These types retain upstream semantics without a parallel

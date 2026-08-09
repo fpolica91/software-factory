@@ -32,11 +32,39 @@ subagent inspection. Its stage validator additionally requires a pure
 decomposition. Native Rust functional acceptance is recorded in
 `RUST_CUTOVER.md`; the superseded JavaScript fixtures have been deleted.
 
+Each execution environment mounts only its exact managed worktree and matching
+repository Git common directory at the absolute paths selected for Codex turns.
+Docker, the default backend, derives those scoped mounts from the worker's
+broader `/workspaces` backing mount. The optional single-host Kubernetes backend
+uses one plain Pod and PVC subpaths from a static local workspace PV. Its
+Compose worker uses host networking and a copied, unprivileged kubeconfig; it
+does not receive the Docker socket. An optional RuntimeClass name is passed
+through after launcher preflight verifies the class and reports its handler.
+Kubernetes execution requires an immutable cluster-reachable
+`registry/repository@sha256:<64 lowercase hex>` reference. Its conservative
+supported subset accepts a lowercase DNS/IPv4-style registry with an optional
+numeric port and lowercase repository components separated by single `.`, `_`,
+or `-` characters; bracketed IPv6 and tag+digest references are unsupported.
+On Pod-producing startup, the launcher enforces this invariant before changing
+the backend marker, workspace, or cluster. The Rust runtime independently
+validates the reference during configuration normalization and again
+immediately before Pod construction. Both the cluster-default runc path and the
+optional operator-installed Kata RuntimeClass have passed full real-model
+lifecycles. Factory does not install Kata.
+The launcher persists the backend choice per installation. Kubernetes is a
+fresh-install/separate-Compose-project profile, not an in-place migration from
+Docker workspaces or PostgreSQL volumes.
+
 A recovered Plan first promotes a valid completed checkpoint instead of
 discarding durable work. Only after a replacement turn is proven necessary does
 the runtime restore the recorded Factory state and managed-worktree baseline,
 immediately before starting that turn. The current attempt's thread correlation
 is stored before any fenced Plan or review recovery write.
+
+Normal Plan restoration preserves the mounted worktree directory inode. If the
+linked worktree is missing or corrupt, Plan preflight removes the old backend,
+recreates the worktree explicitly, and provisions the same durable environment
+identity and generation before starting a new Codex session.
 
 Cancellation, provider failure, validation failure, and worker shutdown close
 and drain the native Codex session before rollback. Detached review snapshots

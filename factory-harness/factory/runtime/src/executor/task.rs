@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_app_server_client::EnvironmentManager;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_config::AbsolutePathBuf;
 pub(super) use factory_coordinator::FactoryTaskInput as TaskInput;
@@ -14,6 +15,7 @@ use crate::stages::OperationKind;
 use super::CodexOperationExecutor;
 use super::ExecutionFailure;
 use super::ExecutionResult;
+use super::SelectedExecutionEnvironment;
 
 impl CodexOperationExecutor {
     pub(super) async fn validate_job_shape(
@@ -74,6 +76,7 @@ impl CodexOperationExecutor {
         &self,
         workspace_root: &str,
         input: &TaskInput,
+        execution_environment: &SelectedExecutionEnvironment,
     ) -> ExecutionResult<InProcessClientStartArgs> {
         let root = AbsolutePathBuf::relative_to_current_dir(PathBuf::from(workspace_root))
             .map_err(|error| {
@@ -94,6 +97,19 @@ impl CodexOperationExecutor {
             config.developer_instructions = Some(instructions.clone());
         }
         args.config = Arc::new(config);
+        let manager = EnvironmentManager::remote_only(
+            execution_environment.environment_id.clone(),
+            execution_environment.provisioned.url.clone(),
+            /*connect_timeout*/ None,
+            args.config.http_client_factory(),
+        )
+        .map_err(|error| {
+            ExecutionFailure::retryable(format!(
+                "configure Codex execution environment {}: {error}",
+                execution_environment.environment_id
+            ))
+        })?;
+        args.environment_manager = Arc::new(manager);
         Ok(args)
     }
 }

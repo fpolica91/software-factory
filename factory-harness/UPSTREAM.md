@@ -105,6 +105,17 @@ subagents. This is the implementation described by
   warmup and sets analytics off in the Rust configuration while leaving local
   plugin, skill, MCP, and turn behavior available on demand.
 
+### Explicit remote-only environment construction
+
+- `codex-rs/exec-server/src/environment.rs` exposes one production
+  `EnvironmentManager::remote_only` constructor. A host supplies the exact
+  environment ID, exec-server WebSocket URL, optional connection timeout, and
+  effective `HttpClientFactory`; the constructor reuses Codex's existing
+  environment snapshot builder with that remote as the sole default and with
+  local execution disabled. Each call owns an independent manager registry.
+  This is a generic host-composition seam: it adds no Factory type, protocol,
+  schema, generated fixture, or fallback behavior to Codex.
+
 ### Contributed host-created turn-item lifecycle
 
 - `codex-rs/core/src/session/mod.rs` adds generic contributed lifecycle emitters

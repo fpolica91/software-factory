@@ -18,6 +18,8 @@ x-factory-worker-env: &factory-worker-env
   FACTORY_PROVIDER_ADAPTER: ${FACTORY_PROVIDER_ADAPTER:-}
   FACTORY_PROVIDER_BASE_URL: ${FACTORY_PROVIDER_BASE_URL:-}
   FACTORY_MODEL_CATALOG_JSON: ${FACTORY_MODEL_CATALOG_JSON:-}
+  FACTORY_EXECUTION_ENVIRONMENT_BACKEND: ${FACTORY_EXECUTION_ENVIRONMENT_BACKEND:-docker}
+  FACTORY_DOCKER_NETWORK: ${FACTORY_DOCKER_NETWORK:-}
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   ZAI_API_KEY: ${ZAI_API_KEY:-}
@@ -144,6 +146,9 @@ services:
     command: ["factory-worker"]
     working_dir: /workspaces
     volumes:
+      - type: bind
+        source: ${FACTORY_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
       - workspaces:/workspaces
       - factory-artifacts:/factory-artifacts
       - type: bind

@@ -1,15 +1,23 @@
 use factory_coordinator::AttemptSettlement;
 use factory_coordinator::ClaimRequest;
+use factory_coordinator::CoordinatorError;
 use factory_coordinator::CoordinatorInstanceId;
 use factory_coordinator::CoordinatorStore;
 use factory_coordinator::EnsureWorkspaceRequest;
+use factory_coordinator::ExecutionEnvironmentDesiredState;
+use factory_coordinator::ExecutionEnvironmentStatus;
+use factory_coordinator::ExecutionProfile;
 use factory_coordinator::JobDefinition;
+use factory_coordinator::JobState;
 use factory_coordinator::OperationDefinition;
 use factory_coordinator::WorkspaceManager;
+use factory_coordinator::WorkspaceState;
 use serde_json::json;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn database_url() -> String {
@@ -84,6 +92,210 @@ async fn succeed_job(store: &CoordinatorStore, job: &factory_coordinator::Durabl
         .settle_attempt(&lease.fence, AttemptSettlement::Succeeded, None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires FACTORY_COORDINATOR_TEST_DATABASE_URL"]
+async fn continuation_and_workspace_removal_commit_only_one_consistent_ordering() {
+    let root = TestRoot::new();
+    std::fs::create_dir_all(&root.0).unwrap();
+    let source = root.0.join("continuation-remove-source");
+    let workspaces = root.0.join("workspaces");
+    git(["init", "-b", "main", path_text(&source)]);
+    git([
+        "-C",
+        path_text(&source),
+        "config",
+        "user.name",
+        "Factory Workspace Test",
+    ]);
+    git([
+        "-C",
+        path_text(&source),
+        "config",
+        "user.email",
+        "factory-workspace@example.invalid",
+    ]);
+    std::fs::write(source.join("README.md"), b"continuation race\n").unwrap();
+    git(["-C", path_text(&source), "add", "README.md"]);
+    git([
+        "-C",
+        path_text(&source),
+        "commit",
+        "-m",
+        "continuation race base",
+    ]);
+
+    let store = CoordinatorStore::connect(&database_url()).await.unwrap();
+    store.migrate().await.unwrap();
+    let manager = WorkspaceManager::new(&workspaces).unwrap();
+    let job = store
+        .create_job(JobDefinition {
+            kind: "factory.task".to_string(),
+            input: json!({
+                "task": "continue or remove",
+                "executionProfile": {
+                    "provider": "test-provider",
+                    "model": "test-model"
+                }
+            }),
+            operations: [
+                "codex.plan",
+                "codex.execute",
+                "codex.review",
+                "codex.remediate",
+            ]
+            .into_iter()
+            .map(|kind| OperationDefinition {
+                kind: kind.to_string(),
+                input: json!({}),
+                max_attempts: 1,
+            })
+            .collect(),
+        })
+        .await
+        .unwrap();
+    let workspace = manager
+        .ensure(
+            &store,
+            &job.job.job_id,
+            EnsureWorkspaceRequest {
+                repository_id: format!("continuation-remove:{}", Uuid::new_v4()),
+                repository: path_text(&source).to_string(),
+                base_ref: "main".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut environment = None;
+    for (index, operation) in job.operations.iter().enumerate() {
+        let lease = store
+            .claim_recovery_for_operation(
+                &operation.operation_id,
+                &ClaimRequest {
+                    owner_instance_id: CoordinatorInstanceId::new(format!(
+                        "continuation-remove-worker-{index}-{}",
+                        Uuid::new_v4()
+                    )),
+                    lease_seconds: 60,
+                    execution_profile: Some(ExecutionProfile {
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                    }),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        if index == 0 {
+            let created = store
+                .ensure_execution_environment(&lease.fence, "continuation-remove-test")
+                .await
+                .unwrap();
+            environment = Some(
+                store
+                    .mark_execution_environment_ready(
+                        &lease.fence,
+                        created.generation,
+                        "continuation-remove-backend",
+                        "ws://continuation-remove:4500",
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        store
+            .settle_attempt(&lease.fence, AttemptSettlement::Succeeded, None)
+            .await
+            .unwrap();
+    }
+    let environment = environment.unwrap();
+    store
+        .mark_execution_environment_released(&job.job.job_id, environment.generation)
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let continuation_store = store.clone();
+    let continuation_job_id = job.job.job_id.clone();
+    let continuation_barrier = Arc::clone(&barrier);
+    let continuation = tokio::spawn(async move {
+        continuation_barrier.wait().await;
+        continuation_store
+            .continue_job(&continuation_job_id, "race continuation")
+            .await
+    });
+    let removal_store = store.clone();
+    let removal_manager = manager.clone();
+    let removal_job_id = job.job.job_id.clone();
+    let removal_barrier = Arc::clone(&barrier);
+    let removal = tokio::spawn(async move {
+        removal_barrier.wait().await;
+        removal_manager
+            .remove(&removal_store, &removal_job_id)
+            .await
+    });
+    barrier.wait().await;
+    let (continued, removed) = tokio::join!(continuation, removal);
+    let continued = continued.unwrap();
+    let removed = removed.unwrap();
+
+    match (continued, removed) {
+        (Ok(continued), Err(CoordinatorError::InvalidInput(message))) => {
+            assert!(message.contains("cannot be removed while execution environment"));
+            assert_eq!(continued.job.state, JobState::Queued);
+            assert_eq!(continued.operations.len(), 7);
+            let current_workspace = store
+                .load_workspace(&job.job.job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current_workspace.state, WorkspaceState::Active);
+            assert!(Path::new(&current_workspace.root).is_dir());
+            let current_environment = store
+                .load_execution_environment(&job.job.job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current_environment.generation, 2);
+            assert_eq!(
+                current_environment.desired_state,
+                ExecutionEnvironmentDesiredState::Active
+            );
+            assert_eq!(
+                current_environment.status,
+                ExecutionEnvironmentStatus::Provisioning
+            );
+        }
+        (Err(CoordinatorError::WorkspaceNotFound(error_job_id)), Ok(removed)) => {
+            assert_eq!(error_job_id, job.job.job_id);
+            assert_eq!(removed.state, WorkspaceState::Removed);
+            assert!(!Path::new(&workspace.root).exists());
+            let current = store.load_job(&job.job.job_id).await.unwrap();
+            assert_eq!(current.job.state, JobState::Succeeded);
+            assert_eq!(current.operations.len(), 4);
+            let current_environment = store
+                .load_execution_environment(&job.job.job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current_environment.generation, 1);
+            assert_eq!(
+                current_environment.desired_state,
+                ExecutionEnvironmentDesiredState::Released
+            );
+            assert_eq!(
+                current_environment.status,
+                ExecutionEnvironmentStatus::Released
+            );
+        }
+        (continued, removed) => panic!(
+            "continuation/removal race produced an inconsistent outcome: continuation={continued:?}, removal={removed:?}"
+        ),
+    }
+
+    store.close().await;
 }
 
 #[tokio::test]

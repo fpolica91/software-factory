@@ -6,6 +6,9 @@ use crate::domain::CheckpointRecord;
 use crate::domain::CoordinatorInstanceId;
 use crate::domain::CorrelationRecordId;
 use crate::domain::DurableCorrelationRecord;
+use crate::domain::ExecutionEnvironmentDesiredState;
+use crate::domain::ExecutionEnvironmentRecord;
+use crate::domain::ExecutionEnvironmentStatus;
 use crate::domain::FactoryThreadStateRecord;
 use crate::domain::JobEventRecord;
 use crate::domain::JobRecord;
@@ -21,6 +24,7 @@ use crate::domain::WorkspaceState;
 use crate::error::CoordinatorError;
 use crate::error::Result;
 use crate::ids::AttemptId;
+use crate::ids::ExecutionEnvironmentId;
 use crate::ids::ItemId;
 use crate::ids::JobId;
 use crate::ids::OperationId;
@@ -40,6 +44,43 @@ pub(crate) struct JobRow {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+pub(crate) struct ExecutionEnvironmentRow {
+    pub job_id: String,
+    pub environment_id: String,
+    pub backend: String,
+    pub generation: i64,
+    pub desired_state: String,
+    pub status: String,
+    pub backend_ref: Option<String>,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<ExecutionEnvironmentRow> for ExecutionEnvironmentRecord {
+    type Error = CoordinatorError;
+
+    fn try_from(row: ExecutionEnvironmentRow) -> Result<Self> {
+        Ok(Self {
+            job_id: JobId::new(row.job_id),
+            environment_id: ExecutionEnvironmentId::new(row.environment_id),
+            backend: row.backend,
+            generation: to_u64(row.generation, "execution environment generation")?,
+            desired_state: ExecutionEnvironmentDesiredState::from_database_value(
+                &row.desired_state,
+            )?,
+            status: ExecutionEnvironmentStatus::from_database_value(&row.status)?,
+            backend_ref: row.backend_ref,
+            url: row.url,
+            error: row.error,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
 }
 
 impl TryFrom<JobRow> for JobRecord {

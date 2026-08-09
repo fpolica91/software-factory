@@ -224,6 +224,25 @@ WHERE kind = 'factory.task'
   AND input #>> '{executionProfile,provider}' = 'claude';
 "#;
 
+// One stable environment identity belongs to one durable job. Its generation
+// changes only when continuation reactivates a terminal job, fencing teardown
+// work retained from the preceding generation.
+const ADD_EXECUTION_ENVIRONMENTS: &str = r#"
+CREATE TABLE factory_execution_environments (
+    job_id TEXT PRIMARY KEY REFERENCES factory_jobs(job_id) ON DELETE CASCADE,
+    environment_id TEXT NOT NULL UNIQUE CHECK (length(environment_id) > 0),
+    backend TEXT NOT NULL CHECK (length(backend) > 0),
+    generation BIGINT NOT NULL CHECK (generation > 0),
+    desired_state TEXT NOT NULL CHECK (desired_state IN ('active', 'released')),
+    status TEXT NOT NULL CHECK (status IN ('provisioning', 'ready', 'releasing', 'released', 'failed')),
+    backend_ref TEXT CHECK (backend_ref IS NULL OR length(backend_ref) > 0),
+    url TEXT CHECK (url IS NULL OR length(url) > 0),
+    error TEXT CHECK (error IS NULL OR length(error) > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+"#;
+
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, MIGRATION_1),
     (2, MIGRATION_2),
@@ -236,6 +255,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (11, ADD_WORKSPACE_IDENTITY_AND_BASE_REVISION),
     (12, ADD_CANCELLATION_REQUEST_STATE),
     (13, NORMALIZE_ANTHROPIC_JOB_PROFILE),
+    (14, ADD_EXECUTION_ENVIRONMENTS),
 ];
 
 pub(crate) async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {

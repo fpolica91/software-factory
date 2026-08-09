@@ -27,8 +27,14 @@ pub enum CoordinatorError {
     JobCancellationRequested(JobId),
     #[error("workspace for job {0} was not found")]
     WorkspaceNotFound(JobId),
+    #[error("execution environment for job {0} was not found")]
+    ExecutionEnvironmentNotFound(JobId),
+    #[error("execution environment generation {generation} for job {job_id} is stale")]
+    ExecutionEnvironmentGenerationStale { job_id: JobId, generation: u64 },
     #[error("workspace operation failed: {0}")]
     Workspace(String),
+    #[error("workspace for job {job_id} must be rebound: {reason}")]
+    WorkspaceRebindRequired { job_id: JobId, reason: String },
     #[error("attempt {0} was not found or is not running")]
     AttemptNotRunning(AttemptId),
     #[error("attempt {0} has no renewable lease for this coordinator instance")]

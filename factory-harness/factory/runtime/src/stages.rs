@@ -13,9 +13,10 @@ use std::fmt;
 use std::str::FromStr;
 
 pub const AUTONOMOUS_PROMPT: &str = "Work autonomously until this stage is complete. Persist the required Factory state with the named Factory tools. Do not stop at advice or ask for confirmation.";
-pub const PLAN_PROMPT: &str = "Inspect the repository without modifying it. On every Plan attempt, create a fresh, dependency-ordered decomposition after rollback. The only permitted Factory state mutation during Plan is exactly one call to factory_decompose. Do not call factory_update_progress, factory_record_review, or factory_record_remediation. Every persisted work unit must remain pending with no progress or result summary. Do not implement any work during planning.";
+pub const PLAN_PROMPT: &str = "Inspect the repository without modifying it. On every Plan attempt, create a fresh, dependency-ordered decomposition after rollback. Decompose only implementation and verification work for Execute; never create work units for the later Factory Review, Remediate, or re-review stages because Factory owns that lifecycle. The only permitted Factory state mutation during Plan is exactly one call to factory_decompose. Do not call factory_update_progress, factory_record_review, or factory_record_remediation. Every persisted work unit must remain pending with no progress or result summary. Do not implement any work during planning.";
 pub const EXECUTE_PROMPT: &str = concat!(
     "Implement every incomplete work unit in dependency order. For each unit, implement and verify the result, then call factory_update_progress exactly once with completed and a concise evidence-based summary. ",
+    "Do not perform instructions explicitly scoped to the later Factory Review, Remediate, or re-review stages during Execute. ",
     "Run the required verification; never skip or weaken it to avoid generated files. Before finishing, inspect the complete workspace diff and remove only untracked transient residue created solely by verification, such as __pycache__/, *.pyc, and .pytest_cache/. ",
     "Preserve every tracked file and every output required by the original task, even when it is generated. Do not mark a unit completed before its work and verification are finished. Do not finish while any unit is incomplete."
 );
@@ -619,6 +620,8 @@ mod tests {
     #[test]
     fn plan_prompt_names_the_exact_pure_state_contract() {
         assert!(PLAN_PROMPT.contains("On every Plan attempt"));
+        assert!(PLAN_PROMPT.contains("only implementation and verification work for Execute"));
+        assert!(PLAN_PROMPT.contains("Factory Review, Remediate, or re-review"));
         assert!(PLAN_PROMPT.contains("exactly one call to factory_decompose"));
         for forbidden in [
             "factory_update_progress",
@@ -641,6 +644,11 @@ mod tests {
             OperationKind::Execute.sandbox_policy(),
             SandboxPolicy::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn execute_prompt_preserves_later_factory_stage_boundaries() {
+        assert!(EXECUTE_PROMPT.contains("later Factory Review, Remediate, or re-review"));
     }
 
     #[test]

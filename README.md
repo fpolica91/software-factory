@@ -160,6 +160,94 @@ factory down     # stop services while preserving data
 factory build    # maintainer-only local image build
 ```
 
+## Optional single-host K3s execution
+
+Docker remains the default execution backend. The backend is immutable for one
+Factory installation because Docker volumes and K3s host workspaces are not
+automatically migrated. Use this profile only from a fresh checkout with its
+own `FACTORY_PROJECT_NAME` and data volumes. On a Linux host with an existing
+single-node K3s installation, set
+`FACTORY_EXECUTION_ENVIRONMENT_BACKEND=kubernetes` in `.env` and review the
+`FACTORY_KUBERNETES_*` values copied from `.env.example`. `factory up` validates
+the user-readable kubeconfig and requires `FACTORY_KUBERNETES_IMAGE` to be a
+cluster-reachable immutable
+`registry/repository@sha256:<64 lowercase hex>` reference. The deliberately
+conservative supported subset accepts a lowercase DNS/IPv4-style registry with
+an optional numeric port and lowercase repository components separated by
+single `.`, `_`, or `-` characters; bracketed IPv6 and tag+digest references
+are unsupported. Both the launcher and Rust runtime enforce this invariant.
+Invalid references fail before the backend marker, workspace, or cluster is
+changed. The launcher then creates the host workspace directory, applies the
+static local PV/PVC template, and starts the host-networked `factory-worker`.
+PostgreSQL, Qdrant, `factoryd`, and the selected provider bridge remain shared
+Compose services; only per-job Codex execution runs in Kubernetes Pods.
+
+The profile is intentionally single-node because coordinator worktrees and
+Pods share one host directory. An empty runtime class uses the K3s default.
+By default the Compose project deterministically supplies a unique namespace,
+PV, PVC, and host workspace directory. Explicit overrides remain supported but
+must also be unique between installations. When a RuntimeClass is configured,
+`factory up` verifies that it exists before starting the worker and prints its
+exact class and handler. A missing or misspelled class therefore fails during
+preflight instead of leaving execution Pods pending until timeout.
+
+Live K3s/runc acceptance completed on Linux ARM64 with a real DeepSeek job. It
+proved planning, remote commands and patches, native subagent delegation,
+detached review, artifact materialization, apply, and `released/released` Pod
+teardown through the same durable environment contract used by Docker.
+
+### Optional Kata RuntimeClass
+
+Kata remains an operator-installed runtime, not a Factory service. The pinned
+`deploy/k3s/kata-qemu-runtime-rs.values.yaml` profile enables only
+`kata-qemu-runtime-rs` on ARM64 and disables optional snapshotters and every
+other shim. Installing it runs a privileged host-mounted DaemonSet that updates
+K3s/containerd and may temporarily restart the node runtime; review that impact
+before running:
+
+```sh
+FACTORY_KUBECONFIG=${FACTORY_KUBERNETES_KUBECONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/k3s.yaml}
+
+helm --kubeconfig "$FACTORY_KUBECONFIG" \
+  upgrade --install kata-deploy \
+  oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+  --version 3.32.0 \
+  --namespace kata-system --create-namespace \
+  -f deploy/k3s/kata-qemu-runtime-rs.values.yaml
+kubectl --kubeconfig "$FACTORY_KUBECONFIG" \
+  -n kata-system rollout status daemonset/kata-deploy --timeout=20m
+```
+
+After RuntimeClass `kata-qemu-runtime-rs` exists, set
+`FACTORY_KUBERNETES_RUNTIME_CLASS=kata-qemu-runtime-rs`; the next `factory up`
+must report that class and its handler before the worker starts.
+
+Definitive exact-source Kata acceptance passed on ARM64 from source fingerprint
+`dec512b9…b8c3ce` with immutable image
+`docker.io/library/software-factory@sha256:2bd920060b337573e8cbd751cc64c514174d2acdbad7a32f9f3c3caa6201611d`.
+DeepSeek model `deepseek-v4-pro` completed all stages in job
+`7003ae36-6f72-4d1a-830b-20f78c3cbeac`; Plan attempt 1 hit a fixture-only
+`ImagePullBackOff` because the offline `k3s ctr images import` lacked the exact
+digest alias. Adding that alias let durable attempt 2 recover; Execute, Review,
+and Remediate each passed on attempt 1. This was local offline-import setup, not
+a Factory retry bypass. Pod `factory-9a32720327d94a39a51c3121aeb9f269-g1`
+(UID `519c1713-84d8-4b23-b05f-8aaa28895c3b`) used RuntimeClass
+`kata-qemu-runtime-rs`; guest kernel 6.18.35 differed from host kernel
+6.17.0-1014-nvidia. Environment `9a327203-27d9-4a39-a51c-3121aeb9f269`,
+generation 1, ended `released/released` and the Pod was removed. Native-subagent
+verification passed; attach, result, and apply succeeded; host `result.md` was
+verified; and the sole applied file was `KATA_FINAL_ACCEPTANCE.txt`, exactly 14
+bytes containing `KATA-FINAL-OK\n`.
+
+Roll back with:
+
+```sh
+FACTORY_KUBECONFIG=${FACTORY_KUBERNETES_KUBECONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/k3s.yaml}
+
+helm --kubeconfig "$FACTORY_KUBECONFIG" \
+  uninstall kata-deploy --namespace kata-system --wait --timeout 20m
+```
+
 ## Source Layout
 
 - `factory-harness/codex-rs/` preserves the upstream-shaped Codex kernel.

@@ -320,6 +320,10 @@ pub(crate) fn compact_event_line(event: &JobEventRecord) -> Option<String> {
         || event.kind.contains("retry")
         || event.kind.contains("recover")
         || event.kind.contains("cancel")
+        || matches!(
+            event.kind.as_str(),
+            "environment.connected" | "environment.disconnected"
+        )
         || event.kind == "context.compacted"
         || event.kind == "turn.plan";
     if !important {
@@ -590,6 +594,7 @@ mod tests {
     use serde_json::json;
 
     use super::Transcript;
+    use super::compact_event_line;
 
     fn event(sequence: u64, kind: &str, payload: Value) -> JobEventRecord {
         serde_json::from_value(json!({
@@ -637,6 +642,21 @@ mod tests {
             json!({ "turnId": "turn-1", "message": "second" }),
         ));
         assert_eq!(transcript.rows().len(), 2);
+    }
+
+    #[test]
+    fn compact_output_shows_remote_recovery_state() {
+        let line = compact_event_line(&event(
+            1,
+            "environment.disconnected",
+            json!({
+                "environmentId": "remote",
+                "message": "Remote execution environment `remote` disconnected",
+            }),
+        ))
+        .expect("important recovery event");
+
+        assert!(line.contains("Remote execution environment `remote` disconnected"));
     }
 
     #[test]

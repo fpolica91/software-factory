@@ -1,6 +1,7 @@
 use crate::CoordinatorError;
 use crate::CoordinatorStore;
 use crate::EnsureWorkspaceRequest;
+use crate::ExecutionEnvironmentStatus;
 use crate::JobState;
 use crate::Result;
 use crate::WorkspaceBinding;
@@ -224,6 +225,17 @@ impl WorkspaceManager {
             .ok_or_else(|| CoordinatorError::WorkspaceNotFound(job_id.clone()))
     }
 
+    /// Returns the exact shared Git common directory used by a managed
+    /// worktree for one repository identity.
+    pub fn repository_metadata_root(&self, repository_id: &str) -> Result<String> {
+        if repository_id.trim().is_empty() {
+            return Err(CoordinatorError::InvalidInput(
+                "workspace repositoryId must not be empty".to_string(),
+            ));
+        }
+        path_text(&self.mirror_path(repository_id)).map(str::to_string)
+    }
+
     pub async fn refresh_revision(
         &self,
         store: &CoordinatorStore,
@@ -297,8 +309,10 @@ impl WorkspaceManager {
         self.validate_pristine_unlocked(workspace, &worktree).await
     }
 
-    /// Recreates only the disposable worktree owned by this Factory job at
-    /// the exact recorded revision. The source repository is never touched.
+    /// Restores the disposable worktree in place so an already-mounted
+    /// execution environment keeps observing the same directory inode.
+    /// Missing or structurally invalid worktrees require an explicit backend
+    /// rebind before [`Self::recreate`] may replace the directory.
     pub async fn restore(&self, workspace: &WorkspaceRecord) -> Result<()> {
         let _guard = self.mutation_gate.lock().await;
         let worktree = self.managed_worktree_path(workspace).await?;
@@ -309,9 +323,54 @@ impl WorkspaceManager {
                 workspace.job_id, workspace.repository
             )));
         }
+        ensure_mirror_has_revision(&mirror, &workspace.revision).await?;
+        if !linked_worktree_matches(&worktree, &mirror).await? {
+            return Err(CoordinatorError::WorkspaceRebindRequired {
+                job_id: workspace.job_id.clone(),
+                reason: "managed linked worktree is missing or does not use its recorded Git common directory"
+                    .to_string(),
+            });
+        }
 
-        run_git(["--git-dir", path_text(&mirror)?, "worktree", "prune"]).await?;
-        if worktree.exists() {
+        run_git([
+            "-C",
+            path_text(&worktree)?,
+            "checkout",
+            "--force",
+            "-B",
+            workspace.branch_name.as_str(),
+            workspace.revision.as_str(),
+        ])
+        .await?;
+        run_git([
+            "-C",
+            path_text(&worktree)?,
+            "reset",
+            "--hard",
+            workspace.revision.as_str(),
+        ])
+        .await?;
+        run_git(["-C", path_text(&worktree)?, "clean", "-ffdx"]).await?;
+
+        self.validate_pristine_unlocked(workspace, &worktree).await
+    }
+
+    /// Recreates a missing or structurally invalid disposable worktree.
+    /// Callers must first stop and remove every execution backend that mounts
+    /// this workspace root.
+    pub async fn recreate(&self, workspace: &WorkspaceRecord) -> Result<()> {
+        let _guard = self.mutation_gate.lock().await;
+        let worktree = self.managed_worktree_path(workspace).await?;
+        let mirror = self.mirror_path(&workspace.repository_id);
+        if !mirror_matches_repository(&mirror, &workspace.repository).await? {
+            return Err(CoordinatorError::Workspace(format!(
+                "managed mirror for job {} is unavailable or does not match {}",
+                workspace.job_id, workspace.repository
+            )));
+        }
+        ensure_mirror_has_revision(&mirror, &workspace.revision).await?;
+
+        if worktree.exists() && linked_worktree_matches(&worktree, &mirror).await? {
             run_git([
                 "--git-dir",
                 path_text(&mirror)?,
@@ -321,7 +380,12 @@ impl WorkspaceManager {
                 path_text(&worktree)?,
             ])
             .await?;
+        } else if worktree.exists() {
+            tokio::fs::remove_dir_all(&worktree)
+                .await
+                .map_err(workspace_io)?;
         }
+        run_git(["--git-dir", path_text(&mirror)?, "worktree", "prune"]).await?;
         run_git([
             "--git-dir",
             path_text(&mirror)?,
@@ -647,6 +711,14 @@ impl WorkspaceManager {
         if current.state == WorkspaceState::Removed {
             return Ok(current);
         }
+        if let Some(environment) = store.load_execution_environment(job_id).await?
+            && environment.status != ExecutionEnvironmentStatus::Released
+        {
+            return Err(CoordinatorError::InvalidInput(format!(
+                "workspace for job {job_id} cannot be removed while execution environment {} generation {} is {:?}",
+                environment.environment_id, environment.generation, environment.status
+            )));
+        }
         let worktree = PathBuf::from(&current.root);
         if worktree.exists() {
             let mirror = self.mirror_path(&current.repository_id);
@@ -694,6 +766,14 @@ impl WorkspaceManager {
         worktree: &Path,
     ) -> Result<()> {
         let head = run_git(["-C", path_text(worktree)?, "rev-parse", "HEAD"]).await?;
+        let branch = optional_git_output([
+            "-C",
+            path_text(worktree)?,
+            "symbolic-ref",
+            "--short",
+            "HEAD",
+        ])
+        .await?;
         let status = run_git([
             "-C",
             path_text(worktree)?,
@@ -704,7 +784,10 @@ impl WorkspaceManager {
             "--ignored=matching",
         ])
         .await?;
-        if head == workspace.revision && status.is_empty() {
+        if head == workspace.revision
+            && branch.as_deref() == Some(workspace.branch_name.as_str())
+            && status.is_empty()
+        {
             return Ok(());
         }
 
@@ -715,12 +798,53 @@ impl WorkspaceManager {
             .collect::<Vec<_>>()
             .join(", ");
         Err(CoordinatorError::Workspace(format!(
-            "managed worktree for job {} drifted from revision {} (HEAD {head}; changes: {})",
+            "managed worktree for job {} drifted from revision {} (HEAD {head}; branch {}; changes: {})",
             workspace.job_id,
             workspace.revision,
+            branch.as_deref().unwrap_or("detached"),
             if changes.is_empty() { "none" } else { &changes }
         )))
     }
+}
+
+async fn linked_worktree_matches(worktree: &Path, mirror: &Path) -> Result<bool> {
+    if !worktree.is_dir() {
+        return Ok(false);
+    }
+    let canonical_worktree = match tokio::fs::canonicalize(worktree).await {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(workspace_io(error)),
+    };
+    if canonical_worktree != worktree {
+        return Ok(false);
+    }
+    let Some(top_level) = optional_git_output([
+        "-C",
+        path_text(worktree)?,
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+    ])
+    .await?
+    else {
+        return Ok(false);
+    };
+    let Some(common_dir) = optional_git_output([
+        "-C",
+        path_text(worktree)?,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ])
+    .await?
+    else {
+        return Ok(false);
+    };
+    let canonical_mirror = tokio::fs::canonicalize(mirror)
+        .await
+        .map_err(workspace_io)?;
+    Ok(Path::new(&top_level) == canonical_worktree && Path::new(&common_dir) == canonical_mirror)
 }
 
 fn validate_request(request: &EnsureWorkspaceRequest) -> Result<()> {
@@ -1133,6 +1257,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn repository_metadata_root_is_stable_and_repository_scoped() {
+        let manager = WorkspaceManager::new("/workspaces").unwrap();
+        let first = manager.repository_metadata_root("repository-a").unwrap();
+        let repeated = manager.repository_metadata_root("repository-a").unwrap();
+        let second = manager.repository_metadata_root("repository-b").unwrap();
+
+        assert_eq!(first, repeated);
+        assert!(first.starts_with("/workspaces/mirrors/"));
+        assert!(first.ends_with(".git"));
+        assert_ne!(first, second);
+        assert!(manager.repository_metadata_root(" ").is_err());
     }
 
     async fn create_source(root: &Path, name: &str, contents: &str) -> (PathBuf, String) {
@@ -1661,8 +1799,11 @@ mod tests {
         assert!(!mirror.exists(), "unresolved mirrors must not be published");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn restore_recreates_only_the_managed_worktree_at_recorded_revision() {
+    async fn restore_cleans_managed_worktree_in_place_at_recorded_revision() {
+        use std::os::unix::fs::MetadataExt;
+
         let root = TestRoot::new();
         tokio::fs::create_dir_all(&root.0).await.unwrap();
         let (source, _) = create_source(&root.0, "source", "expected source\n").await;
@@ -1734,6 +1875,7 @@ mod tests {
             updated_at: now,
         };
         manager.validate_pristine(&record).await.unwrap();
+        let inode_before = tokio::fs::metadata(&worktree).await.unwrap().ino();
 
         tokio::fs::write(source.join("SOURCE-ADVANCED.txt"), b"newer source commit\n")
             .await
@@ -1787,6 +1929,11 @@ mod tests {
         assert!(drift.to_string().contains("IGNORED.txt"));
 
         manager.restore(&record).await.unwrap();
+        let inode_after = tokio::fs::metadata(&worktree).await.unwrap().ino();
+        assert_eq!(
+            inode_after, inode_before,
+            "restore replaced workspace inode"
+        );
         manager.validate_pristine(&record).await.unwrap();
         assert_eq!(
             tokio::fs::read_to_string(worktree.join("README.md"))
@@ -1804,6 +1951,35 @@ mod tests {
             "expected source\n"
         );
         assert!(source.join("SOURCE-ADVANCED.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn missing_or_corrupt_worktree_requires_explicit_recreate() {
+        let root = TestRoot::new();
+        tokio::fs::create_dir_all(&root.0).await.unwrap();
+        let (source, _) = create_source(&root.0, "rebind-source", "expected source\n").await;
+        let (manager, record, worktree) =
+            create_managed_record(&root.0, &source, "rebind-restore").await;
+
+        tokio::fs::remove_file(worktree.join(".git")).await.unwrap();
+        let corrupt = manager.restore(&record).await.unwrap_err();
+        assert!(matches!(
+            corrupt,
+            CoordinatorError::WorkspaceRebindRequired { ref job_id, .. }
+                if job_id == &record.job_id
+        ));
+        manager.recreate(&record).await.unwrap();
+        manager.validate_pristine(&record).await.unwrap();
+
+        tokio::fs::remove_dir_all(&worktree).await.unwrap();
+        let missing = manager.restore(&record).await.unwrap_err();
+        assert!(matches!(
+            missing,
+            CoordinatorError::WorkspaceRebindRequired { ref job_id, .. }
+                if job_id == &record.job_id
+        ));
+        manager.recreate(&record).await.unwrap();
+        manager.validate_pristine(&record).await.unwrap();
     }
 
     #[cfg(unix)]

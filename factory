@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly FACTORY_PROJECT_NAME='software-factory'
+readonly FACTORY_PROJECT_NAME=${FACTORY_PROJECT_NAME:-software-factory}
 readonly DEFAULT_FACTORY_IMAGE='ghcr.io/fpolica91/software-factory:edge'
 
 resolve_product_root() {
@@ -45,6 +45,9 @@ sha256_text() {
 
 readonly PRODUCT_ROOT=$(resolve_product_root)
 readonly COMPOSE_FILE=$PRODUCT_ROOT/docker-compose.yml
+readonly KUBERNETES_COMPOSE_FILE=$PRODUCT_ROOT/docker-compose.kubernetes.yml
+readonly KUBERNETES_WORKSPACE_TEMPLATE=$PRODUCT_ROOT/deploy/k3s/single-node-workspaces.yaml
+readonly BACKEND_MARKER=$PRODUCT_ROOT/.factory-execution-backend
 readonly ENV_FILE=$PRODUCT_ROOT/.env
 readonly ENV_EXAMPLE=$PRODUCT_ROOT/.env.example
 readonly PROJECT_DIR=$(find_project_dir)
@@ -59,13 +62,25 @@ export FACTORY_HOST_REPOSITORY_ID=$HOST_REPOSITORY_ID
 export FACTORY_RUN_AS_UID=$HOST_UID
 export FACTORY_RUN_AS_GID=$HOST_GID
 
-COMPOSE=(
+BASE_COMPOSE=(
   docker compose
   --project-directory "$PRODUCT_ROOT"
   --env-file "$ENV_FILE"
   --file "$COMPOSE_FILE"
   --project-name "$FACTORY_PROJECT_NAME"
 )
+COMPOSE=("${BASE_COMPOSE[@]}")
+EXECUTION_BACKEND=''
+KUBECTL=()
+KUBERNETES_PREFLIGHTED=0
+KUBERNETES_NODE_NAME=''
+KUBERNETES_WORKSPACE_HOST_DIR=''
+KUBERNETES_NAMESPACE=''
+KUBERNETES_WORKSPACE_PVC=''
+KUBERNETES_WORKSPACE_PV=''
+KUBERNETES_WORKSPACE_SIZE_GIB=''
+KUBERNETES_RUNTIME_CLASS=''
+KUBERNETES_RUNTIME_HANDLER=''
 
 die() {
   printf 'factory: %s\n' "$*" >&2
@@ -136,6 +151,59 @@ compose() {
   "${COMPOSE[@]}" "$@"
 }
 
+base_compose_environment_value() {
+  local key=$1 environment line value=''
+  environment=$("${BASE_COMPOSE[@]}" config --environment) ||
+    die "cannot read Compose environment from $ENV_FILE"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$key="* ]]; then
+      value=${line#*=}
+    fi
+  done <<< "$environment"
+  printf '%s' "$value"
+}
+
+select_execution_backend() {
+  local backend workspace_host_dir kubeconfig namespace pvc pv slug
+  [[ -z "$EXECUTION_BACKEND" ]] || return
+  validate_factory_project_name
+  backend=$(base_compose_environment_value FACTORY_EXECUTION_ENVIRONMENT_BACKEND)
+  backend=${backend:-docker}
+  case "$backend" in
+    docker)
+      EXECUTION_BACKEND=docker
+      ;;
+    kubernetes)
+      [[ -f "$KUBERNETES_COMPOSE_FILE" ]] || die "missing $KUBERNETES_COMPOSE_FILE"
+      workspace_host_dir=$(base_compose_environment_value FACTORY_KUBERNETES_WORKSPACE_HOST_DIR)
+      if [[ -z "$workspace_host_dir" ]]; then
+        workspace_host_dir=${XDG_DATA_HOME:-$HOME/.local/share}/software-factory/$FACTORY_PROJECT_NAME/workspaces
+      fi
+      validate_workspace_host_path "$workspace_host_dir"
+      kubeconfig=$(base_compose_environment_value FACTORY_KUBERNETES_KUBECONFIG)
+      kubeconfig=${kubeconfig:-${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/k3s.yaml}
+      slug=$(kubernetes_project_slug)
+      namespace=$(base_compose_environment_value FACTORY_KUBERNETES_NAMESPACE)
+      namespace=${namespace:-$slug-execution}
+      pvc=$(base_compose_environment_value FACTORY_KUBERNETES_WORKSPACE_PVC)
+      pvc=${pvc:-$slug-workspaces}
+      pv=$(base_compose_environment_value FACTORY_KUBERNETES_WORKSPACE_PV)
+      pv=${pv:-$slug-workspaces-pv}
+      validate_dns_label FACTORY_KUBERNETES_NAMESPACE "$namespace"
+      validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PVC "$pvc"
+      validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PV "$pv"
+      export FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
+      export FACTORY_KUBERNETES_KUBECONFIG=$kubeconfig
+      export FACTORY_KUBERNETES_NAMESPACE=$namespace
+      export FACTORY_KUBERNETES_WORKSPACE_PVC=$pvc
+      export FACTORY_KUBERNETES_WORKSPACE_PV=$pv
+      COMPOSE+=(--file "$KUBERNETES_COMPOSE_FILE")
+      EXECUTION_BACKEND=kubernetes
+      ;;
+    *) die "unsupported FACTORY_EXECUTION_ENVIRONMENT_BACKEND: $backend" ;;
+  esac
+}
+
 # Docker Compose is the process that expands .env into every service. Reading
 # its canonical environment here keeps launcher preflight and per-job pinning
 # byte-for-byte aligned with the worker, including quoted literal characters.
@@ -156,6 +224,302 @@ require_docker() {
   docker compose version >/dev/null 2>&1 || die 'Docker Compose is required'
   docker info >/dev/null 2>&1 || die 'Docker is not running'
   [[ -f "$COMPOSE_FILE" ]] || die "missing $COMPOSE_FILE"
+}
+
+compose_volume_exists() {
+  local volume_name=$1
+  docker volume ls --quiet \
+    --filter "label=com.docker.compose.project=$FACTORY_PROJECT_NAME" \
+    --filter "label=com.docker.compose.volume=$volume_name" | grep -q .
+}
+
+read_backend_marker() {
+  local marker
+  [[ -f "$BACKEND_MARKER" && ! -L "$BACKEND_MARKER" ]] ||
+    die "invalid Factory backend marker: $BACKEND_MARKER"
+  marker=$(< "$BACKEND_MARKER")
+  case "$marker" in
+    docker | kubernetes) printf '%s' "$marker" ;;
+    *) die "invalid Factory backend marker contents: $BACKEND_MARKER" ;;
+  esac
+}
+
+write_backend_marker() {
+  local backend=$1 temporary
+  temporary=$(mktemp "$PRODUCT_ROOT/.factory-execution-backend.tmp.XXXXXX")
+  printf '%s\n' "$backend" > "$temporary"
+  chmod 600 "$temporary"
+  if ln -- "$temporary" "$BACKEND_MARKER" 2>/dev/null; then
+    rm -f -- "$temporary"
+    return
+  fi
+  rm -f -- "$temporary"
+  [[ -f "$BACKEND_MARKER" ]] || die "cannot create Factory backend marker: $BACKEND_MARKER"
+}
+
+enforce_execution_backend() {
+  local installed_backend
+  if [[ ! -e "$BACKEND_MARKER" && ! -L "$BACKEND_MARKER" ]]; then
+    if compose_volume_exists workspaces || compose_volume_exists postgres-data; then
+      write_backend_marker docker
+    else
+      if [[ "$EXECUTION_BACKEND" == kubernetes ]]; then
+        preflight_kubernetes_profile
+      fi
+      write_backend_marker "$EXECUTION_BACKEND"
+    fi
+  fi
+  installed_backend=$(read_backend_marker)
+  [[ "$installed_backend" == "$EXECUTION_BACKEND" ]] ||
+    die "this Factory installation is pinned to the '$installed_backend' execution backend, not '$EXECUTION_BACKEND'. Use a fresh Factory checkout with its own FACTORY_PROJECT_NAME and data volumes; automatic backend migration is not supported."
+}
+
+validate_dns_label() {
+  local name=$1 value=$2
+  [[ ${#value} -le 63 && "$value" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+    die "$name must be a Kubernetes DNS label"
+}
+
+validate_dns_subdomain() {
+  local name=$1 value=$2 label
+  local -a labels
+  [[ ${#value} -le 253 && "$value" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] ||
+    die "$name must be a Kubernetes DNS subdomain"
+  IFS='.' read -r -a labels <<< "$value"
+  (( ${#labels[@]} > 0 )) || die "$name must be a Kubernetes DNS subdomain"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 && "$label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+      die "$name must be a Kubernetes DNS subdomain"
+  done
+}
+
+validate_factory_project_name() {
+  [[ "$FACTORY_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+    die 'FACTORY_PROJECT_NAME must start with a lowercase letter or digit and contain only lowercase letters, digits, underscore, and hyphen'
+}
+
+validate_kubernetes_image_reference() {
+  local image=$1 name registry repository host port component label
+  local -a components labels
+  [[ "$image" =~ ^([^@]+)@sha256:([0-9a-f]{64})$ ]] ||
+    die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  name=${BASH_REMATCH[1]}
+  [[ ${#name} -le 255 && "$name" != *:*:* && "$name" == */* ]] ||
+    die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  registry=${name%%/*}
+  repository=${name#*/}
+  [[ -n "$repository" && "$repository" != /* && "$repository" != */ && "$repository" != *//* ]] ||
+    die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  host=$registry
+  if [[ "$registry" == *:* ]]; then
+    host=${registry%:*}
+    port=${registry##*:}
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] &&
+      (( 10#$port >= 1 && 10#$port <= 65535 )) ||
+      die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  fi
+  [[ ${#host} -le 253 && "$host" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] ||
+    die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  IFS='.' read -r -a labels <<< "$host"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 && "$label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+      die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  done
+  IFS='/' read -r -a components <<< "$repository"
+  (( ${#components[@]} > 0 )) ||
+    die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  for component in "${components[@]}"; do
+    [[ "$component" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] ||
+      die 'FACTORY_KUBERNETES_IMAGE must be an immutable registry digest, such as ghcr.io/org/image@sha256:<64 lowercase hex characters>'
+  done
+}
+
+kubernetes_project_slug() {
+  local normalized hash
+  normalized=$(printf '%s' "$FACTORY_PROJECT_NAME" | sed -E 's/[-_]+/-/g; s/-$//')
+  if [[ "$normalized" != "$FACTORY_PROJECT_NAME" || ${#normalized} -gt 49 ]]; then
+    hash=$(sha256_text "$FACTORY_PROJECT_NAME")
+    normalized=${normalized:0:40}
+    normalized=${normalized%-}
+    normalized=$normalized-${hash:0:8}
+  fi
+  [[ ${#normalized} -le 49 && "$normalized" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+    die 'FACTORY_PROJECT_NAME cannot be converted to a Kubernetes DNS-1123 slug'
+  printf '%s' "$normalized"
+}
+
+validate_workspace_host_path() {
+  local path=$1
+  [[ "$path" == /* ]] ||
+    die 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR must be an absolute path'
+  [[ "$path" != / && "$path" != "$HOME" ]] ||
+    die 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR must not be a broad host directory'
+  [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
+    die 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR may contain only letters, digits, dot, underscore, slash, and hyphen'
+  [[ "$path" != *'/../'* && "$path" != */.. ]] ||
+    die 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR contains an unsafe path component'
+}
+
+positive_integer() {
+  local name=$1 value=$2
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
+}
+
+select_kubectl() {
+  local kubeconfig=$1
+  if command -v kubectl >/dev/null 2>&1; then
+    KUBECTL=(kubectl --kubeconfig "$kubeconfig")
+  elif command -v k3s >/dev/null 2>&1; then
+    KUBECTL=(k3s kubectl --kubeconfig "$kubeconfig")
+  else
+    die 'Kubernetes mode requires kubectl or k3s on the host'
+  fi
+}
+
+sed_replacement() {
+  printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+}
+
+preflight_kubernetes_profile() {
+  local kubeconfig image workspace_host_dir workspace_root namespace pvc pv
+  local cpu_request memory_request cpu_limit memory_limit readiness_seconds storage_gib
+  local nodes node_count node_name kubeconfig_quoted runtime_class runtime_handler=''
+
+  (( KUBERNETES_PREFLIGHTED == 0 )) || return
+
+  [[ "$(uname -s)" == Linux ]] || die 'Kubernetes execution is currently supported only on Linux hosts'
+  kubeconfig=$(compose_environment_value FACTORY_KUBERNETES_KUBECONFIG)
+  kubeconfig=${kubeconfig:-${XDG_CONFIG_HOME:-$HOME/.config}/software-factory/k3s.yaml}
+  export FACTORY_KUBERNETES_KUBECONFIG=$kubeconfig
+  [[ "$kubeconfig" == /* ]] || die 'FACTORY_KUBERNETES_KUBECONFIG must be an absolute path'
+  if [[ ! -f "$kubeconfig" || ! -r "$kubeconfig" ]]; then
+    printf -v kubeconfig_quoted '%q' "$kubeconfig"
+    die "K3s kubeconfig must be readable by UID $HOST_UID at $kubeconfig. Run once: sudo install -D -m 600 -o $HOST_UID -g $HOST_GID /etc/rancher/k3s/k3s.yaml $kubeconfig_quoted"
+  fi
+  image=$(compose_environment_value FACTORY_KUBERNETES_IMAGE)
+  validate_kubernetes_image_reference "$image"
+  export FACTORY_KUBERNETES_IMAGE=$image
+
+  workspace_host_dir=$FACTORY_KUBERNETES_WORKSPACE_HOST_DIR
+  validate_workspace_host_path "$workspace_host_dir"
+
+  workspace_root=$(compose_environment_value FACTORY_KUBERNETES_WORKSPACE_ROOT)
+  workspace_root=${workspace_root:-/workspaces}
+  [[ "$workspace_root" == /workspaces ]] ||
+    die 'the single-node profile requires FACTORY_KUBERNETES_WORKSPACE_ROOT=/workspaces'
+  namespace=$(compose_environment_value FACTORY_KUBERNETES_NAMESPACE)
+  pvc=$(compose_environment_value FACTORY_KUBERNETES_WORKSPACE_PVC)
+  pv=$FACTORY_KUBERNETES_WORKSPACE_PV
+  validate_dns_label FACTORY_KUBERNETES_NAMESPACE "$namespace"
+  validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PVC "$pvc"
+  validate_dns_label FACTORY_KUBERNETES_WORKSPACE_PV "$pv"
+
+  cpu_request=$(compose_environment_value FACTORY_KUBERNETES_CPU_REQUEST_MILLIS)
+  memory_request=$(compose_environment_value FACTORY_KUBERNETES_MEMORY_REQUEST_MIB)
+  cpu_limit=$(compose_environment_value FACTORY_KUBERNETES_CPU_LIMIT_MILLIS)
+  memory_limit=$(compose_environment_value FACTORY_KUBERNETES_MEMORY_LIMIT_MIB)
+  readiness_seconds=$(compose_environment_value FACTORY_KUBERNETES_READINESS_TIMEOUT_SECONDS)
+  storage_gib=$(compose_environment_value FACTORY_KUBERNETES_WORKSPACE_SIZE_GIB)
+  cpu_request=${cpu_request:-500}
+  memory_request=${memory_request:-1024}
+  cpu_limit=${cpu_limit:-2000}
+  memory_limit=${memory_limit:-4096}
+  readiness_seconds=${readiness_seconds:-120}
+  storage_gib=${storage_gib:-50}
+  positive_integer FACTORY_KUBERNETES_CPU_REQUEST_MILLIS "$cpu_request"
+  positive_integer FACTORY_KUBERNETES_MEMORY_REQUEST_MIB "$memory_request"
+  positive_integer FACTORY_KUBERNETES_CPU_LIMIT_MILLIS "$cpu_limit"
+  positive_integer FACTORY_KUBERNETES_MEMORY_LIMIT_MIB "$memory_limit"
+  positive_integer FACTORY_KUBERNETES_READINESS_TIMEOUT_SECONDS "$readiness_seconds"
+  positive_integer FACTORY_KUBERNETES_WORKSPACE_SIZE_GIB "$storage_gib"
+  (( cpu_limit >= cpu_request )) || die 'Kubernetes CPU limit must be at least its request'
+  (( memory_limit >= memory_request )) || die 'Kubernetes memory limit must be at least its request'
+
+  select_kubectl "$kubeconfig"
+  nodes=$("${KUBECTL[@]}" get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}') ||
+    die 'cannot list Kubernetes nodes with the configured kubeconfig'
+  node_count=$(printf '%s\n' "$nodes" | awk 'NF { count++ } END { print count + 0 }')
+  [[ "$node_count" == 1 ]] || die "the single-node profile requires exactly one Kubernetes node; found $node_count"
+  node_name=$(printf '%s\n' "$nodes" | awk 'NF { print; exit }')
+  [[ -n "$node_name" && "$node_name" != *$'\n'* ]] || die 'Kubernetes returned an invalid node name'
+
+  runtime_class=$(compose_environment_value FACTORY_KUBERNETES_RUNTIME_CLASS)
+  if [[ -n "$runtime_class" ]]; then
+    validate_dns_subdomain FACTORY_KUBERNETES_RUNTIME_CLASS "$runtime_class"
+    if ! runtime_handler=$("${KUBECTL[@]}" get runtimeclass "$runtime_class" -o 'jsonpath={.handler}' 2>/dev/null); then
+      die "configured Kubernetes RuntimeClass '$runtime_class' is unavailable; install it or clear FACTORY_KUBERNETES_RUNTIME_CLASS"
+    fi
+    [[ -n "$runtime_handler" ]] ||
+      die "configured Kubernetes RuntimeClass '$runtime_class' has no handler"
+  fi
+  [[ -f "$KUBERNETES_WORKSPACE_TEMPLATE" ]] || die "missing $KUBERNETES_WORKSPACE_TEMPLATE"
+
+  KUBERNETES_NODE_NAME=$node_name
+  KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
+  KUBERNETES_NAMESPACE=$namespace
+  KUBERNETES_WORKSPACE_PVC=$pvc
+  KUBERNETES_WORKSPACE_PV=$pv
+  KUBERNETES_WORKSPACE_SIZE_GIB=$storage_gib
+  KUBERNETES_RUNTIME_CLASS=$runtime_class
+  KUBERNETES_RUNTIME_HANDLER=$runtime_handler
+  KUBERNETES_PREFLIGHTED=1
+}
+
+prepare_kubernetes_profile() {
+  local rendered workspace_host_dir
+
+  preflight_kubernetes_profile
+  workspace_host_dir=$KUBERNETES_WORKSPACE_HOST_DIR
+  mkdir -p -- "$workspace_host_dir"
+  workspace_host_dir=$(cd -P "$workspace_host_dir" && pwd)
+  validate_workspace_host_path "$workspace_host_dir"
+  chown "$HOST_UID:$HOST_GID" "$workspace_host_dir"
+  export FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
+
+  rendered=$(mktemp "${TMPDIR:-/tmp}/factory-k3s-workspaces.XXXXXX.yaml")
+  sed \
+    -e "s|__FACTORY_NAMESPACE__|$(sed_replacement "$KUBERNETES_NAMESPACE")|g" \
+    -e "s|__FACTORY_WORKSPACE_PV__|$(sed_replacement "$KUBERNETES_WORKSPACE_PV")|g" \
+    -e "s|__FACTORY_WORKSPACE_PVC__|$(sed_replacement "$KUBERNETES_WORKSPACE_PVC")|g" \
+    -e "s|__FACTORY_WORKSPACE_HOST_DIR__|$(sed_replacement "$workspace_host_dir")|g" \
+    -e "s|__FACTORY_KUBERNETES_NODE_NAME__|$(sed_replacement "$KUBERNETES_NODE_NAME")|g" \
+    -e "s|__FACTORY_WORKSPACE_SIZE_GIB__|$(sed_replacement "$KUBERNETES_WORKSPACE_SIZE_GIB")|g" \
+    "$KUBERNETES_WORKSPACE_TEMPLATE" > "$rendered"
+  if ! "${KUBECTL[@]}" apply -f "$rendered" >/dev/null; then
+    rm -f -- "$rendered"
+    die 'cannot apply the single-node Factory workspace manifest'
+  fi
+  rm -f -- "$rendered"
+  if [[ -n "$KUBERNETES_RUNTIME_CLASS" ]]; then
+    printf 'Factory execution backend: kubernetes (worker factory-worker, node %s, RuntimeClass %s, handler %s)\n' \
+      "$KUBERNETES_NODE_NAME" "$KUBERNETES_RUNTIME_CLASS" "$KUBERNETES_RUNTIME_HANDLER" >&2
+  else
+    printf 'Factory execution backend: kubernetes (worker factory-worker, node %s, cluster-default runtime)\n' \
+      "$KUBERNETES_NODE_NAME" >&2
+  fi
+}
+
+configure_kubernetes_provider_url() {
+  local provider=$1 configured port
+  [[ "$EXECUTION_BACKEND" == kubernetes ]] || return
+  case "$provider" in
+    anthropic | claude)
+      port=$(compose_environment_value CLAUDE_PROVIDER_PORT)
+      export FACTORY_KUBERNETES_PROVIDER_BASE_URL="http://127.0.0.1:${port:-10103}/v1"
+      ;;
+    deepseek)
+      port=$(compose_environment_value DEEPSEEK_PROVIDER_PORT)
+      export FACTORY_KUBERNETES_PROVIDER_BASE_URL="http://127.0.0.1:${port:-10102}/v1"
+      ;;
+    zai)
+      port=$(compose_environment_value FACTORY_PROVIDER_PORT)
+      export FACTORY_KUBERNETES_PROVIDER_BASE_URL="http://127.0.0.1:${port:-10101}/v1"
+      ;;
+    openai)
+      configured=$(compose_environment_value FACTORY_PROVIDER_BASE_URL)
+      export FACTORY_KUBERNETES_PROVIDER_BASE_URL=$configured
+      ;;
+  esac
 }
 
 factory_image() {
@@ -272,12 +636,20 @@ up_stack() {
   local provider profile
   local services=(postgres qdrant factoryd)
   ensure_env_file
-  ensure_artifact_root
+  select_execution_backend
   require_docker
+  enforce_execution_backend
+  ensure_artifact_root
   ensure_provider_configuration
   pull_factory_image
   provider=$(compose_environment_value FACTORY_PROVIDER_ADAPTER)
   profile=$(provider_profile "$provider")
+  configure_kubernetes_provider_url "$provider"
+  if [[ "$EXECUTION_BACKEND" == kubernetes ]]; then
+    prepare_kubernetes_profile
+  else
+    printf 'Factory execution backend: docker (worker factory-worker)\n' >&2
+  fi
   reconcile_provider_services "$provider"
   if [[ -n "$profile" ]]; then
     services+=("$profile-provider")
@@ -292,8 +664,10 @@ up_stack() {
 
 up_coordinator() {
   ensure_env_file
-  ensure_artifact_root
+  select_execution_backend
   require_docker
+  enforce_execution_backend
+  ensure_artifact_root
   pull_factory_image
   compose up -d --wait --wait-timeout 180 --remove-orphans postgres factoryd
 }
@@ -495,7 +869,9 @@ main() {
     logs)
       (( $# == 1 )) || die 'usage: factory logs'
       ensure_env_file
+      select_execution_backend
       require_docker
+      enforce_execution_backend
       follow_logs
       ;;
     up)
@@ -505,7 +881,9 @@ main() {
     down)
       (( $# == 1 )) || die 'usage: factory down'
       ensure_env_file
+      select_execution_backend
       require_docker
+      enforce_execution_backend
       compose --profile '*' down --remove-orphans
       ;;
     build)

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::bail;
+use codex_app_server_client::EnvironmentManager;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
@@ -29,6 +30,7 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -36,6 +38,7 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_config::AbsolutePathBuf;
+use codex_exec_server::EnvironmentConnectionState;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -43,10 +46,16 @@ use factory_coordinator::CancellationHandle;
 use factory_extension::FACTORY_STAGE_METADATA_KEY;
 use factory_extension::FactoryStateBackend;
 use factory_extension::FactoryTurnStage;
+use tokio::sync::watch;
 
 use crate::events::AttemptEventWriter;
 
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
+// Codex retains remote exec sessions for 30 seconds and spends at most 25
+// seconds recovering them. Give its native recovery loop that full budget,
+// then return control to Factory's durable retry loop instead of allowing the
+// model to retry failed tools indefinitely.
+const REMOTE_RECOVERY_GRACE: Duration = Duration::from_secs(30);
 // Upstream bounds its own drain at 45 seconds. The outer bound also covers a
 // shutdown command that cannot be enqueued.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(50);
@@ -108,6 +117,8 @@ pub struct AutonomousSession {
     runtime_workspace_roots: Vec<AbsolutePathBuf>,
     model: String,
     model_provider: String,
+    environments: Option<Vec<TurnEnvironmentParams>>,
+    remote_environment: Option<RemoteEnvironmentMonitor>,
     active_turn: Option<TurnCorrelation>,
     latest_turn: Option<TurnCorrelation>,
 }
@@ -123,6 +134,13 @@ impl AutonomousSession {
         factory_stage: FactoryTurnStage,
         parent: ParentThread,
     ) -> SessionResult<(Self, ThreadCorrelation)> {
+        let environments = default_turn_environments(
+            args.environment_manager.as_ref(),
+            &args.config.cwd,
+            &args.config.workspace_roots,
+        );
+        let remote_environment =
+            default_remote_environment_monitor(args.environment_manager.as_ref());
         let requested = RequestedThread {
             cwd: args.config.cwd.clone(),
             runtime_workspace_roots: args.config.workspace_roots.clone(),
@@ -130,6 +148,7 @@ impl AutonomousSession {
             model_provider: args.config.model_provider_id.clone(),
             developer_instructions: args.config.developer_instructions.clone(),
             ephemeral: args.config.ephemeral,
+            environments: environments.clone(),
         };
         let client =
             crate::in_process::start_with_backend(args, backend, repository_id, factory_stage)
@@ -163,6 +182,8 @@ impl AutonomousSession {
             runtime_workspace_roots: effective.runtime_workspace_roots,
             model: effective.model,
             model_provider: effective.model_provider,
+            environments,
+            remote_environment,
             active_turn: None,
             latest_turn: None,
         };
@@ -254,28 +275,12 @@ impl AutonomousSession {
             bail!("turn prompt must not be empty");
         }
         let request_id = self.request_ids.next();
+        let params = self.text_turn_params(prompt, sandbox_policy, mode, factory_stage);
         let response: TurnStartResponse = self
             .client()?
             .request_typed(ClientRequest::TurnStart {
                 request_id: request_id.clone(),
-                params: TurnStartParams {
-                    thread_id: self.parent.thread_id.clone(),
-                    input: vec![UserInput::Text {
-                        text: prompt,
-                        text_elements: Vec::new(),
-                    }],
-                    cwd: Some(self.cwd.to_path_buf()),
-                    runtime_workspace_roots: Some(self.runtime_workspace_roots.clone()),
-                    approval_policy: Some(AskForApproval::Never),
-                    sandbox_policy: Some(sandbox_policy),
-                    model: Some(self.model.clone()),
-                    collaboration_mode: Some(native_collaboration_mode(&self.model, mode)),
-                    responsesapi_client_metadata: Some(HashMap::from([(
-                        FACTORY_STAGE_METADATA_KEY.to_string(),
-                        factory_stage.as_wire_name().to_string(),
-                    )])),
-                    ..TurnStartParams::default()
-                },
+                params,
             })
             .await
             .context("turn/start")?;
@@ -284,6 +289,34 @@ impl AutonomousSession {
             thread_id: self.parent.thread_id.clone(),
             turn_id: response.turn.id,
         }))
+    }
+
+    fn text_turn_params(
+        &self,
+        prompt: String,
+        sandbox_policy: SandboxPolicy,
+        mode: ModeKind,
+        factory_stage: FactoryTurnStage,
+    ) -> TurnStartParams {
+        TurnStartParams {
+            thread_id: self.parent.thread_id.clone(),
+            input: vec![UserInput::Text {
+                text: prompt,
+                text_elements: Vec::new(),
+            }],
+            environments: self.environments.clone(),
+            cwd: Some(self.cwd.to_path_buf()),
+            runtime_workspace_roots: Some(self.runtime_workspace_roots.clone()),
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_policy: Some(sandbox_policy),
+            model: Some(self.model.clone()),
+            collaboration_mode: Some(native_collaboration_mode(&self.model, mode)),
+            responsesapi_client_metadata: Some(HashMap::from([(
+                FACTORY_STAGE_METADATA_KEY.to_string(),
+                factory_stage.as_wire_name().to_string(),
+            )])),
+            ..TurnStartParams::default()
+        }
     }
 
     /// Starts a detached native `review/start` using custom instructions.
@@ -307,6 +340,9 @@ impl AutonomousSession {
             bail!("review durable state key must not be empty");
         }
         let request_id = self.request_ids.next();
+        // Detached review has no environment field of its own. Codex starts it
+        // from this session's manager, whose configured remote mode has only a
+        // remote default; native thread-spawn subagents inherit the parent turn.
         let response: ReviewStartResponse = self
             .client()?
             .request_typed(ClientRequest::ReviewStart {
@@ -342,11 +378,34 @@ impl AutonomousSession {
             .active_turn
             .clone()
             .context("session has no active turn")?;
+        let mut remote_recovery = None;
+        if let Some(environment) = self.remote_environment.as_ref()
+            && environment.current_state() == EnvironmentConnectionState::Disconnected
+            && let Some(kind) = update_remote_recovery(
+                &environment.environment_id,
+                EnvironmentConnectionState::Disconnected,
+                &mut remote_recovery,
+            )
+        {
+            events
+                .emit(
+                    kind,
+                    remote_environment_event_payload(kind, &environment.environment_id),
+                )
+                .await?;
+        }
         loop {
             let next = {
                 let client = self.client.as_mut().context("session is closed")?;
                 tokio::select! {
+                    biased;
                     _ = cancellation.cancelled() => NextEvent::Cancelled,
+                    _ = wait_for_remote_recovery(remote_recovery.as_ref()) => {
+                        NextEvent::RemoteRecoveryExpired
+                    }
+                    state = wait_for_remote_environment(self.remote_environment.as_mut()) => {
+                        NextEvent::RemoteEnvironment(state)
+                    }
                     event = client.next_event() => NextEvent::Server(event),
                 }
             };
@@ -361,6 +420,74 @@ impl AutonomousSession {
                         )
                         .await;
                     return self.cancel(active).await;
+                }
+                NextEvent::RemoteRecoveryExpired => {
+                    if self.remote_environment.as_ref().is_some_and(|environment| {
+                        environment.current_state() == EnvironmentConnectionState::Connected
+                    }) {
+                        if let Some(recovery) = remote_recovery.take() {
+                            events
+                                .emit(
+                                    "environment.connected",
+                                    remote_environment_event_payload(
+                                        "environment.connected",
+                                        &recovery.environment_id,
+                                    ),
+                                )
+                                .await?;
+                        }
+                        continue;
+                    }
+                    let recovery = remote_recovery
+                        .take()
+                        .context("remote recovery timer expired without an environment")?;
+                    let message = format!(
+                        "remote execution environment `{}` remained disconnected for {} seconds",
+                        recovery.environment_id,
+                        REMOTE_RECOVERY_GRACE.as_secs()
+                    );
+                    events
+                        .emit(
+                            "turn.error",
+                            serde_json::json!({
+                                "message": message,
+                                "environmentId": recovery.environment_id,
+                            }),
+                        )
+                        .await?;
+                    let cleanup = self.cancel::<()>(active.clone()).await;
+                    let cleanup =
+                        cleanup.expect_err("cancelling an active turn always returns an error");
+                    bail!("{message}; {cleanup}");
+                }
+                NextEvent::RemoteEnvironment(Some(state)) => {
+                    let environment_id = self
+                        .remote_environment
+                        .as_ref()
+                        .map(|environment| environment.environment_id.clone())
+                        .context("remote environment state changed without a monitor")?;
+                    if let Some(kind) =
+                        update_remote_recovery(&environment_id, state, &mut remote_recovery)
+                    {
+                        events
+                            .emit(
+                                kind,
+                                remote_environment_event_payload(kind, &environment_id),
+                            )
+                            .await?;
+                    }
+                    continue;
+                }
+                NextEvent::RemoteEnvironment(None) => {
+                    self.remote_environment = None;
+                    let message = "remote execution environment connection monitor closed";
+                    events
+                        .emit("turn.error", serde_json::json!({ "message": message }))
+                        .await?;
+                    let cleanup = self.cancel::<()>(active.clone()).await;
+                    let cleanup =
+                        cleanup.expect_err("cancelling an active turn always returns an error");
+                    bail!("{message}; {cleanup}");
                 }
                 NextEvent::Server(Some(event)) => event,
                 NextEvent::Server(None) => {
@@ -551,6 +678,7 @@ struct RequestedThread {
     model_provider: String,
     developer_instructions: Option<String>,
     ephemeral: bool,
+    environments: Option<Vec<TurnEnvironmentParams>>,
 }
 
 impl RequestedThread {
@@ -565,6 +693,7 @@ impl RequestedThread {
             permissions: None,
             developer_instructions: self.developer_instructions.clone(),
             ephemeral: Some(self.ephemeral),
+            environments: self.environments.clone(),
             ..ThreadStartParams::default()
         }
     }
@@ -584,6 +713,39 @@ impl RequestedThread {
             ..ThreadResumeParams::default()
         }
     }
+}
+
+fn default_turn_environments(
+    manager: &EnvironmentManager,
+    cwd: &AbsolutePathBuf,
+    runtime_workspace_roots: &[AbsolutePathBuf],
+) -> Option<Vec<TurnEnvironmentParams>> {
+    manager.default_environment_id().map(|environment_id| {
+        vec![TurnEnvironmentParams {
+            environment_id: environment_id.to_string(),
+            cwd: cwd.clone().into(),
+            runtime_workspace_roots: Some(
+                runtime_workspace_roots
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+            ),
+        }]
+    })
+}
+
+fn default_remote_environment_monitor(
+    manager: &EnvironmentManager,
+) -> Option<RemoteEnvironmentMonitor> {
+    let environment_id = manager.default_environment_id()?.to_string();
+    let connection_state = manager
+        .default_environment()?
+        .subscribe_connection_state()?;
+    Some(RemoteEnvironmentMonitor {
+        environment_id,
+        connection_state,
+    })
 }
 
 struct EffectiveThread {
@@ -706,7 +868,82 @@ impl RequestIdSequence {
 
 enum NextEvent {
     Cancelled,
+    RemoteRecoveryExpired,
+    RemoteEnvironment(Option<EnvironmentConnectionState>),
     Server(Option<InProcessServerEvent>),
+}
+
+#[derive(Debug)]
+struct RemoteEnvironmentMonitor {
+    environment_id: String,
+    connection_state: watch::Receiver<EnvironmentConnectionState>,
+}
+
+impl RemoteEnvironmentMonitor {
+    fn current_state(&self) -> EnvironmentConnectionState {
+        *self.connection_state.borrow()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RemoteRecovery {
+    environment_id: String,
+    deadline: tokio::time::Instant,
+}
+
+async fn wait_for_remote_recovery(recovery: Option<&RemoteRecovery>) {
+    match recovery {
+        Some(recovery) => tokio::time::sleep_until(recovery.deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn wait_for_remote_environment(
+    environment: Option<&mut RemoteEnvironmentMonitor>,
+) -> Option<EnvironmentConnectionState> {
+    let Some(environment) = environment else {
+        return std::future::pending().await;
+    };
+    environment.connection_state.changed().await.ok()?;
+    Some(*environment.connection_state.borrow_and_update())
+}
+
+fn update_remote_recovery(
+    environment_id: &str,
+    state: EnvironmentConnectionState,
+    recovery: &mut Option<RemoteRecovery>,
+) -> Option<&'static str> {
+    match state {
+        EnvironmentConnectionState::Disconnected if recovery.is_none() => {
+            *recovery = Some(RemoteRecovery {
+                environment_id: environment_id.to_string(),
+                deadline: tokio::time::Instant::now() + REMOTE_RECOVERY_GRACE,
+            });
+            Some("environment.disconnected")
+        }
+        EnvironmentConnectionState::Connected if recovery.is_some() => {
+            *recovery = None;
+            Some("environment.connected")
+        }
+        _ => None,
+    }
+}
+
+fn remote_environment_event_payload(kind: &str, environment_id: &str) -> serde_json::Value {
+    let message = match kind {
+        "environment.disconnected" => format!(
+            "Remote execution environment `{environment_id}` disconnected; waiting up to {} seconds for Codex recovery",
+            REMOTE_RECOVERY_GRACE.as_secs()
+        ),
+        "environment.connected" => {
+            format!("Remote execution environment `{environment_id}` reconnected")
+        }
+        _ => format!("Remote execution environment `{environment_id}` changed state"),
+    };
+    serde_json::json!({
+        "environmentId": environment_id,
+        "message": message,
+    })
 }
 
 async fn handle_server_request(
@@ -832,6 +1069,120 @@ async fn shutdown_client(client: InProcessAppServerClient) -> SessionResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_workspace() -> (AbsolutePathBuf, Vec<AbsolutePathBuf>) {
+        let cwd = AbsolutePathBuf::try_from(std::path::PathBuf::from("/workspaces/jobs/phase-one"))
+            .expect("absolute cwd");
+        (cwd.clone(), vec![cwd])
+    }
+
+    #[tokio::test]
+    async fn selected_default_environment_uses_managed_workspace_paths() {
+        let manager = EnvironmentManager::create_for_tests(
+            Some("ws://127.0.0.1:9".to_string()),
+            /*local_runtime_paths*/ None,
+        )
+        .await;
+        let (cwd, roots) = test_workspace();
+
+        let environments =
+            default_turn_environments(&manager, &cwd, &roots).expect("remote default");
+
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].environment_id, "remote");
+        assert_eq!(environments[0].cwd.as_str(), "/workspaces/jobs/phase-one");
+        assert_eq!(
+            environments[0]
+                .runtime_workspace_roots
+                .as_ref()
+                .expect("workspace roots")[0]
+                .as_str(),
+            "/workspaces/jobs/phase-one"
+        );
+    }
+
+    #[test]
+    fn thread_and_text_turn_select_the_same_environment() {
+        let (cwd, roots) = test_workspace();
+        let environments = Some(vec![TurnEnvironmentParams {
+            environment_id: "remote".to_string(),
+            cwd: cwd.clone().into(),
+            runtime_workspace_roots: Some(roots.iter().cloned().map(Into::into).collect()),
+        }]);
+        let requested = RequestedThread {
+            cwd: cwd.clone(),
+            runtime_workspace_roots: roots.clone(),
+            model: Some("test-model".to_string()),
+            model_provider: "test-provider".to_string(),
+            developer_instructions: None,
+            ephemeral: false,
+            environments: environments.clone(),
+        };
+        let session = AutonomousSession {
+            client: None,
+            request_ids: RequestIdSequence::default(),
+            parent: ThreadCorrelation {
+                request_id: RequestId::Integer(1),
+                thread_id: "thread-1".to_string(),
+            },
+            cwd,
+            runtime_workspace_roots: roots,
+            model: "test-model".to_string(),
+            model_provider: "test-provider".to_string(),
+            environments: environments.clone(),
+            remote_environment: None,
+            active_turn: None,
+            latest_turn: None,
+        };
+
+        let thread = requested.start_params();
+        let turn = session.text_turn_params(
+            "run the task".to_string(),
+            SandboxPolicy::DangerFullAccess,
+            ModeKind::Default,
+            FactoryTurnStage::Execute,
+        );
+
+        assert_eq!(thread.environments, environments);
+        assert_eq!(turn.environments, thread.environments);
+    }
+
+    #[test]
+    fn remote_recovery_uses_authoritative_connection_state() {
+        let mut recovery = None;
+        assert_eq!(
+            update_remote_recovery(
+                "remote",
+                EnvironmentConnectionState::Disconnected,
+                &mut recovery,
+            ),
+            Some("environment.disconnected")
+        );
+        let first_deadline = recovery.as_ref().expect("recovery").deadline;
+
+        assert_eq!(
+            update_remote_recovery(
+                "remote",
+                EnvironmentConnectionState::Disconnected,
+                &mut recovery,
+            ),
+            None
+        );
+        assert_eq!(
+            recovery.as_ref().expect("recovery").deadline,
+            first_deadline
+        );
+
+        assert_eq!(
+            update_remote_recovery(
+                "remote",
+                EnvironmentConnectionState::Connected,
+                &mut recovery,
+            ),
+            Some("environment.connected")
+        );
+        assert!(recovery.is_none());
+    }
 
     #[test]
     fn native_default_mode_uses_the_selected_model_and_builtin_instructions() {

@@ -155,6 +155,35 @@ impl EnvironmentManager {
         }
     }
 
+    /// Builds a fresh manager whose only environment is the caller-named remote.
+    ///
+    /// The supplied environment is selected as the default, and no local
+    /// execution fallback is configured. Uses the default WebSocket connection
+    /// timeout when none is provided.
+    pub fn remote_only(
+        environment_id: String,
+        exec_server_url: String,
+        connect_timeout: Option<std::time::Duration>,
+        http_client_factory: HttpClientFactory,
+    ) -> Result<Self, ExecServerError> {
+        let exec_server_url = validate_remote_exec_server_url(exec_server_url)?;
+        Self::from_snapshot(
+            EnvironmentProviderSnapshot {
+                environments: vec![(
+                    environment_id.clone(),
+                    ExecServerTransportParams::websocket_url(
+                        exec_server_url,
+                        connect_timeout.unwrap_or(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT),
+                    ),
+                )],
+                default: EnvironmentDefault::EnvironmentId(environment_id),
+                include_local: false,
+            },
+            /*local_runtime_paths*/ None,
+            http_client_factory,
+        )
+    }
+
     /// Builds a test-only manager from a raw exec-server URL value.
     pub async fn create_for_tests(
         exec_server_url: Option<String>,
@@ -1084,6 +1113,100 @@ mod tests {
         ));
         assert!(manager.get_environment(LOCAL_ENVIRONMENT_ID).is_none());
         assert_local_environment_unavailable(&manager);
+    }
+
+    #[tokio::test]
+    async fn remote_only_manager_uses_the_exact_caller_id_and_has_no_local_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let manager = EnvironmentManager::remote_only(
+            "job-environment-42".to_string(),
+            format!("ws://{}", listener.local_addr().expect("listener address")),
+            /*connect_timeout*/ Some(Duration::from_secs(60)),
+            HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        )
+        .expect("remote-only environment manager");
+        let default_environment = manager.default_environment().expect("default environment");
+
+        assert_eq!(manager.default_environment_id(), Some("job-environment-42"));
+        assert_eq!(
+            manager.default_environment_ids(),
+            vec!["job-environment-42".to_string()]
+        );
+        assert!(Arc::ptr_eq(
+            &default_environment,
+            &manager
+                .get_environment("job-environment-42")
+                .expect("caller-named environment")
+        ));
+        assert!(default_environment.is_remote());
+        assert_eq!(
+            manager.get_environment_status("job-environment-42").await,
+            Some(EnvironmentObservedStatus::Pending)
+        );
+        assert!(manager.get_environment_status("missing").await.is_none());
+        assert!(manager.get_environment(REMOTE_ENVIRONMENT_ID).is_none());
+        assert!(manager.get_environment(LOCAL_ENVIRONMENT_ID).is_none());
+        assert_local_environment_unavailable(&manager);
+        assert_eq!(
+            manager.http_client_factory().outbound_proxy_policy(),
+            OutboundProxyPolicy::RespectSystemProxy
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_only_managers_keep_environment_state_independent() {
+        let first_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind first websocket listener");
+        let second_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind second websocket listener");
+        let first = EnvironmentManager::remote_only(
+            "job-a".to_string(),
+            format!(
+                "ws://{}",
+                first_listener.local_addr().expect("first listener address")
+            ),
+            /*connect_timeout*/ None,
+            legacy_http_client_factory(),
+        )
+        .expect("first manager");
+        let second = EnvironmentManager::remote_only(
+            "job-b".to_string(),
+            format!(
+                "ws://{}",
+                second_listener
+                    .local_addr()
+                    .expect("second listener address")
+            ),
+            /*connect_timeout*/ None,
+            legacy_http_client_factory(),
+        )
+        .expect("second manager");
+
+        first
+            .upsert_environment(
+                "first-only".to_string(),
+                format!(
+                    "ws://{}",
+                    first_listener.local_addr().expect("first listener address")
+                ),
+                /*connect_timeout*/ None,
+            )
+            .expect("first-only environment");
+
+        assert_eq!(first.default_environment_id(), Some("job-a"));
+        assert_eq!(second.default_environment_id(), Some("job-b"));
+        assert!(first.get_environment("job-b").is_none());
+        assert!(second.get_environment("job-a").is_none());
+        assert!(first.get_environment("first-only").is_some());
+        assert!(second.get_environment("first-only").is_none());
+        assert!(!Arc::ptr_eq(
+            &first.default_environment().expect("first default"),
+            &second.default_environment().expect("second default")
+        ));
     }
 
     #[tokio::test]

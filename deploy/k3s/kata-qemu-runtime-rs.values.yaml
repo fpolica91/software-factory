@@ -1,0 +1,24 @@
+# Pinned single-node ARM64 Kata profile for the official 3.32.0 kata-deploy chart.
+# Review the chart's privileged host/containerd changes before installing it.
+k8sDistribution: k3s
+
+nodeSelector:
+  kubernetes.io/arch: arm64
+
+snapshotter:
+  setup: []
+
+shims:
+  disableAll: true
+  qemu-runtime-rs:
+    enabled: true
+
+defaultShim:
+  arm64: qemu-runtime-rs
+
+runtimeClasses:
+  enabled: true
+  createDefault: false
+
+node-feature-discovery:
+  enabled: false

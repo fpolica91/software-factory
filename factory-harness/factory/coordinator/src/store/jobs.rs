@@ -86,6 +86,7 @@ impl CoordinatorStore {
                 "continuation feedback must not be empty".to_string(),
             ));
         }
+        let _workspace_guard = self.acquire_workspace_execution(job_id).await?;
         let mut transaction = self.pool.begin().await?;
         let job_row = sqlx::query_as::<_, JobRow>(
             r#"
@@ -126,6 +127,8 @@ impl CoordinatorStore {
         if !workspace_active {
             return Err(CoordinatorError::WorkspaceNotFound(job_id.clone()));
         }
+
+        super::environments::reactivate_in_transaction(&mut transaction, job_id).await?;
 
         let next_ordinal = sqlx::query_scalar::<_, i32>(
             "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM factory_operations WHERE job_id = $1",
@@ -312,6 +315,8 @@ impl CoordinatorStore {
                     .bind(job_id.as_str())
                     .execute(&mut *transaction)
                     .await?;
+                    super::environments::request_release_in_transaction(&mut transaction, job_id)
+                        .await?;
                 }
             }
             _ => {
@@ -344,6 +349,21 @@ impl CoordinatorStore {
                 job_id,
                 state: status,
             });
+        }
+        let environment_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM factory_execution_environments WHERE job_id = $1 FOR UPDATE",
+        )
+        .bind(job_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if environment_status
+            .as_deref()
+            .is_some_and(|status| status != "released")
+        {
+            return Err(CoordinatorError::InvalidInput(format!(
+                "execution environment for cancelling job {} must be released before acknowledgement",
+                job_id
+            )));
         }
 
         sqlx::query(

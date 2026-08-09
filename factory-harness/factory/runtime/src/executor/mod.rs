@@ -11,6 +11,7 @@ use factory_coordinator::AttemptFailure;
 use factory_coordinator::CancellationHandle;
 use factory_coordinator::CoordinatorError;
 use factory_coordinator::CoordinatorStore;
+use factory_coordinator::ExecutionEnvironmentRecord;
 use factory_coordinator::ExecutionProfile;
 use factory_coordinator::OperationExecutionContext;
 use factory_coordinator::OperationExecutionResult;
@@ -26,6 +27,10 @@ use factory_extension::FactoryStateFence;
 use factory_extension::FactorydStateBackend;
 use serde_json::json;
 
+use crate::execution_environment::ExecutionEnvironmentProvisionRequest;
+use crate::execution_environment::ExecutionEnvironmentProvisioner;
+use crate::execution_environment::ExecutionEnvironmentReleaseRequest;
+use crate::execution_environment::ProvisionedExecutionEnvironment;
 use crate::session::AutonomousSession;
 use crate::session::ParentThread;
 use crate::stages::OperationKind;
@@ -64,6 +69,12 @@ pub struct CodexOperationExecutor {
     workspaces: WorkspaceManager,
     artifacts: ArtifactManager,
     execution_profile: ExecutionProfile,
+    execution_environment_provisioner: Arc<dyn ExecutionEnvironmentProvisioner>,
+}
+
+struct SelectedExecutionEnvironment {
+    environment_id: String,
+    provisioned: ProvisionedExecutionEnvironment,
 }
 
 impl CodexOperationExecutor {
@@ -72,12 +83,14 @@ impl CodexOperationExecutor {
         start_args: InProcessClientStartArgs,
         factoryd_base_url: impl Into<String>,
         execution_profile: ExecutionProfile,
+        execution_environment_provisioner: Arc<dyn ExecutionEnvironmentProvisioner>,
     ) -> Result<Self, String> {
         Self::with_max_review_cycles(
             store,
             start_args,
             factoryd_base_url,
             execution_profile,
+            execution_environment_provisioner,
             DEFAULT_MAX_REVIEW_CYCLES,
         )
     }
@@ -87,6 +100,7 @@ impl CodexOperationExecutor {
         start_args: InProcessClientStartArgs,
         factoryd_base_url: impl Into<String>,
         execution_profile: ExecutionProfile,
+        execution_environment_provisioner: Arc<dyn ExecutionEnvironmentProvisioner>,
         max_review_cycles: u32,
     ) -> Result<Self, String> {
         let factoryd_base_url = factoryd_base_url.into();
@@ -104,6 +118,7 @@ impl CodexOperationExecutor {
             workspaces,
             artifacts,
             execution_profile,
+            execution_environment_provisioner,
         })
     }
 
@@ -131,16 +146,35 @@ impl CodexOperationExecutor {
         require_text("workspace root", &workspace.root).map_err(ExecutionFailure::terminal)?;
         require_text("workspace revision", &workspace.revision)
             .map_err(ExecutionFailure::terminal)?;
-
         let workspace_guard = tokio::select! {
             _ = cancellation.cancelled() => return Err(ExecutionFailure::Cancelled),
             guard = self.store.acquire_workspace_execution(&workspace.job_id) => {
                 guard.map_err(ExecutionFailure::Coordinator)?
             }
         };
-        let result = self
-            .execute_with_workspace_guard(context, cancellation, operation, input, workspace)
-            .await;
+        let result = async {
+            if operation == OperationKind::Plan {
+                self.prepare_plan_workspace(workspace).await?;
+            }
+            let execution_environment = self
+                .ensure_execution_environment(context, workspace)
+                .await?;
+            let start_args = self.start_args_for_workspace(
+                workspace.root.as_str(),
+                &input,
+                &execution_environment,
+            )?;
+            self.execute_with_workspace_guard(
+                context,
+                cancellation,
+                operation,
+                input,
+                workspace,
+                start_args,
+            )
+            .await
+        }
+        .await;
         let release = workspace_guard.release().await;
         match (result, release) {
             (Ok(completed), Ok(())) => Ok(completed),
@@ -158,6 +192,7 @@ impl CodexOperationExecutor {
         operation: OperationKind,
         input: TaskInput,
         workspace: &WorkspaceRecord,
+        start_args: InProcessClientStartArgs,
     ) -> ExecutionResult<stage_loop::CompletedOperation> {
         let mut resume =
             ResumePoint::decode(context, operation, &workspace.root, &workspace.revision)?;
@@ -192,7 +227,6 @@ impl CodexOperationExecutor {
         let repository_id =
             factory_extension::FactoryRepositoryId::new(workspace.repository_id.clone())
                 .map_err(|error| ExecutionFailure::terminal(error.to_string()))?;
-        let start_args = self.start_args_for_workspace(workspace.root.as_str(), &input)?;
         let (mut session, thread) = match AutonomousSession::start(
             start_args,
             Arc::clone(&backend),
@@ -309,6 +343,142 @@ impl CodexOperationExecutor {
         final_result
     }
 
+    async fn ensure_execution_environment(
+        &self,
+        context: &OperationExecutionContext,
+        workspace: &WorkspaceRecord,
+    ) -> ExecutionResult<SelectedExecutionEnvironment> {
+        let provisioner = &self.execution_environment_provisioner;
+        let fence = &context.lease().fence;
+        let repository_metadata_root = self
+            .workspaces
+            .repository_metadata_root(&workspace.repository_id)
+            .map_err(ExecutionFailure::Coordinator)?;
+        let mut environment = self
+            .store
+            .ensure_execution_environment(fence, provisioner.backend())
+            .await
+            .map_err(ExecutionFailure::Coordinator)?;
+        if let Some(locator) = provisioner.durable_locator(&environment).map_err(|error| {
+            ExecutionFailure::terminal(format!(
+                "derive {} execution environment locator: {error:#}",
+                provisioner.backend()
+            ))
+        })? {
+            environment = self
+                .store
+                .reserve_execution_environment_locator(fence, environment.generation, &locator)
+                .await
+                .map_err(ExecutionFailure::Coordinator)?;
+        }
+        let provisioned = match provisioner
+            .ensure(ExecutionEnvironmentProvisionRequest {
+                environment: environment.clone(),
+                workspace_root: workspace.root.clone(),
+                repository_metadata_root,
+            })
+            .await
+        {
+            Ok(provisioned) => provisioned,
+            Err(error) => {
+                let message = format!(
+                    "provision {} execution environment {} generation {}: {error:#}",
+                    provisioner.backend(),
+                    environment.environment_id,
+                    environment.generation
+                );
+                self.store
+                    .mark_execution_environment_failed(fence, environment.generation, &message)
+                    .await
+                    .map_err(ExecutionFailure::Coordinator)?;
+                return Err(ExecutionFailure::retryable(message));
+            }
+        };
+        if let Err(message) = require_text(
+            "execution environment backend reference",
+            &provisioned.backend_ref,
+        )
+        .and_then(|()| require_text("execution environment URL", &provisioned.url))
+        {
+            self.store
+                .mark_execution_environment_failed(fence, environment.generation, &message)
+                .await
+                .map_err(ExecutionFailure::Coordinator)?;
+            return Err(ExecutionFailure::retryable(message));
+        }
+        let ready = self
+            .store
+            .mark_execution_environment_ready(
+                fence,
+                environment.generation,
+                &provisioned.backend_ref,
+                &provisioned.url,
+            )
+            .await
+            .map_err(ExecutionFailure::Coordinator)?;
+        Ok(SelectedExecutionEnvironment {
+            environment_id: ready.environment_id.as_str().to_string(),
+            provisioned,
+        })
+    }
+
+    /// Repairs only the exceptional missing/corrupt Plan worktree before any
+    /// Codex session starts. A backend that still mounts the old directory is
+    /// removed first; ordinary provisioning then recreates the same durable
+    /// environment identity and generation against the repaired root.
+    async fn prepare_plan_workspace(&self, workspace: &WorkspaceRecord) -> ExecutionResult<()> {
+        match self.workspaces.restore(workspace).await {
+            Ok(()) => Ok(()),
+            Err(CoordinatorError::WorkspaceRebindRequired { .. }) => {
+                if let Some(environment) = self
+                    .store
+                    .load_execution_environment(&workspace.job_id)
+                    .await
+                    .map_err(ExecutionFailure::Coordinator)?
+                {
+                    release_execution_environment_backend(
+                        self.execution_environment_provisioner.as_ref(),
+                        &environment,
+                    )
+                    .await
+                    .map_err(ExecutionFailure::Coordinator)?;
+                }
+                self.workspaces
+                    .recreate(workspace)
+                    .await
+                    .map_err(ExecutionFailure::Coordinator)
+            }
+            Err(error) => Err(ExecutionFailure::Coordinator(error)),
+        }
+    }
+
+    async fn reconcile_releasing_execution_environments(&self) -> factory_coordinator::Result<()> {
+        reconcile_releasing_environments(
+            &self.store,
+            self.execution_environment_provisioner.as_ref(),
+        )
+        .await
+    }
+
+    async fn release_cancelled_environment(
+        &self,
+        context: &OperationExecutionContext,
+    ) -> factory_coordinator::Result<()> {
+        let Some(environment) = self
+            .store
+            .request_cancelling_execution_environment_release(&context.lease().fence)
+            .await?
+        else {
+            return Ok(());
+        };
+        release_execution_environment(
+            &self.store,
+            self.execution_environment_provisioner.as_ref(),
+            environment,
+        )
+        .await
+    }
+
     async fn cleanup_cancelled_operation(
         &self,
         context: &OperationExecutionContext,
@@ -340,18 +510,14 @@ impl CodexOperationExecutor {
             let backend = FactorydStateBackend::new(&self.factoryd_base_url, state_fence)
                 .map_err(|error| ExecutionFailure::terminal(error.to_string()))?;
             match operation {
-                OperationKind::Plan => match resume.parent_thread_id() {
-                    Some(parent_thread_id) => {
-                        self.restore_plan_baseline(&backend, parent_thread_id, workspace)
+                OperationKind::Plan => {
+                    if let Some(parent_thread_id) = resume.parent_thread_id() {
+                        restore_factory_plan_state(&backend, parent_thread_id)
                             .await
                             .map_err(ExecutionFailure::retryable)?;
                     }
-                    None => self.workspaces.restore(workspace).await.map_err(|error| {
-                        ExecutionFailure::retryable(format!(
-                            "restore cancelled Plan worktree: {error}"
-                        ))
-                    })?,
-                },
+                    self.prepare_plan_workspace(workspace).await?;
+                }
                 OperationKind::Review | OperationKind::Remediate => {
                     if let Some(parent_thread_id) = resume.parent_thread_id() {
                         self.cleanup_detached_review(&backend, parent_thread_id, workspace)
@@ -577,12 +743,96 @@ impl OperationExecutor for CodexOperationExecutor {
         })
     }
 
+    fn release_cancelled_execution_environment(
+        &self,
+        context: OperationExecutionContext,
+    ) -> Pin<Box<dyn Future<Output = factory_coordinator::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.release_cancelled_environment(&context).await })
+    }
+
+    fn reconcile_execution_environments(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = factory_coordinator::Result<()>> + Send + '_>> {
+        Box::pin(async move { self.reconcile_releasing_execution_environments().await })
+    }
+
     fn after_successful_settlement(
         &self,
         context: OperationExecutionContext,
     ) -> Pin<Box<dyn Future<Output = factory_coordinator::Result<()>> + Send + '_>> {
         Box::pin(async move { self.publish_settled_artifacts(&context).await })
     }
+}
+
+async fn release_execution_environment(
+    store: &CoordinatorStore,
+    provisioner: &dyn ExecutionEnvironmentProvisioner,
+    environment: ExecutionEnvironmentRecord,
+) -> factory_coordinator::Result<()> {
+    release_execution_environment_backend(provisioner, &environment).await?;
+    match store
+        .mark_execution_environment_released(&environment.job_id, environment.generation)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(CoordinatorError::ExecutionEnvironmentGenerationStale { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn release_execution_environment_backend(
+    provisioner: &dyn ExecutionEnvironmentProvisioner,
+    environment: &ExecutionEnvironmentRecord,
+) -> factory_coordinator::Result<()> {
+    if environment.backend != provisioner.backend() {
+        return Err(CoordinatorError::InvalidInput(format!(
+            "execution environment {} uses backend {:?}, but this worker serves {:?}",
+            environment.environment_id,
+            environment.backend,
+            provisioner.backend()
+        )));
+    }
+    provisioner
+        .release(ExecutionEnvironmentReleaseRequest {
+            environment: environment.clone(),
+        })
+        .await
+        .map_err(|error| {
+            CoordinatorError::InvalidInput(format!(
+                "release {} execution environment {} generation {}: {error:#}",
+                provisioner.backend(),
+                environment.environment_id,
+                environment.generation
+            ))
+        })
+}
+
+async fn reconcile_releasing_environments(
+    store: &CoordinatorStore,
+    provisioner: &dyn ExecutionEnvironmentProvisioner,
+) -> factory_coordinator::Result<()> {
+    let mut failures = 0usize;
+    for environment in store
+        .list_releasing_execution_environments(provisioner.backend())
+        .await?
+    {
+        let identity = format!(
+            "{} generation {}",
+            environment.environment_id, environment.generation
+        );
+        if let Err(error) = release_execution_environment(store, provisioner, environment).await {
+            eprintln!(
+                "factory execution-environment reconciliation failed for {identity}: {error}"
+            );
+            failures += 1;
+        }
+    }
+    if failures != 0 {
+        return Err(CoordinatorError::InvalidInput(format!(
+            "{failures} execution environment release(s) remain pending"
+        )));
+    }
+    Ok(())
 }
 
 fn cancel_cleanup_error(error: ExecutionFailure) -> CoordinatorError {
@@ -623,6 +873,12 @@ impl ExecutionFailure {
 mod tests {
     use std::sync::Mutex;
 
+    use factory_coordinator::AttemptSettlement;
+    use factory_coordinator::ClaimRequest;
+    use factory_coordinator::CoordinatorInstanceId;
+    use factory_coordinator::ExecutionEnvironmentStatus;
+    use factory_coordinator::JobDefinition;
+    use factory_coordinator::OperationDefinition;
     use factory_extension::FactoryBackendFuture;
     use factory_extension::FactoryStateDurability;
 
@@ -630,6 +886,45 @@ mod tests {
 
     struct RecordingBackend {
         state: Mutex<Option<FactoryState>>,
+    }
+
+    struct ReconciliationProvisioner {
+        released: Mutex<Vec<String>>,
+        fail_environment: Mutex<Option<String>>,
+    }
+
+    impl ExecutionEnvironmentProvisioner for ReconciliationProvisioner {
+        fn backend(&self) -> &'static str {
+            "reconciliation-test"
+        }
+
+        fn ensure(
+            &self,
+            _request: ExecutionEnvironmentProvisionRequest,
+        ) -> crate::execution_environment::ProvisionFuture<'_> {
+            Box::pin(async {
+                Ok(ProvisionedExecutionEnvironment {
+                    backend_ref: "fixture".to_string(),
+                    url: "ws://fixture:4500".to_string(),
+                })
+            })
+        }
+
+        fn release(
+            &self,
+            request: ExecutionEnvironmentReleaseRequest,
+        ) -> crate::execution_environment::ReleaseFuture<'_> {
+            let environment_id = request.environment.environment_id.as_str().to_string();
+            self.released.lock().unwrap().push(environment_id.clone());
+            let should_fail =
+                self.fail_environment.lock().unwrap().as_deref() == Some(environment_id.as_str());
+            Box::pin(async move {
+                if should_fail {
+                    anyhow::bail!("deliberate release failure")
+                }
+                Ok(())
+            })
+        }
     }
 
     impl FactoryStateBackend for RecordingBackend {
@@ -675,6 +970,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires FACTORY_COORDINATOR_TEST_DATABASE_URL"]
+    async fn restart_reconciliation_processes_other_rows_and_retries_failures() {
+        let database_url = std::env::var("FACTORY_COORDINATOR_TEST_DATABASE_URL")
+            .expect("set a disposable PostgreSQL database");
+        let store = CoordinatorStore::connect(&database_url).await.unwrap();
+        store.migrate().await.unwrap();
+        let first = create_releasing_environment(&store, "first").await;
+        let second = create_releasing_environment(&store, "second").await;
+        let provisioner = ReconciliationProvisioner {
+            released: Mutex::new(Vec::new()),
+            fail_environment: Mutex::new(Some(first.environment_id.as_str().to_string())),
+        };
+
+        let error = reconcile_releasing_environments(&store, &provisioner)
+            .await
+            .expect_err("one release remains pending");
+        assert!(
+            error
+                .to_string()
+                .contains("1 execution environment release")
+        );
+        let released_ids = provisioner.released.lock().unwrap().clone();
+        assert!(released_ids.contains(&first.environment_id.as_str().to_string()));
+        assert!(released_ids.contains(&second.environment_id.as_str().to_string()));
+        assert_eq!(
+            store
+                .load_execution_environment(&first.job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionEnvironmentStatus::Releasing
+        );
+        assert_eq!(
+            store
+                .load_execution_environment(&second.job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionEnvironmentStatus::Released
+        );
+
+        *provisioner.fail_environment.lock().unwrap() = None;
+        reconcile_releasing_environments(&store, &provisioner)
+            .await
+            .expect("restart retries the persisted release");
+        assert_eq!(
+            store
+                .load_execution_environment(&first.job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionEnvironmentStatus::Released
+        );
+        assert!(
+            store
+                .list_releasing_execution_environments(provisioner.backend())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        reconcile_releasing_environments(&store, &provisioner)
+            .await
+            .expect("reconciliation is idempotent when nothing remains");
+        store.close().await;
+    }
+
     #[test]
     fn runtime_accepts_only_canonical_persisted_provider_ids() {
         let legacy = json!({
@@ -701,5 +1066,63 @@ mod tests {
             panic!("canonical Anthropic task input must pass runtime validation");
         };
         assert_eq!(input.execution_profile.unwrap().provider, "anthropic");
+    }
+
+    async fn create_releasing_environment(
+        store: &CoordinatorStore,
+        label: &str,
+    ) -> ExecutionEnvironmentRecord {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let job = store
+            .create_job(JobDefinition {
+                kind: format!("runtime-reconciliation-{label}-{nonce}"),
+                input: json!({}),
+                operations: vec![OperationDefinition {
+                    kind: "execute".to_string(),
+                    input: json!({}),
+                    max_attempts: 1,
+                }],
+            })
+            .await
+            .unwrap();
+        let lease = store
+            .claim_recovery_for_operation(
+                &job.operations[0].operation_id,
+                &ClaimRequest {
+                    owner_instance_id: CoordinatorInstanceId::new(format!(
+                        "reconciliation-{label}-{nonce}"
+                    )),
+                    lease_seconds: 60,
+                    execution_profile: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let environment = store
+            .ensure_execution_environment(&lease.fence, "reconciliation-test")
+            .await
+            .unwrap();
+        store
+            .mark_execution_environment_ready(
+                &lease.fence,
+                environment.generation,
+                &format!("backend-{}", environment.environment_id),
+                "ws://fixture:4500",
+            )
+            .await
+            .unwrap();
+        store
+            .settle_attempt(&lease.fence, AttemptSettlement::Succeeded, None)
+            .await
+            .unwrap();
+        store
+            .load_execution_environment(&job.job.job_id)
+            .await
+            .unwrap()
+            .unwrap()
     }
 }

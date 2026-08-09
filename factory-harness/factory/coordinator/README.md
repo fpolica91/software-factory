@@ -109,6 +109,15 @@ that recorded commit rather than resolving `baseRef` again. Checkpoints bind
 the root and revision to attempts; Codex only receives the selected root and
 remains the owner of tool execution inside it.
 
+Ordinary Plan rollback restores the recorded revision in place with checkout,
+hard reset, and ignored-file cleanup; it does not replace the directory mounted
+by the job's execution container. A missing or corrupt linked worktree returns
+`WorkspaceRebindRequired`. The runtime must remove that job's backend before
+calling explicit recreation and reprovisioning the same environment generation.
+`repository_metadata_root` identifies the exact Git common directory required
+beside the worktree. Workspace removal refuses any environment not durably
+released, and removal and continuation use the same per-job advisory lock.
+
 PostgreSQL advisory locks serialize each job worktree across worker and
 `factoryd` processes and serialize shared-cache publication. They use a pool
 separate from durable query/control traffic. `factory-worker` accepts 1-32

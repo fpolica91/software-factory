@@ -17,7 +17,8 @@ cutover.
 
 The deliberate upstream Codex seams in the working tree carry detached review
 history isolation and lineage into native extension state, plus generic
-per-step host-tool removal used by Factory Plan. Their hand-edited files are:
+per-step host-tool removal used by Factory Plan and explicit remote-only
+environment construction. Their hand-edited files are:
 
 - `factory-harness/codex-rs/app-server-protocol/src/protocol/v2/review.rs`
 - `factory-harness/codex-rs/app-server/src/request_processors/turn_processor.rs`
@@ -31,6 +32,7 @@ per-step host-tool removal used by Factory Plan. Their hand-edited files are:
 - `factory-harness/codex-rs/core/src/tools/router.rs`
 - `factory-harness/codex-rs/core/src/tools/spec_plan.rs`
 - `factory-harness/codex-rs/core/src/tools/spec_plan_tests.rs`
+- `factory-harness/codex-rs/exec-server/src/environment.rs`
 - Mechanical `detached_context: None` call-site updates in
   `codex-rs/app-server/tests/suite/v2/client_metadata.rs`,
   `codex-rs/app-server/tests/suite/v2/review.rs`, `codex-rs/exec/src/lib.rs`,
@@ -71,10 +73,12 @@ unplanned and must be investigated before continuing.
 - Switched the runnable container distribution from the TypeScript/Hatchet
   workflow to the native Rust `factory`, `factory-worker`, and `factoryd`
   binaries. The image no longer builds or copies `harness-client/`,
-  `workflows/`, or `integrations/` artifacts.
+  `workflows/`, or `integrations/` artifacts. The same image now also carries
+  the preserved upstream `codex` binary solely to run Codex's native
+  `exec-server`; it is not another Factory application or harness.
 - Removed Hatchet from the default Compose stack and removed its token
-  bootstrap from the host launcher. PostgreSQL, Qdrant, `factoryd`, and the
-  Rust durable worker are now the baseline services.
+  bootstrap from the host launcher. PostgreSQL, Qdrant, `factoryd`, Codex's
+  `exec-server`, and the Rust durable worker are now the baseline services.
 - Deleted the Hatchet-era external workflow idempotency and task-run
   correlation fields, ID wrappers, conflict branch, columns, and index. Native
   job, operation, attempt, request, thread, turn, and item IDs are the complete
@@ -112,7 +116,22 @@ unplanned and must be investigated before continuing.
   append/replay; `src/store/attempts.rs` owns correlations, checkpoints,
   thread state, leases, and settlement; and `src/store/recovery.rs` owns
   recovery selection and claims. No repository abstraction or duplicate store
-  surface was added. `coordinator/README.md` documents `factory-worker` and
+  surface was added. Migration 14 and `src/store/environments.rs` add exactly
+  one stable execution-environment identity per job. Its backend and optional
+  backend reference, URL, and error are lifecycle data; retries and lease
+  transfers retain the identity and generation. Provisioning, ready, and
+  failure writes require the live `AttemptFence`; release completion compares
+  the persisted generation. Terminal success, terminal failure, and queued
+  cancellation request release in the same transaction as terminal job state.
+  A running cancellation keeps the job and fence in `cancelling` while its
+  owner interrupts and drains Codex, restores disposable worktree state,
+  requests release through that fence, removes the backend, and marks it
+  released. Only then may cancellation become terminal. Continuation is
+  rejected until terminal teardown is durably `released`; it then reactivates
+  the same identity with one generation increment. Continuation and explicit
+  workspace removal take the same per-job advisory lock, so they cannot commit
+  a queued continuation against a removed worktree.
+  `coordinator/README.md` documents `factory-worker` and
   `DurableRunner` as the current claim/ordering owner rather than Hatchet.
   Dedicated PostgreSQL advisory-lock connections fence each job worktree
   across worker and `factoryd` processes and fence shared cache publication.
@@ -123,8 +142,8 @@ unplanned and must be investigated before continuing.
   Running cancellation is a request/acknowledgement lifecycle: the job remains
   `cancelling` with its live fence intact while a one-second control poll asks
   the executor to stop, drain, and restore disposable state. Only the cleanup
-  owner can acknowledge terminal `cancelled`. Queued jobs without a live
-  attempt still cancel immediately. A slow or transiently failed job-state
+  owner can release the execution environment and acknowledge terminal
+  `cancelled`. Queued jobs without a live attempt still cancel immediately. A slow or transiently failed job-state
   poll is advisory and does not impersonate lease loss; execution continues
   while the independent fenced heartbeat proves ownership. Only an observed
   terminal/cancelling job or confirmed heartbeat fence failure stops it.
@@ -205,8 +224,149 @@ unplanned and must be investigated before continuing.
   read repository-scoped memory and return work to the parent for reconciliation.
 - `factory-harness/factory/runtime/`: native Codex bootstrap, autonomous
   session, stage contracts, checkpoints, fenced live event output, and the
-  production durable worker binary (`src/bin/factory_worker.rs`). The
-  four-stage executor has one unversioned module tree: `src/executor/mod.rs`
+  production durable worker binary (`src/bin/factory_worker.rs`). Production
+  requires a per-job execution-environment provisioner; bootstrap carries only
+  an inert remote-only manager, which is replaced by the ensured job URL before
+  every Codex session. There is no local or static execution fallback. The deliberate public
+  `EnvironmentManager::remote_only` seam creates a fresh manager for one exact
+  caller-named remote through Codex's existing snapshot path, with the supplied
+  HTTP policy and optional connection timeout, no local fallback, and no state
+  shared between constructor calls. It is the protected-upstream primitive for
+  later Factory-owned per-job environment selection. Factory passes Codex's exact
+  `TurnEnvironmentParams` with the managed worktree path to new threads and
+  every text turn. Each job's `codex exec-server` container owns only tool and
+  filesystem execution over two exact writable mounts: that job's worktree and
+  its repository's Git common directory. The worker retains the model loop and
+  Factory retains durable lifecycle authority. Detached review uses the same
+  remote-only manager default, and native thread-spawn subagents inherit their
+  parent's selection. The session watches the selected remote environment's
+  authoritative connection state. A disconnect gets Codex's full 30-second
+  recovery window exactly once; if it remains disconnected, the active turn is
+  interrupted and returned to Factory's durable retry loop. Reconnect and
+  disconnect events remain visible in compact CLI output. Real-model Compose
+  acceptance covers remote commands and patches, native subagents, skills,
+  durable retry, disconnect/reconnect recovery, cancellation, detached review,
+  remediation, and independent re-review.
+  `src/execution_environment.rs` is the Factory-owned provisioning seam. When
+  the worker enables its Docker backend, every claimed operation uses its live
+  `AttemptFence` to ensure the job's stable coordinator environment record,
+  idempotently create or reuse one environment-and-generation-named sibling
+  container, and publish the exact container ID and WebSocket URL through the
+  fenced ready transition. The provisioner uses Bollard's Docker Engine API,
+  never a Docker subprocess. It discovers the worker's exact image, attached
+  network, and `/workspaces` volume or bind mount by inspecting the running
+  worker, so no Compose project name is encoded in Rust. The container runs
+  only the preserved Codex `exec-server`; it receives no Docker socket and
+  shares only the managed worktree and required Git common directory. For a
+  named volume, Docker subpaths narrow the worker's backing mount; bind-backed
+  deployments use the two corresponding narrowed host paths. Reuse validates the exact
+  invariant-bearing image environment and entrypoint, command, working
+  directory, user, single network, and exactly two writable scoped mounts; a
+  stale or raced container is rejected rather than silently adopted. Each
+  operation clones the reusable
+  Codex startup arguments and replaces their manager with a fresh
+  `EnvironmentManager::remote_only` whose default ID is the exact durable
+  environment ID. Detached review and native subagents therefore retain the
+  same per-job selection, while retries, later stages, lease recovery, and
+  graceful worker shutdown reuse the same container generation. Missing active
+  containers are recreated and stopped active containers restarted. Terminal
+  success/failure and cancellation drive idempotent release. Release inspects by
+  persisted container ID when available, otherwise by deterministic name, and
+  validates exact job, environment, generation, and backend-reference identity
+  before Bollard stop/remove calls. Absence is already released; mismatches are
+  retained and reported. Startup and normal polling retry persisted `releasing`
+  rows without preventing other releases or job claims.
+  Phase 6 acceptance is complete on final image
+  `sha256:9a3418d3e470071abdebed5224f9b25153509efeedd1cafc58826141b8f6a656`.
+  Claude Sonnet job `7773ded7-2b75-4268-b3f3-8680fda57b53` passed the full
+  Plan, remote command and patch Execute, detached Review, Remediate, and
+  independent re-review lifecycle with a repository skill, native Codex
+  subagent, `VERIFY_FINAL_OK`, terminal environment release, container removal,
+  and all eight host artifacts. Concurrent jobs
+  `6afe719a-7dfd-4b47-a917-e31ad5a80068` and
+  `0cab3836-9a57-4298-8d22-2023a518f017` each saw exactly its own worktree and
+  Git-common-directory subpath mounts. Removing the first job's active
+  container produced the visible 30-second Codex disconnect, retry, and
+  recreation of the same environment and generation before its successful
+  full-contract completion. The second job reached terminal success and
+  release but its model incorrectly approved the fixture's deliberate
+  `STATUS=needs-remediation` defect, so it proves only concurrency, scoped
+  isolation, and release. Both environments finished `released/released` with
+  no remaining container and complete host artifacts.
+  The optional single-host K3s distribution profile is wired through
+  `docker-compose.kubernetes.yml`, the existing `factory-worker`, and
+  `deploy/k3s/single-node-workspaces.yaml`. Docker remains the exact default.
+  K3s mode keeps shared state services in Compose, gives the worker host-local
+  service URLs and no Docker socket, bind-mounts the same host workspace into
+  `factoryd` and the worker, and exposes it to execution Pods through one static
+  local PV/PVC pinned to the discovered node. The launcher validates and applies
+  that template before starting the worker. A configured RuntimeClass must exist
+  during launcher preflight; its exact name and handler are reported before the
+  worker starts, then the class is only passed through. The overlay overrides the existing
+  `factory-worker`; it does not define a second worker service or retain a
+  backend-selection reconciliation layer. Pod reuse checks Factory-owned fields
+  directly on native Kubernetes types. No Factory Pod schema version, shadow
+  struct, desired-spec hash, or quantity parser remains.
+  Final K3s/runc acceptance passed on ARM64 node `spark-91b3` with acceptance
+  image `sha256:df6e4338afc7428dc11786085f8ca5ad8cf6f27628b4509de9e216b444592d5e`
+  and immutable execution manifest
+  `sha256:6b72e173796f9e4c719fb0a7d336ff5bc715b4f9d46a791b9748e7a2eca875a4`.
+  Removing one unused serialization derive did not change behavior; the exact
+  final source rebuilt successfully as distribution image
+  `sha256:9a1fcdcf450fcedc236e57d8d0f91607805b19fe4649ba99aa9a96e96ee66357`.
+  Real DeepSeek job `a99d38e3-82f6-4caf-8f3b-14812f5fb03b` completed native
+  planning, Pod-hostname and cwd commands, `apply_patch`, exact-byte
+  verification, one native subagent, detached review, and the remediation gate.
+  The applied host artifact was exactly `K3S-CLEANUP-OK\n`. Environment
+  `62f8dbc5-9852-41ab-8304-eb26d211560b`, generation 1, retained Pod UID
+  `6940ad52-3095-4e58-88d0-feeef178f58d`, finished `released/released`, and
+  left no execution Pod. The final Compose project contained only one
+  `factory-worker`; the obsolete service was removed as an orphan.
+  Initial live startup exposed a deterministic Rustls-provider requirement
+  after `kube` enabled both crypto backends. `factory-worker` now calls Codex's
+  existing `ensure_rustls_crypto_provider` helper before any async client or
+  arg0 dispatch; the targeted worker check and first-start container gate pass.
+  The pinned `deploy/k3s/kata-qemu-runtime-rs.values.yaml` operator profile
+  enables only ARM64 `kata-qemu-runtime-rs` and disables optional snapshotters
+  and every other shim. Definitive exact-source Kata acceptance passed from
+  source fingerprint `dec512b9…b8c3ce` with immutable image
+  `docker.io/library/software-factory@sha256:2bd920060b337573e8cbd751cc64c514174d2acdbad7a32f9f3c3caa6201611d`.
+  DeepSeek model `deepseek-v4-pro` completed all stages in job
+  `7003ae36-6f72-4d1a-830b-20f78c3cbeac`. Plan attempt 1 hit a fixture-only
+  `ImagePullBackOff` because the offline `k3s ctr images import` lacked the
+  exact digest alias; adding that alias let durable attempt 2 recover. Execute,
+  Review, and Remediate each passed on attempt 1. The alias repair was local
+  offline-import setup, not a Factory retry bypass. Pod
+  `factory-9a32720327d94a39a51c3121aeb9f269-g1` (UID
+  `519c1713-84d8-4b23-b05f-8aaa28895c3b`) used RuntimeClass
+  `kata-qemu-runtime-rs`; guest kernel 6.18.35 differed from host kernel
+  6.17.0-1014-nvidia. Environment
+  `9a327203-27d9-4a39-a51c-3121aeb9f269`, generation 1, ended
+  `released/released` and the Pod was removed. Native-subagent verification
+  passed; attach, result, and apply succeeded; host `result.md` was verified;
+  and the sole applied file was `KATA_FINAL_ACCEPTANCE.txt`, exactly 14 bytes
+  containing `KATA-FINAL-OK\n`.
+  Before first persisting the immutable per-installation backend marker, the
+  launcher runs a read-only Kubernetes preflight over configuration,
+  kubeconfig, immutable registry image digest, resource values, and the single
+  node. The launcher and Rust runtime both require
+  `registry/repository@sha256:<64 lowercase hex>` from a deliberately
+  conservative subset: a lowercase DNS/IPv4-style registry with an optional
+  numeric port and lowercase repository components separated by single `.`,
+  `_`, or `-` characters. Bracketed IPv6, tag+digest references, tags, empty
+  values, and malformed digests fail before the backend marker, host workspace,
+  or cluster is changed. A missing
+  kubeconfig regression exits with no marker; a live-node preflight records
+  `kubernetes` only after success. Markerless upgrades infer Docker from existing
+  Compose-labelled workspace/PostgreSQL volumes; mismatches refuse rather than
+  deleting or migrating data. K3s is fresh-install/separate-project only. Its
+  kubeconfig must be readable by the invoking host user, and workspace paths use
+  a conservative YAML-safe character set before directory creation or manifest
+  rendering.
+  Default K3s namespace, PV, PVC, and host workspace identities derive
+  deterministically from the validated Compose project name, preventing two
+  separate Factory projects from sharing those resources accidentally.
+  The four-stage executor has one unversioned module tree: `src/executor/mod.rs`
   owns its public lifecycle, `src/executor/task.rs` owns task/config validation,
   `src/executor/stage_loop.rs` owns stage and remediation turns, and
   `src/executor/resume.rs` owns checkpoints, correlations, and recovery. The
@@ -234,6 +394,9 @@ unplanned and must be investigated before continuing.
   path for read-only commands because default Docker containers cannot create
   bubblewrap's nested namespaces; the image needs neither bubblewrap nor
   elevated container capabilities.
+  Plan decomposes only implementation and verification work owned by Execute;
+  it cannot schedule duplicate Review, Remediate, or re-review units. Execute
+  likewise leaves explicitly later-stage work to Factory's durable lifecycle.
   Execute records
   each incomplete unit once as completed with evidence after implementation
   and verification; the durable progress tool accepts only a first completion,
@@ -247,10 +410,13 @@ unplanned and must be investigated before continuing.
   requires a pristine worktree,
   pending work units with no progress summaries, and no review, remediation, or
   history state. A rejected Plan is reset only after its Codex session shuts
-  down, then the managed worktree is recreated at the recorded revision. The
-  same rollback path covers cancellation, provider/runtime failure, and
-  shutdown failure, while replacement Plan preflight repeats cleanup after a
-  process crash. Detached review starts in a fresh Codex thread without copying
+  down. Ordinary rollback checks out, resets, and cleans the managed worktree
+  in place so an active scoped mount retains the same directory inode. A
+  missing or corrupt linked worktree requires the old backend to be removed
+  before explicit recreation and reprovisioning of the same durable environment
+  generation. The same rollback path covers cancellation, provider/runtime
+  failure, and shutdown failure, while replacement Plan preflight repeats
+  cleanup after a process crash. Detached review starts in a fresh Codex thread without copying
   the parent conversation, while retaining Codex review source metadata and the
   typed parent thread, parent turn, and durable-state attachment used by
   Factory lineage. It captures a durable semantic Git snapshot of
@@ -376,18 +542,27 @@ client, Hatchet workflow, or integration loader.
 
 The runnable distribution switched to Rust on 2026-08-02:
 
-- `Dockerfile` builds and installs `factory`, `factory-worker`, `factoryd`, and
-  the Rust `factory-provider-bridge`. It has no Node build stage, and no legacy
-  client, integration, workflow, or provider script enters the image.
-  `factoryd` and the provider bridge drain Axum gracefully on both SIGINT and
-  the SIGTERM used by container shutdown.
+- `Dockerfile` builds and installs `factory`, `factory-worker`, `factoryd`, the
+  Rust `factory-provider-bridge`, and the preserved upstream `codex` binary
+  used solely for Codex's native `exec-server`. It has no Node build stage, and
+  no legacy client, integration, workflow, or provider script enters the
+  image. `factoryd` and the provider bridge drain Axum gracefully on both
+  SIGINT and the SIGTERM used by container shutdown.
 - `docker-compose.yml` runs PostgreSQL, Qdrant, `factoryd`, and
-  `factory-worker` by default. `factoryd` sees the selected host repository at
-  `/workspace/project` so the native CLI can apply a verified completed result;
-  the model worker still sees only coordinator-owned `/workspaces`. Hatchet and
-  runtime Node commands are absent. Optional profiles remain optional; all
+  `factory-worker` by default. `factoryd` sees the
+  selected host repository at `/workspace/project` so the native CLI can apply
+  a verified completed result. Only the worker sees coordinator-owned
+  `/workspaces` as a backing tree; each per-job Codex execution container sees
+  its exact worktree and repository Git common directory. Hatchet
+  and runtime Node commands are absent. Optional profiles remain optional; all
   provider adapters share the one selected-provider catalog volume, and
   provider health checks use `curl` instead of Node.
+  The worker mounts the Docker Engine socket and enables the Docker execution
+  provisioner. Its generic entrypoint retains the socket's numeric group while
+  dropping to the configured workspace UID/GID. Provisioned exec-server
+  containers do not receive the socket. The former static `codex-exec-server`
+  service, global URL, launcher startup/log entries, and worker dependency are
+  removed; every production session uses its durable per-job environment.
 - The root `factory` launcher owns only Docker/bootstrap and host-file
   lifecycle. It delegates onboarding, hidden key input,
   provider/model switching, run, attach, status, stop, result/artifact reads,
@@ -820,3 +995,111 @@ Recorded on 2026-08-05 (verification-residue cleanup):
   attempts because the provider repeatedly supplied malformed `apply_patch`
   arguments, either a bare `@@` hunk or a missing `*** End Patch`. These runs
   are recorded provider/tool-format failures, not cleanup acceptance evidence.
+
+Recorded on 2026-08-07 (Codex remote execution):
+
+- Linux image
+  `sha256:086337e6ed373c402198ab4f3f109cb98866032c6327d23f1499aa823ac10f20`
+  contains the preserved upstream `codex` binary and Factory's Rust binaries.
+  Compose runs `codex exec-server` separately with the same managed-worktree
+  volume; the worker has no local execution fallback.
+- DeepSeek job `5e865e18-c5f6-43c3-895d-4e4e325ff3d0` passed the clean
+  lifecycle gate. Plan created four Execute-only units. Remote commands, a
+  repository skill, a native Codex subagent, `apply_patch`, and both verifiers
+  produced the exact final `STATUS=accepted`,
+  `REMOTE_EXECUTION=confirmed`, `SKILL_TOKEN=REMOTE-SKILL-CONTENT-7`, and
+  `SUBAGENT_TOKEN=NATIVE-SUBAGENT-TOKEN-9` file. Detached Review requested
+  deliberate finding `controlled-status`; Remediate resolved it; a distinct
+  re-review approved `VERIFY_FINAL_OK`. Two malformed DeepSeek patch calls
+  failed as durable retryable Execute attempts before attempt three succeeded.
+  Terminal attach replay and the fixed host-visible artifact set both passed.
+- Recovery job `eaa6db83-1a5e-4fe8-b41a-b128c1ad5af6` lost
+  `codex-exec-server` during its blocked remote command. The authoritative
+  disconnect watch expired after 30 seconds, emitted the visible turn and stage
+  errors, scheduled the next durable attempt after five seconds, observed the
+  reconnected environment, and completed the same job. This job is recovery
+  evidence only; the later job above is the stage-separation gate.
+- Cancellation job `d2f8c849-3d80-4709-a3e7-6b58cd047304` received
+  `factory stop` while the remote probe was blocked. Its running Execute
+  attempt became abandoned with `jobCancelled`, the remaining operations were
+  cancelled, no probe process remained in the execution container, and the
+  managed worktree was clean at terminal `cancelled`.
+- These remote jobs emitted no `context.compacted` event and are not presented
+  as a new compaction or Qdrant-memory gate. Those mechanisms remain in the
+  unchanged worker-side Codex and Factory extension paths and retain their
+  separately recorded native real-model evidence above.
+
+Recorded on 2026-08-07 (per-job Docker environment binding):
+
+- The runtime provisioner and deterministic Docker-spec regressions pass, as
+  do the complete runtime suite, warning-denied runtime clippy, all-target
+  runtime check, Compose rendering, entrypoint syntax, and diff whitespace
+  validation. The fake provisioner received the exact durable environment
+  identity rather than a runtime-generated alias.
+- A live Bollard 0.21 test ran from the existing isolated worker network and
+  ensured the same environment generation twice. Both calls returned one
+  unchanged container ID and URL. Direct Docker inspection confirmed exact
+  worker image
+  `sha256:086337e6ed373c402198ab4f3f109cb98866032c6327d23f1499aa823ac10f20`,
+  command `codex exec-server --listen ws://0.0.0.0:4500`, numeric worker user,
+  one discovered `/workspaces` volume, and one discovered worker network. The
+  container had neither the Docker socket nor provider credentials and was
+  removed after the test. The same live ensure/reuse test passed again after
+  exact stale-container validation was added. A separate entrypoint probe
+  dropped to UID/GID 1000
+  while retaining only the Docker socket's live group and successfully reached
+  the Engine API.
+- Phase 4's live Bollard lifecycle gate additionally stopped and restarted an
+  active container with the same ID, removed and recreated it with a new ID,
+  released it, and repeated release successfully after Docker returned 404. A
+  deterministic-name container with a mismatched Factory job label produced a
+  fatal release error and remained running until test cleanup. PostgreSQL gates
+  prove success/failure/queued cancellation release intents, cleanup-before-
+  release-before-ack running cancellation, graceful shutdown retention,
+  continuation refusal while releasing, and restart reconciliation that keeps a
+  failed release durable while completing other rows and succeeds on retry.
+
+Recorded on 2026-08-07 (per-job real-model lifecycle):
+
+- Fresh image
+  `sha256:88ebd2543a7272b725a1b9e9682a7c25530296f0a105d6554c427a086a560781`
+  ran in isolated fixture `/tmp/factory-perjob-acceptance.p5`, Compose project
+  `sfperjobp5`. `docker compose config --services` contained PostgreSQL,
+  Qdrant, `factoryd`, and `factory-worker`; no static `codex-exec-server`
+  service was rendered.
+- Concurrent jobs `c71292b1-cba6-447d-b711-0e03e2b709b0` and
+  `a2b87743-406c-42c3-b18b-a74975291dfe` ran with distinct environment IDs
+  `4ebdc095-a51d-4102-aac8-3bccd7f82072` and
+  `bc3534be-8f1e-4a29-9d2c-9589709e991d`, distinct generation-1 containers,
+  and exact job worktree cwd selections. Direct inspection found only the
+  `codex exec-server --listen ws://0.0.0.0:4500` command, numeric user, one
+  writable `/workspaces` mount, and one worker network.
+- Job `c71292b1-cba6-447d-b711-0e03e2b709b0` succeeded through Plan, Execute,
+  detached Review, `controlled-status` remediation, and independent re-review.
+  Durable events contained native subagent activity, repository skill use,
+  command and `apply_patch` activity, four accepted stage completions, and
+  final `VERIFY_FINAL_OK`. Probe hostnames for Execute, Review, and Remediate
+  matched container `31821a92ab3b...`. Terminal release persisted
+  `released/released`, removed the container, and terminal status rebuilt all
+  eight host-visible `.factory/jobs/<job-id>/` files.
+- Recovery job `fb3e65de-1957-48d7-a17e-4d28db8902ad` used environment
+  `351e3b9d-74d4-44a9-97aa-6198033a6c21`, generation 1. Its first Execute
+  attempt ran the blocked probe in container `a4941b88657c...`. After exact
+  kill and removal, events recorded `environment.disconnected`, the 30-second
+  `turn.error`, and `stage.error`; attempt
+  `810f9dda-f795-46af-93ac-e591cef32662` failed with
+  `stageExecutionRetry`. Attempt `35e1cbdc-fd16-4a48-a605-719cd758e01b`
+  carried `retryScheduled`, recreated the same environment and generation as
+  container `133f9d692eae...`, and succeeded. The matching probe hostname,
+  terminal job success, `released/released` row, absent container, attach
+  result, and host artifacts all passed.
+- Candidate recovery job `a2b87743-406c-42c3-b18b-a74975291dfe` is not used
+  as disconnect-causality evidence: it emitted the disconnect and recreated
+  the same environment generation, but DeepSeek exhausted all three Execute
+  attempts by repeating malformed `apply_patch` syntax. The bounded failure was
+  retained rather than hidden or retried indefinitely.
+- At this Phase 5 point, Codex selected an exact job cwd and workspace root,
+  but each per-job container still mounted the shared `/workspaces` backing
+  volume. Mount-level per-job isolation remained a later improvement. These runs emitted
+  no `context.compacted` event and are not a new compaction or Qdrant-memory
+  gate.

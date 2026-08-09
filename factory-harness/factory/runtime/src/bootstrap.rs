@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::EnvironmentManager;
-use codex_app_server_client::ExecServerRuntimePaths;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::AbsolutePathBuf;
@@ -33,7 +32,6 @@ const CONTAINER_SANDBOX_OVERRIDE: &str = "features.use_legacy_landlock";
 pub enum BootstrapError {
     WorkspacePath(std::io::Error),
     Config(std::io::Error),
-    RuntimePaths(std::io::Error),
     Environment(Box<dyn Error + Send + Sync>),
     ProviderConfig(String),
 }
@@ -43,9 +41,6 @@ impl fmt::Display for BootstrapError {
         match self {
             Self::WorkspacePath(source) => write!(formatter, "invalid workspace path: {source}"),
             Self::Config(source) => write!(formatter, "failed to build Codex config: {source}"),
-            Self::RuntimePaths(source) => {
-                write!(formatter, "invalid Codex runtime paths: {source}")
-            }
             Self::Environment(source) => {
                 write!(
                     formatter,
@@ -62,9 +57,7 @@ impl fmt::Display for BootstrapError {
 impl Error for BootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::WorkspacePath(source) | Self::Config(source) | Self::RuntimePaths(source) => {
-                Some(source)
-            }
+            Self::WorkspacePath(source) | Self::Config(source) => Some(source),
             Self::Environment(source) => Some(source.as_ref()),
             Self::ProviderConfig(_) => None,
         }
@@ -126,17 +119,16 @@ pub async fn build_worker_start_args(
         .map_err(BootstrapError::Config)?;
     config.analytics_enabled = Some(false);
 
-    let runtime_paths = ExecServerRuntimePaths::from_optional_paths(
-        input.arg0_paths.codex_self_exe.clone(),
-        input.arg0_paths.codex_linux_sandbox_exe.clone(),
-    )
-    .map_err(BootstrapError::RuntimePaths)?;
-    let environment_manager = EnvironmentManager::from_codex_home(
-        config.codex_home.clone(),
-        Some(runtime_paths),
+    // The production executor replaces this inert remote-only manager with the
+    // freshly ensured per-job URL before starting every Codex session. Keeping
+    // the bootstrap manager remote-only makes an accidental local/static
+    // fallback impossible.
+    let environment_manager = EnvironmentManager::remote_only(
+        "factory-unprovisioned".to_string(),
+        "ws://127.0.0.1:9".to_string(),
+        None,
         config.http_client_factory(),
     )
-    .await
     .map_err(|source| BootstrapError::Environment(Box::new(source)))?;
     let state_db = codex_core::init_state_db(&config).await;
 
@@ -161,4 +153,22 @@ pub async fn build_worker_start_args(
         opt_out_notification_methods: Vec::new(),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configured_remote_manager_has_no_local_fallback() {
+        let manager = EnvironmentManager::create_for_tests(
+            Some("ws://127.0.0.1:9".to_string()),
+            /*local_runtime_paths*/ None,
+        )
+        .await;
+
+        assert_eq!(manager.default_environment_id(), Some("remote"));
+        assert!(manager.try_local_environment().is_none());
+        assert!(manager.default_environment().unwrap().is_remote());
+    }
 }

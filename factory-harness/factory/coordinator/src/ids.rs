@@ -45,6 +45,7 @@ macro_rules! string_id {
 string_id!(JobId);
 string_id!(OperationId);
 string_id!(AttemptId);
+string_id!(ExecutionEnvironmentId);
 string_id!(RequestId);
 
 // These retain exact Codex identifiers in coordinator storage without defining

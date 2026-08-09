@@ -1,6 +1,7 @@
 .env
 /secrets/
 .env.local
+.factory-execution-backend
 
 # Build artifacts
 **/node_modules/
