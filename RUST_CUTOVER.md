@@ -1135,3 +1135,44 @@ Recorded on 2026-08-07 (per-job real-model lifecycle):
   volume. Mount-level per-job isolation remained a later improvement. These runs emitted
   no `context.compacted` event and are not a new compaction or Qdrant-memory
   gate.
+
+Recorded on 2026-08-10 (multi-node Kubernetes execution):
+
+- Revision `99eb4da06609d5a76dc77b5ae72ee5f2eff491de` ran the immutable
+  multi-architecture image
+  `ghcr.io/fpolica91/software-factory@sha256:73183da88ee6c82c4a08931423b3734534a9f7a8ed1bf610b5577112b226aca7`.
+  Real runc jobs completed on both ARM64 and AMD64 nodes through the same
+  explicit `ReadWriteMany` workspace, proving cross-node planning, tool use,
+  patches, detached review, and terminal environment release.
+- x86_64 (AMD64) Job C, `d20d837b-f69e-47b7-8364-e2be8ae7e3ab`, supplied the
+  separate recovery and remediation evidence. Killing the worker during its
+  initial Review left the job running. Review attempt
+  `90076f05-a602-4826-aa6e-c10c92f73b18` started at lease epoch 1, was
+  reclaimed with `recovery_cause=lease_expired`, and completed at epoch 3 after
+  resuming itself from `factory.stage` checkpoint
+  `bc5a9e4a-56b6-489c-8a34-93c65af61e47` (sequence 3).
+- The remediation test was separate from that worker crash. A defect was
+  deliberately injected while no operation was active and before round-3
+  Iterate established its baseline. Iterate preserved and audited the defect;
+  Review attempt `3d97e00f-bcca-4454-98f8-2e7ec4cef0b0` returned two real
+  `request_changes` findings. Remediation attempt
+  `f9da0884-4d9e-4fdf-93aa-272662623c05` fixed the defect, passed all 20 fixture
+  tests, resolved both findings, and completed a fresh independent re-review.
+  This proves detection and remediation of a pre-baseline defect, not handling
+  of corruption introduced during a model turn.
+- The isolated control-plane fixture was Compose project `sfmultinodeaccept`.
+  Its execution resources were namespace `software-factory-execution`, PV
+  `software-factory-workspaces-rwx`, PVC `software-factory-workspaces`, host
+  mount `/srv/software-factory-rwx`, and NFS export
+  `/data0/software-factory-rwx`. These acceptance resources remain live, so
+  cleanup is pending rather than completed. The planned safe order is to
+  release any fixture jobs and Pods, stop `sfmultinodeaccept`, delete the PVC
+  and namespace, delete the retained PV, unmount and remove the client mount,
+  and remove the NFS export. Delete the server backing directory only when its
+  retained data is explicitly no longer wanted. Preserve the K3s cluster and
+  optional Kata installation.
+- K3s v1.36 required the PVC access-mode JSONPath iterator to change from
+  `{.}` to `{@}`; the former returned an empty access-mode field and falsely
+  rejected a valid RWX claim. The launcher now uses `{@}`, and a focused
+  regression proves the corrected preflight accepts the live response while
+  the former expression fails.

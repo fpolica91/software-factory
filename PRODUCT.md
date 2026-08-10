@@ -77,9 +77,13 @@ already permit the configured `FACTORY_RUN_AS_UID` and
 `FACTORY_RUN_AS_GID`: Factory preserves its ownership and omits Pod `fsGroup`
 in this mode. Kubernetes owns Pod placement and RuntimeClass execution while
 Factory owns durable retries, generations, cancellation, and release. Kata is
-a configured RuntimeClass, not a bundled dependency. Both the K3s/runc and
-optional Kata paths have passed full real-model lifecycles; operators still
-install Kata separately.
+a configured RuntimeClass, not a bundled dependency. Single-node runc and Kata
+have passed real-model lifecycle acceptance. Multi-node `existing-pvc` runc
+scheduled and completed real-model jobs on ARM64 and AMD64 through shared RWX
+storage; a separate x86_64 (AMD64) run proved lease-expiry recovery plus
+substantive request-changes remediation and independent re-review. Operators
+install Kata separately, and selecting its RuntimeClass constrains scheduling
+to nodes that expose the handler.
 Kubernetes execution requires an immutable, cluster-reachable
 `registry/repository@sha256:<64 lowercase hex>` reference. Its conservative
 supported subset accepts a lowercase DNS/IPv4-style registry with an optional

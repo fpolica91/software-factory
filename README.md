@@ -199,17 +199,25 @@ both endpoints but cannot mechanically prove they share the same backing
 filesystem. The launcher also tells both host-side services to preserve the
 mounted workspace's existing ownership; it never recursively changes ownership
 inside operator-managed shared storage. Local-PV and Docker profiles retain
-Factory-managed workspace ownership.
+Factory-managed workspace ownership. For an NFS export using `root_squash`,
+the export root must be readable and searchable by the squashed kubelet identity
+so kubelet can resolve the PVC `subPath` mounts. Factory's worktree and Git
+common-directory subpaths must remain writable by `FACTORY_RUN_AS_UID` and
+`FACTORY_RUN_AS_GID`.
 
 An empty runtime class uses the cluster default. When a RuntimeClass is
 configured, `factory up` verifies that it exists before starting the worker
 and prints its exact class and handler. A missing or misspelled class therefore
 fails during preflight instead of leaving execution Pods pending until timeout.
 
-Live K3s/runc acceptance completed on Linux ARM64 with a real DeepSeek job. It
-proved planning, remote commands and patches, native subagent delegation,
-detached review, artifact materialization, apply, and `released/released` Pod
-teardown through the same durable environment contract used by Docker.
+Live K3s/runc acceptance completed across Linux ARM64 and AMD64 nodes with an
+explicit `ReadWriteMany` PV/PVC. Real-model jobs scheduled and completed on
+each architecture, proving shared-workspace access, planning, command and patch
+execution, detached review, and `released/released` Pod teardown. A separate
+x86_64 (AMD64) run proved lease-expiry recovery after worker termination and a
+substantive request-changes, remediation, and independent re-review cycle.
+Kata remains valid only on nodes where its RuntimeClass handler is installed;
+selecting it narrows the eligible nodes.
 
 ### Optional Kata RuntimeClass
 
@@ -237,22 +245,11 @@ After RuntimeClass `kata-qemu-runtime-rs` exists, set
 `FACTORY_KUBERNETES_RUNTIME_CLASS=kata-qemu-runtime-rs`; the next `factory up`
 must report that class and its handler before the worker starts.
 
-Definitive exact-source Kata acceptance passed on ARM64 from source fingerprint
-`dec512b9…b8c3ce` with immutable image
-`docker.io/library/software-factory@sha256:2bd920060b337573e8cbd751cc64c514174d2acdbad7a32f9f3c3caa6201611d`.
-DeepSeek model `deepseek-v4-pro` completed all stages in job
-`7003ae36-6f72-4d1a-830b-20f78c3cbeac`; Plan attempt 1 hit a fixture-only
-`ImagePullBackOff` because the offline `k3s ctr images import` lacked the exact
-digest alias. Adding that alias let durable attempt 2 recover; Execute, Review,
-and Remediate each passed on attempt 1. This was local offline-import setup, not
-a Factory retry bypass. Pod `factory-9a32720327d94a39a51c3121aeb9f269-g1`
-(UID `519c1713-84d8-4b23-b05f-8aaa28895c3b`) used RuntimeClass
-`kata-qemu-runtime-rs`; guest kernel 6.18.35 differed from host kernel
-6.17.0-1014-nvidia. Environment `9a327203-27d9-4a39-a51c-3121aeb9f269`,
-generation 1, ended `released/released` and the Pod was removed. Native-subagent
-verification passed; attach, result, and apply succeeded; host `result.md` was
-verified; and the sole applied file was `KATA_FINAL_ACCEPTANCE.txt`, exactly 14
-bytes containing `KATA-FINAL-OK\n`.
+Live ARM64 Kata acceptance passed with a real-model lifecycle using the
+selected RuntimeClass and an immutable execution image. The execution ran
+inside the Kata guest kernel, completed planning, command and patch execution,
+detached review, result materialization and apply, and released its Pod
+environment.
 
 Roll back with:
 

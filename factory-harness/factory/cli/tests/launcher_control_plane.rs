@@ -577,7 +577,18 @@ exit 0
 printf 'kubectl %s\n' "$*" >> "$FACTORY_DOCKER_LOG"
 case " $* " in
   *" get nodes -o "*) printf '%s\n' "$FACTORY_TEST_NODES" ;;
-  *" get pvc "*) printf '%s' "$FACTORY_TEST_PVC_STATE" ;;
+  *" get pvc "*)
+    case "$*" in
+      *'{range .spec.accessModes[*]}{@}{","}{end}'*)
+        printf '%s' "$FACTORY_TEST_PVC_STATE"
+        ;;
+      *'{range .spec.accessModes[*]}{.}{","}{end}'*)
+        # K3s v1.36 renders the old expression as an empty value plus separator.
+        printf 'Bound|Filesystem|,'
+        ;;
+      *) exit 65 ;;
+    esac
+    ;;
   *) exit 64 ;;
 esac
 "##,
@@ -737,6 +748,8 @@ exit 91
 
     let commands = std::fs::read_to_string(log).unwrap();
     assert!(commands.contains("get pvc shared-workspaces"));
+    assert!(commands.contains(r#"{range .spec.accessModes[*]}{@}{","}{end}"#));
+    assert!(!commands.contains(r#"{range .spec.accessModes[*]}{.}{","}{end}"#));
     assert!(commands.contains("ownership=preserve docker"));
     assert!(!commands.contains("apply -f"));
     assert!(!commands.contains("chown "));

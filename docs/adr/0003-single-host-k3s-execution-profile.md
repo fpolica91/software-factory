@@ -1,6 +1,6 @@
 # ADR 0003: Optional Kubernetes Execution Profile
 
-- Status: Accepted; runc and Kata live acceptance passed
+- Status: Accepted; single-node runc/Kata and multi-node runc live acceptance passed
 - Date: 2026-08-08
 
 ## Context
@@ -74,28 +74,12 @@ host-mounted DaemonSet that
 modifies K3s/containerd and can temporarily restart the node runtime. Shell
 syntax, both Compose models, and manifest rendering remain configuration gates.
 
-Live runc acceptance passed on ARM64 K3s node `spark-91b3` with real DeepSeek
-job `a99d38e3-82f6-4caf-8f3b-14812f5fb03b`. The execution Pod ran remote
-commands and patches, used a native subagent, passed detached review,
-materialized and applied the exact artifact, disappeared after success, and
-left its durable environment `released/released` with the UID-bound backend
-reference retained.
-
-Definitive exact-source Kata acceptance passed from source fingerprint
-`dec512b9…b8c3ce` with RuntimeClass `kata-qemu-runtime-rs` and immutable image
-`docker.io/library/software-factory@sha256:2bd920060b337573e8cbd751cc64c514174d2acdbad7a32f9f3c3caa6201611d`.
-DeepSeek model `deepseek-v4-pro` completed all stages in job
-`7003ae36-6f72-4d1a-830b-20f78c3cbeac`. Plan attempt 1 hit a fixture-only
-`ImagePullBackOff` because the offline `k3s ctr images import` lacked the exact
-digest alias; adding that alias let durable attempt 2 recover. Execute, Review,
-and Remediate each passed on attempt 1. The alias repair was local offline-import
-setup, not a Factory retry bypass.
-
-Pod `factory-9a32720327d94a39a51c3121aeb9f269-g1` (UID
-`519c1713-84d8-4b23-b05f-8aaa28895c3b`) used the selected RuntimeClass. Guest
-kernel 6.18.35 differed from host kernel 6.17.0-1014-nvidia. Environment
-`9a327203-27d9-4a39-a51c-3121aeb9f269`, generation 1, ended
-`released/released` and the Pod was removed. Native-subagent verification
-passed; attach, result, and apply succeeded; host `result.md` was verified; and
-the sole applied file was `KATA_FINAL_ACCEPTANCE.txt`, exactly 14 bytes containing
-`KATA-FINAL-OK\n`.
+Acceptance covers single-node runc and Kata plus multi-node runc on a mixed
+ARM64/AMD64 cluster backed by an explicit `ReadWriteMany` PV/PVC. A
+multi-architecture execution image lets runc Pods use either architecture;
+Kata remains available only on nodes where its handler is installed, so
+selecting its RuntimeClass narrows the eligible nodes. Real-model runc jobs
+scheduled and completed on each architecture, verifying shared-workspace
+access and the plan, execute, detached-review, and release lifecycle. A
+separate x86_64 (AMD64) run verified worker-loss lease recovery and a
+substantive request-changes, remediation, and independent re-review cycle.

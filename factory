@@ -496,7 +496,7 @@ preflight_kubernetes_profile() {
     (( node_count >= 1 )) || die 'the existing-pvc workspace mode requires at least one Ready schedulable Kubernetes node'
     node_name=''
 
-    pvc_state=$("${KUBECTL[@]}" -n "$namespace" get pvc "$pvc" -o 'jsonpath={.status.phase}{"|"}{.spec.volumeMode}{"|"}{range .spec.accessModes[*]}{.}{","}{end}') ||
+    pvc_state=$("${KUBECTL[@]}" -n "$namespace" get pvc "$pvc" -o 'jsonpath={.status.phase}{"|"}{.spec.volumeMode}{"|"}{range .spec.accessModes[*]}{@}{","}{end}') ||
       die "cannot read existing Kubernetes workspace PVC '$namespace/$pvc'"
     IFS='|' read -r pvc_phase pvc_volume_mode pvc_access_modes <<< "$pvc_state"
     [[ "$pvc_phase" == Bound ]] ||
