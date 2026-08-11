@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://software-factory.invalid/benchmarks/cleanrl-gpu/run-manifest.schema.json",
+  "title": "CleanRL GPU benchmark run manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "benchmark", "agent_profile", "repository", "collection", "execution_profiles", "issue_jobs", "rl_runs"],
+  "properties": {
+    "$schema": {"const": "./schemas/run-manifest.schema.json"},
+    "benchmark": {"const": "cleanrl-gpu"},
+    "agent_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "base"],
+      "properties": {
+        "provider": {"const": "zai"},
+        "model": {"const": "glm-5.2"},
+        "base": {"const": "coding"}
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "revision"],
+      "properties": {
+        "url": {"const": "https://github.com/vwxyzjn/cleanrl"},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "pod_selector_label", "running_pod_command", "gpu_sample_duration_seconds", "gpu_sample_interval_seconds", "gpu_sample_command"],
+      "properties": {
+        "namespace": {"const": "software-factory-execution"},
+        "pod_selector_label": {"const": "software-factory.io/job-id"},
+        "running_pod_command": {"const": ["kubectl", "--namespace", "software-factory-execution", "get", "pods", "--selector", "software-factory.io/job-id=JOB_ID", "--field-selector", "status.phase=Running", "--output", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"]},
+        "gpu_sample_duration_seconds": {"const": 120},
+        "gpu_sample_interval_seconds": {"const": 1},
+        "gpu_sample_command": {"const": ["timeout", "120s", "kubectl", "--namespace", "software-factory-execution", "exec", "POD_NAME", "--", "sh", "-lc", "while pgrep -f '[c]leanrl/c51.py.*--total-timesteps 500000' >/dev/null; do nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits; sleep 1; done"]}
+      }
+    },
+    "execution_profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gb10", "a100"],
+      "properties": {
+        "gb10": {"$ref": "#/$defs/gb10Profile"},
+        "a100": {"$ref": "#/$defs/a100Profile"}
+      }
+    },
+    "issue_jobs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {"$ref": "#/$defs/issueJob"},
+      "allOf": [
+        {"contains": {"properties": {"id": {"const": "cleanrl-488-factory"}, "execution_profile": {"const": "gb10"}, "prompt_file": {"const": "benchmarks/cleanrl-gpu/prompts/issue-488.md"}}, "required": ["id", "execution_profile", "prompt_file"]}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "cleanrl-562-factory"}, "execution_profile": {"const": "a100"}, "prompt_file": {"const": "benchmarks/cleanrl-gpu/prompts/issue-562.md"}}, "required": ["id", "execution_profile", "prompt_file"]}, "minContains": 1, "maxContains": 1}
+      ]
+    },
+    "rl_runs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {"$ref": "#/$defs/rlRun"},
+      "allOf": [
+        {"contains": {"properties": {"id": {"const": "cleanrl-c51-gb10"}, "execution_profile": {"const": "gb10"}, "log_path": {"const": ".factory/benchmark/c51-gb10.log"}}, "required": ["id", "execution_profile", "log_path"]}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "cleanrl-c51-a100"}, "execution_profile": {"const": "a100"}, "log_path": {"const": ".factory/benchmark/c51-a100.log"}}, "required": ["id", "execution_profile", "log_path"]}, "minContains": 1, "maxContains": 1}
+      ]
+    }
+  },
+  "$defs": {
+    "cudaPreflight": {
+      "const": [
+        ".venv/bin/python",
+        "-c",
+        "import torch; assert torch.cuda.is_available(); torch.cuda.set_device(0); device=torch.device('cuda:0'); model=torch.nn.Linear(4, 1).to(device); assert next(model.parameters()).device.type == 'cuda'; tensor=torch.ones((1, 4), device=device); optimizer=torch.optim.SGD(model.parameters(), lr=0.01); before=[parameter.detach().clone() for parameter in model.parameters()]; optimizer.zero_grad(); loss=model(tensor).square().mean(); loss.backward(); assert all(parameter.grad is not None for parameter in model.parameters()); optimizer.step(); after=list(model.parameters()); assert any(not torch.equal(old, new) for old, new in zip(before, after)); assert torch.cuda.current_device() == 0"
+      ]
+    },
+    "gb10Profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_image", "execution_image", "node_local_image", "node_local_content_digest", "public_image_digest", "platform", "gpu_class", "gpu_name", "namespace", "node_name", "runtime_class", "gpu_resource", "gpu_count", "python", "virtual_environment", "system_site_packages", "dependency_input", "dependency_input_sha256", "dependency_lock", "dependency_lock_sha256", "setup_commands", "cuda_preflight_command"],
+      "properties": {
+        "base_image": {"const": "nvcr.io/nvidia/pytorch:25.08-py3"},
+        "execution_image": {"const": "docker.io/library/software-factory-gpu@sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557"},
+        "node_local_image": {"const": "software-factory-gpu:benchmark-2b88673"},
+        "node_local_content_digest": {"const": "sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557"},
+        "public_image_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "platform": {"const": "linux/arm64"},
+        "gpu_class": {"const": "NVIDIA GB10"},
+        "gpu_name": {"const": "NVIDIA GB10"},
+        "namespace": {"const": "software-factory-execution"},
+        "node_name": {"const": "spark-91b3"},
+        "runtime_class": {"const": "nvidia"},
+        "gpu_resource": {"const": "nvidia.com/gpu"},
+        "gpu_count": {"const": 1},
+        "python": {"const": "3.12"},
+        "virtual_environment": {"const": ".venv"},
+        "system_site_packages": {"const": true},
+        "dependency_input": {"const": "benchmarks/cleanrl-gpu/requirements/gb10.in"},
+        "dependency_input_sha256": {"const": "eaf3fa41a93aad1b2ee80aed5fae1b36248dad8bf5ff8b151de6f12dd814b105"},
+        "dependency_lock": {"const": "benchmarks/cleanrl-gpu/requirements/gb10.txt"},
+        "dependency_lock_sha256": {"const": "11523ca83e7da13ef6aa7c5f45945d0e93f601f55d80348211504ccf1ac1bd47"},
+        "setup_commands": {"const": ["python3.12 -m venv --system-site-packages .venv", "uv pip install --python .venv/bin/python --require-hashes --no-deps -r .factory/benchmark/gb10.txt"]},
+        "cuda_preflight_command": {"$ref": "#/$defs/cudaPreflight"}
+      }
+    },
+    "a100Profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_image", "execution_image", "node_local_image", "node_local_content_digest", "public_image_digest", "platform", "gpu_class", "gpu_name", "namespace", "node_name", "runtime_class", "gpu_resource", "gpu_count", "python", "virtual_environment", "system_site_packages", "dependency_input", "dependency_input_sha256", "dependency_lock", "dependency_lock_sha256", "setup_commands", "cuda_preflight_command"],
+      "properties": {
+        "base_image": {"const": "nvcr.io/nvidia/pytorch:25.08-py3"},
+        "execution_image": {"const": "docker.io/library/software-factory-gpu@sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673"},
+        "node_local_image": {"const": "software-factory-gpu:benchmark-2b88673"},
+        "node_local_content_digest": {"const": "sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673"},
+        "public_image_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "platform": {"const": "linux/amd64"},
+        "gpu_class": {"const": "NVIDIA A100"},
+        "gpu_name": {"const": "NVIDIA A100-SXM4-40GB"},
+        "namespace": {"const": "software-factory-execution"},
+        "node_name": {"const": "kent-ai-stuff"},
+        "runtime_class": {"const": "nvidia"},
+        "gpu_resource": {"const": "nvidia.com/gpu"},
+        "gpu_count": {"const": 1},
+        "python": {"const": "3.10.16"},
+        "virtual_environment": {"const": ".venv"},
+        "system_site_packages": {"const": false},
+        "dependency_input": {"const": "pyproject.toml"},
+        "dependency_input_sha256": {"const": "a628568b59baf3bc2c7615ba8910a4c1454d7284dcab098c5e90d04d665d7d13"},
+        "dependency_lock": {"const": "uv.lock"},
+        "dependency_lock_sha256": {"const": "34ecd77065f7f99fabac27a8e562ba4894142e67774cb98d120ab527bb44df5b"},
+        "setup_commands": {"const": ["uv python install 3.10.16", "UV_PYTHON=3.10.16 uv sync --frozen --extra envpool --extra pytest --no-dev"]},
+        "cuda_preflight_command": {"$ref": "#/$defs/cudaPreflight"}
+      }
+    },
+    "status": {"enum": ["planned", "running", "completed", "failed"]},
+    "runId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+    "issueJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "issue", "status", "execution_profile", "prompt_file", "validation_commands"],
+      "properties": {
+        "id": {"enum": ["cleanrl-488-factory", "cleanrl-562-factory"]},
+        "issue": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["number", "title", "url"],
+          "properties": {
+            "number": {"enum": [488, 562]},
+            "title": {"type": "string", "minLength": 1},
+            "url": {"type": "string", "pattern": "^https://github\\.com/vwxyzjn/cleanrl/issues/(488|562)$"}
+          }
+        },
+        "status": {"$ref": "#/$defs/status"},
+        "execution_profile": {"enum": ["gb10", "a100"]},
+        "prompt_file": {"enum": ["benchmarks/cleanrl-gpu/prompts/issue-488.md", "benchmarks/cleanrl-gpu/prompts/issue-562.md"]},
+        "validation_commands": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "rlRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "status", "source_revision", "execution_profile", "framework", "algorithm", "environment", "seed", "training_steps", "evaluation_episodes", "gpu_required", "cuda_device", "cuda_preflight_required", "log_path", "log_signals", "command"],
+      "properties": {
+        "id": {"enum": ["cleanrl-c51-gb10", "cleanrl-c51-a100"]},
+        "role": {"const": "product-validation"},
+        "status": {"$ref": "#/$defs/status"},
+        "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "execution_profile": {"enum": ["gb10", "a100"]},
+        "framework": {"const": "pytorch"},
+        "algorithm": {"const": "c51"},
+        "environment": {"const": "CartPole-v1"},
+        "seed": {"const": 1},
+        "training_steps": {"const": 500000},
+        "evaluation_episodes": {"const": 10},
+        "gpu_required": {"const": true},
+        "cuda_device": {"const": 0},
+        "cuda_preflight_required": {"const": true},
+        "log_path": {"enum": [".factory/benchmark/c51-gb10.log", ".factory/benchmark/c51-a100.log"]},
+        "log_signals": {"const": ["global_step", "episodic_return", "SPS", "eval_episode"]},
+        "command": {"const": [".venv/bin/python", "cleanrl/c51.py", "--env-id", "CartPole-v1", "--seed", "1", "--total-timesteps", "500000", "--save-model"]}
+      }
+    }
+  }
+}

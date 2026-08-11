@@ -1,0 +1,10 @@
+# Python 3.12 userspace dependencies for the GB10 benchmark profile.
+# Torch is intentionally omitted: the NVIDIA base image supplies CUDA Torch
+# through the virtual environment's system site packages.
+gymnasium[classic-control]==0.29.1
+moviepy==1.0.3
+numpy==1.26.4
+pygame==2.6.1
+pytest==8.3.5
+tensorboard==2.18.0
+tyro==0.8.6

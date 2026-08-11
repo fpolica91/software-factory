@@ -105,6 +105,12 @@ uv python install 3.10
 uv venv --python 3.10 .venv
 ```
 
+Factory execution Pods can run under any numeric non-root UID. `HOME`, the XDG
+directories, the uv cache, and uv's managed Python installation and binary
+directories point into the Pod's private `/tmp`; the active UID creates them
+on demand. Do not persist those caches as job output. The `.venv` above remains
+in the mounted workspace and is therefore available to later job stages.
+
 That environment does not inherit NVIDIA's Python 3.12 PyTorch build. Install
 a CUDA-enabled PyTorch wheel compatible with both the project and the host,
 then repeat the CUDA assertion before training.

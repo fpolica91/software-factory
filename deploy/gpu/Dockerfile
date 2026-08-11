@@ -41,7 +41,6 @@ RUN command -v git >/dev/null \
     && factory --help >/dev/null \
     && codex --version >/dev/null \
     && mkdir -p \
-        /var/lib/software-factory/codex \
         /var/lib/software-factory/coordinator \
         /var/lib/software-factory/provider \
         /factory-artifacts/local/jobs \
@@ -49,9 +48,17 @@ RUN command -v git >/dev/null \
         /workspace/project \
         /workspaces
 
-ENV CODEX_HOME=/var/lib/software-factory/codex \
+ENV HOME=/tmp/software-factory-home \
+    XDG_CACHE_HOME=/tmp/software-factory-cache \
+    XDG_CONFIG_HOME=/tmp/software-factory-config \
+    XDG_DATA_HOME=/tmp/software-factory-data \
+    UV_CACHE_DIR=/tmp/software-factory-cache/uv \
+    UV_PYTHON_INSTALL_DIR=/tmp/software-factory-python \
+    UV_PYTHON_BIN_DIR=/tmp/software-factory-bin \
+    CODEX_HOME=/tmp/software-factory-home/.codex \
     FACTORY_WORKSPACE_ROOT=/workspaces \
-    FACTORY_ARTIFACT_ROOT=/factory-artifacts
+    FACTORY_ARTIFACT_ROOT=/factory-artifacts \
+    PATH=/tmp/software-factory-bin:${PATH}
 
 WORKDIR /workspace/project
 CMD ["factory", "--help"]

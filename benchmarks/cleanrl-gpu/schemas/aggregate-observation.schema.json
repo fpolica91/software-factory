@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://software-factory.invalid/benchmarks/cleanrl-gpu/aggregate-observation.schema.json",
+  "title": "Whitelisted CleanRL GPU benchmark observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "source", "metrics"],
+  "properties": {
+    "run_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+    "source": {"enum": ["profile", "factory", "model", "kubernetes", "gpu", "rl"]},
+    "metrics": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"source": {"const": "profile"}}},
+      "then": {"properties": {"metrics": {"$ref": "#/$defs/profile"}}}
+    },
+    {
+      "if": {"properties": {"source": {"const": "factory"}}},
+      "then": {"properties": {"metrics": {"$ref": "#/$defs/factory"}}}
+    },
+    {
+      "if": {"properties": {"source": {"const": "model"}}},
+      "then": {"properties": {"metrics": {"$ref": "#/$defs/model"}}}
+    },
+    {
+      "if": {"properties": {"source": {"const": "kubernetes"}}},
+      "then": {"properties": {"metrics": {"$ref": "#/$defs/kubernetes"}}}
+    },
+    {
+      "if": {"properties": {"source": {"const": "gpu"}}},
+      "then": {"properties": {"metrics": {"$ref": "#/$defs/gpu"}}}
+    },
+    {
+      "if": {"properties": {"source": {"const": "rl"}}},
+      "then": {"properties": {"metrics": {"$ref": "#/$defs/rl"}}}
+    }
+  ],
+  "$defs": {
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "model", "provider_base"],
+      "properties": {
+        "provider": {"const": "zai"},
+        "model": {"const": "glm-5.2"},
+        "provider_base": {"const": "coding"}
+      }
+    },
+    "nonNegativeNumber": {"type": "number", "minimum": 0},
+    "nonNegativeInteger": {"type": "integer", "minimum": 0},
+    "factory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "wall_seconds",
+        "operation_count",
+        "completed_operations",
+        "stage_checkpoint_count",
+        "attempt_count",
+        "retry_count"
+      ],
+      "properties": {
+        "status": {"type": "string", "pattern": "^[a-z][a-zA-Z]*$"},
+        "wall_seconds": {"$ref": "#/$defs/nonNegativeNumber"},
+        "operation_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "completed_operations": {"$ref": "#/$defs/nonNegativeInteger"},
+        "stage_checkpoint_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "attempt_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "retry_count": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "response_count",
+        "total_tokens",
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "tool_started_count",
+        "context_compacted_count"
+      ],
+      "properties": {
+        "response_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "total_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+        "input_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+        "cached_input_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+        "cache_write_input_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+        "output_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+        "reasoning_output_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+        "tool_started_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "context_compacted_count": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "kubernetes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pod_count",
+        "pending_pods",
+        "running_pods",
+        "succeeded_pods",
+        "failed_pods",
+        "unknown_pods",
+        "pod_restart_count",
+        "runtime_class_pods"
+      ],
+      "properties": {
+        "pod_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "pending_pods": {"$ref": "#/$defs/nonNegativeInteger"},
+        "running_pods": {"$ref": "#/$defs/nonNegativeInteger"},
+        "succeeded_pods": {"$ref": "#/$defs/nonNegativeInteger"},
+        "failed_pods": {"$ref": "#/$defs/nonNegativeInteger"},
+        "unknown_pods": {"$ref": "#/$defs/nonNegativeInteger"},
+        "pod_restart_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "runtime_class_pods": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "gpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gpu_count",
+        "sample_count",
+        "gpu_seconds",
+        "gpu_utilization_mean_pct",
+        "gpu_utilization_max_pct",
+        "gpu_memory_mean_mib",
+        "gpu_memory_peak_mib"
+      ],
+      "properties": {
+        "gpu_count": {"type": "integer", "minimum": 1},
+        "sample_count": {"type": "integer", "minimum": 2},
+        "gpu_seconds": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_utilization_mean_pct": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_utilization_max_pct": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_memory_mean_mib": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_memory_peak_mib": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_power_mean_watts": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_power_peak_watts": {"$ref": "#/$defs/nonNegativeNumber"}
+      }
+    },
+    "rl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "training_steps",
+        "evaluation_episodes",
+        "evaluation_return_mean",
+        "evaluation_return_stddev"
+      ],
+      "properties": {
+        "training_steps": {"$ref": "#/$defs/nonNegativeInteger"},
+        "evaluation_episodes": {"$ref": "#/$defs/nonNegativeInteger"},
+        "evaluation_return_mean": {"type": "number"},
+        "evaluation_return_stddev": {"$ref": "#/$defs/nonNegativeNumber"}
+      }
+    }
+  }
+}

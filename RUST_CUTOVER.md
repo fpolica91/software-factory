@@ -591,11 +591,19 @@ The runnable distribution switched to Rust on 2026-08-02:
   Factory image into the immutable NVIDIA PyTorch 25.08 CUDA 13.0 base already
   exercised on GB10. Its NVIDIA index contains both AMD64 and ARM64 images for
   the A100 and GB10 hosts. A pinned multi-architecture `uv` binary supports
-  workspace-local alternate Python versions without changing the profile. It
-  is selected only through the Kubernetes execution image setting and never
-  enlarges or replaces the default control-plane image.
+  workspace-local alternate Python versions without changing the profile.
+  Pod-local `HOME`, XDG, Codex, uv cache, and uv managed-Python paths live under
+  `/tmp`, so arbitrary non-root execution UIDs can initialize them without a
+  user-specific image layer. It is selected only through the Kubernetes
+  execution image setting and never enlarges or replaces the default
+  control-plane image.
   Repo dependencies, credentials, datasets, and benchmark output remain
   runtime workspace state and are not baked into this profile.
+- `benchmarks/cleanrl-gpu/` is the active Factory-owned two-node GPU/GLM
+  evidence harness. Its standard-library collectors, strict schemas, and
+  deterministic renderer cover the GB10 and A100 runs; normalized metrics and
+  rendered charts are generated only after real jobs execute, never as sample
+  or placeholder evidence.
 - `docker-compose.yml` runs PostgreSQL, Qdrant, `factoryd`, and
   `factory-worker` by default. `factoryd` sees the
   selected host repository at `/workspace/project` so the native CLI can apply
