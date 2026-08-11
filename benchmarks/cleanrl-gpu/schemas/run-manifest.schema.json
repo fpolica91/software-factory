@@ -4,10 +4,11 @@
   "title": "CleanRL GPU benchmark run manifest",
   "type": "object",
   "additionalProperties": false,
-  "required": ["$schema", "benchmark", "agent_profile", "repository", "collection", "execution_profiles", "issue_jobs", "rl_runs"],
+  "required": ["$schema", "benchmark", "factory_revision", "agent_profile", "repository", "collection", "execution_profiles", "issue_jobs", "rl_runs"],
   "properties": {
     "$schema": {"const": "./schemas/run-manifest.schema.json"},
     "benchmark": {"const": "cleanrl-gpu"},
+    "factory_revision": {"const": "6e967bb67a92944ecdfa9b5884cc1924f2dbecba"},
     "agent_profile": {
       "type": "object",
       "additionalProperties": false,
@@ -24,20 +25,21 @@
       "required": ["url", "revision"],
       "properties": {
         "url": {"const": "https://github.com/vwxyzjn/cleanrl"},
-        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        "revision": {"const": "fe8d8a03c41a7ef5b523e2e354bd01c363e786bb"}
       }
     },
     "collection": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["namespace", "pod_selector_label", "running_pod_command", "gpu_sample_duration_seconds", "gpu_sample_interval_seconds", "gpu_sample_command"],
+      "required": ["namespace", "workspace_claim", "pod_selector_label", "running_pod_command", "gpu_sample_duration_seconds", "gpu_sample_interval_seconds", "gpu_sample_command"],
       "properties": {
         "namespace": {"const": "software-factory-execution"},
+        "workspace_claim": {"const": "software-factory-workspaces"},
         "pod_selector_label": {"const": "software-factory.io/job-id"},
         "running_pod_command": {"const": ["kubectl", "--namespace", "software-factory-execution", "get", "pods", "--selector", "software-factory.io/job-id=JOB_ID", "--field-selector", "status.phase=Running", "--output", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"]},
         "gpu_sample_duration_seconds": {"const": 120},
         "gpu_sample_interval_seconds": {"const": 1},
-        "gpu_sample_command": {"const": ["timeout", "120s", "kubectl", "--namespace", "software-factory-execution", "exec", "POD_NAME", "--", "sh", "-lc", "while pgrep -f '[c]leanrl/c51.py.*--total-timesteps 500000' >/dev/null; do nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits; sleep 1; done"]}
+        "gpu_sample_command": {"const": ["timeout", "130s", "kubectl", "--namespace", "software-factory-execution", "exec", "POD_NAME", "--", "sh", "-lc", "i=0; while [ \"$i\" -lt 120 ]; do pgrep -f '^([^ ]*/)?python([0-9]+([.][0-9]+)*)?[ ]+[c]leanrl/c51[.]py([ ]|$).*--total-timesteps[ ]+500000([ ]|$)' >/dev/null || exit 1; nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits || exit 1; i=$((i + 1)); [ \"$i\" -eq 120 ] || sleep 1; done"]}
       }
     },
     "execution_profiles": {
@@ -65,8 +67,8 @@
       "maxItems": 2,
       "items": {"$ref": "#/$defs/rlRun"},
       "allOf": [
-        {"contains": {"properties": {"id": {"const": "cleanrl-c51-gb10"}, "execution_profile": {"const": "gb10"}, "log_path": {"const": ".factory/benchmark/c51-gb10.log"}}, "required": ["id", "execution_profile", "log_path"]}, "minContains": 1, "maxContains": 1},
-        {"contains": {"properties": {"id": {"const": "cleanrl-c51-a100"}, "execution_profile": {"const": "a100"}, "log_path": {"const": ".factory/benchmark/c51-a100.log"}}, "required": ["id", "execution_profile", "log_path"]}, "minContains": 1, "maxContains": 1}
+        {"contains": {"properties": {"id": {"const": "cleanrl-c51-gb10"}, "execution_profile": {"const": "gb10"}, "log_path": {"const": ".factory/benchmark/c51-gb10.log"}, "checkpoint_path": {"const": ".factory/benchmark/c51-gb10.cleanrl_model"}}, "required": ["id", "execution_profile", "log_path", "checkpoint_path"]}, "minContains": 1, "maxContains": 1},
+        {"contains": {"properties": {"id": {"const": "cleanrl-c51-a100"}, "execution_profile": {"const": "a100"}, "log_path": {"const": ".factory/benchmark/c51-a100.log"}, "checkpoint_path": {"const": ".factory/benchmark/c51-a100.cleanrl_model"}}, "required": ["id", "execution_profile", "log_path", "checkpoint_path"]}, "minContains": 1, "maxContains": 1}
       ]
     }
   },
@@ -75,19 +77,19 @@
       "const": [
         ".venv/bin/python",
         "-c",
-        "import torch; assert torch.cuda.is_available(); torch.cuda.set_device(0); device=torch.device('cuda:0'); model=torch.nn.Linear(4, 1).to(device); assert next(model.parameters()).device.type == 'cuda'; tensor=torch.ones((1, 4), device=device); optimizer=torch.optim.SGD(model.parameters(), lr=0.01); before=[parameter.detach().clone() for parameter in model.parameters()]; optimizer.zero_grad(); loss=model(tensor).square().mean(); loss.backward(); assert all(parameter.grad is not None for parameter in model.parameters()); optimizer.step(); after=list(model.parameters()); assert any(not torch.equal(old, new) for old, new in zip(before, after)); assert torch.cuda.current_device() == 0"
+        "import torch; assert torch.cuda.is_available(); torch.cuda.set_device(0); device=torch.device('cuda:0'); gpu_name=torch.cuda.get_device_name(0); model=torch.nn.Linear(4, 1).to(device); assert next(model.parameters()).device.type == 'cuda'; torch.nn.init.constant_(model.weight, 0.25); torch.nn.init.constant_(model.bias, 0.5); tensor=torch.ones((1, 4), device=device); assert tensor.device.type == 'cuda'; optimizer=torch.optim.SGD(model.parameters(), lr=0.01); before_weight=model.weight.detach().clone(); before_bias=model.bias.detach().clone(); optimizer.zero_grad(); loss=model(tensor).square().mean(); loss.backward(); assert model.weight.grad is not None and model.bias.grad is not None; optimizer.step(); weight_changed=not torch.equal(before_weight, model.weight.detach()); bias_changed=not torch.equal(before_bias, model.bias.detach()); assert weight_changed and bias_changed; assert torch.cuda.current_device() == 0; print(f'GPU name: {gpu_name}'); print(f'weight changed: {weight_changed}'); print(f'bias changed: {bias_changed}'); print('CUDA PREFLIGHT PASS')"
       ]
     },
     "gb10Profile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["base_image", "execution_image", "node_local_image", "node_local_content_digest", "public_image_digest", "platform", "gpu_class", "gpu_name", "namespace", "node_name", "runtime_class", "gpu_resource", "gpu_count", "python", "virtual_environment", "system_site_packages", "dependency_input", "dependency_input_sha256", "dependency_lock", "dependency_lock_sha256", "setup_commands", "cuda_preflight_command"],
+      "required": ["base_image", "execution_image", "image_reference", "resolved_image_digest", "public_image_digest", "platform", "gpu_class", "gpu_name", "namespace", "node_name", "runtime_class", "gpu_resource", "gpu_count", "python", "virtual_environment", "system_site_packages", "dependency_input", "dependency_input_sha256", "dependency_lock", "dependency_lock_sha256", "setup_commands", "cuda_preflight_command"],
       "properties": {
         "base_image": {"const": "nvcr.io/nvidia/pytorch:25.08-py3"},
-        "execution_image": {"const": "docker.io/library/software-factory-gpu@sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557"},
-        "node_local_image": {"const": "software-factory-gpu:benchmark-2b88673"},
-        "node_local_content_digest": {"const": "sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557"},
-        "public_image_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "execution_image": {"enum": ["docker.io/library/software-factory-gpu@sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557", "ghcr.io/fpolica91/software-factory@sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1"]},
+        "image_reference": {"enum": ["software-factory-gpu:benchmark-2b88673", "ghcr.io/fpolica91/software-factory@sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1"]},
+        "resolved_image_digest": {"enum": ["sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557", "sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1"]},
+        "public_image_digest": {"const": "sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1"},
         "platform": {"const": "linux/arm64"},
         "gpu_class": {"const": "NVIDIA GB10"},
         "gpu_name": {"const": "NVIDIA GB10"},
@@ -103,20 +105,24 @@
         "dependency_input_sha256": {"const": "eaf3fa41a93aad1b2ee80aed5fae1b36248dad8bf5ff8b151de6f12dd814b105"},
         "dependency_lock": {"const": "benchmarks/cleanrl-gpu/requirements/gb10.txt"},
         "dependency_lock_sha256": {"const": "11523ca83e7da13ef6aa7c5f45945d0e93f601f55d80348211504ccf1ac1bd47"},
-        "setup_commands": {"const": ["python3.12 -m venv --system-site-packages .venv", "uv pip install --python .venv/bin/python --require-hashes --no-deps -r .factory/benchmark/gb10.txt"]},
+        "setup_commands": {"const": ["python3.12 -m venv --system-site-packages --without-pip /tmp/factory-cleanrl-venv", "UV_LINK_MODE=copy uv pip install --python /tmp/factory-cleanrl-venv/bin/python --require-hashes --no-deps -r .factory/benchmark/gb10.txt", "ln -sfn /tmp/factory-cleanrl-venv .venv", "mkdir -p /tmp/factory-runs && ln -sfn /tmp/factory-runs runs"]},
         "cuda_preflight_command": {"$ref": "#/$defs/cudaPreflight"}
-      }
+      },
+      "oneOf": [
+        {"properties": {"execution_image": {"const": "docker.io/library/software-factory-gpu@sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557"}, "image_reference": {"const": "software-factory-gpu:benchmark-2b88673"}, "resolved_image_digest": {"const": "sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557"}}},
+        {"properties": {"execution_image": {"const": "ghcr.io/fpolica91/software-factory@sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1"}, "image_reference": {"const": "ghcr.io/fpolica91/software-factory@sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1"}, "resolved_image_digest": {"const": "sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1"}}}
+      ]
     },
     "a100Profile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["base_image", "execution_image", "node_local_image", "node_local_content_digest", "public_image_digest", "platform", "gpu_class", "gpu_name", "namespace", "node_name", "runtime_class", "gpu_resource", "gpu_count", "python", "virtual_environment", "system_site_packages", "dependency_input", "dependency_input_sha256", "dependency_lock", "dependency_lock_sha256", "setup_commands", "cuda_preflight_command"],
+      "required": ["base_image", "execution_image", "image_reference", "resolved_image_digest", "public_image_digest", "platform", "gpu_class", "gpu_name", "namespace", "node_name", "runtime_class", "gpu_resource", "gpu_count", "python", "virtual_environment", "system_site_packages", "dependency_input", "dependency_input_sha256", "dependency_lock", "dependency_lock_sha256", "setup_commands", "cuda_preflight_command"],
       "properties": {
         "base_image": {"const": "nvcr.io/nvidia/pytorch:25.08-py3"},
-        "execution_image": {"const": "docker.io/library/software-factory-gpu@sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673"},
-        "node_local_image": {"const": "software-factory-gpu:benchmark-2b88673"},
-        "node_local_content_digest": {"const": "sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673"},
-        "public_image_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "execution_image": {"enum": ["docker.io/library/software-factory-gpu@sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673", "ghcr.io/fpolica91/software-factory@sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01"]},
+        "image_reference": {"enum": ["software-factory-gpu:benchmark-2b88673", "ghcr.io/fpolica91/software-factory@sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01"]},
+        "resolved_image_digest": {"enum": ["sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673", "sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01"]},
+        "public_image_digest": {"const": "sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01"},
         "platform": {"const": "linux/amd64"},
         "gpu_class": {"const": "NVIDIA A100"},
         "gpu_name": {"const": "NVIDIA A100-SXM4-40GB"},
@@ -132,16 +138,20 @@
         "dependency_input_sha256": {"const": "a628568b59baf3bc2c7615ba8910a4c1454d7284dcab098c5e90d04d665d7d13"},
         "dependency_lock": {"const": "uv.lock"},
         "dependency_lock_sha256": {"const": "34ecd77065f7f99fabac27a8e562ba4894142e67774cb98d120ab527bb44df5b"},
-        "setup_commands": {"const": ["uv python install 3.10.16", "UV_PYTHON=3.10.16 uv sync --frozen --extra envpool --extra pytest --no-dev"]},
+        "setup_commands": {"const": ["UV_CACHE_DIR=/tmp/factory-uv-cache uv python install 3.10.16", "UV_CACHE_DIR=/tmp/factory-uv-cache UV_PYTHON=3.10.16 UV_PROJECT_ENVIRONMENT=/tmp/factory-cleanrl-venv uv sync --frozen --extra envpool --extra pytest --no-dev", "ln -sfn /tmp/factory-cleanrl-venv .venv", "mkdir -p /tmp/factory-runs && ln -sfn /tmp/factory-runs runs"]},
         "cuda_preflight_command": {"$ref": "#/$defs/cudaPreflight"}
-      }
+      },
+      "oneOf": [
+        {"properties": {"execution_image": {"const": "docker.io/library/software-factory-gpu@sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673"}, "image_reference": {"const": "software-factory-gpu:benchmark-2b88673"}, "resolved_image_digest": {"const": "sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673"}}},
+        {"properties": {"execution_image": {"const": "ghcr.io/fpolica91/software-factory@sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01"}, "image_reference": {"const": "ghcr.io/fpolica91/software-factory@sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01"}, "resolved_image_digest": {"const": "sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01"}}}
+      ]
     },
     "status": {"enum": ["planned", "running", "completed", "failed"]},
     "runId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
     "issueJob": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "issue", "status", "execution_profile", "prompt_file", "validation_commands"],
+      "required": ["id", "issue", "status", "execution_profile", "prompt_file", "submitted_task_sha256", "reproduction_task_sha256", "cuda_log_path", "focused_test_log_path", "focused_test_count", "ppo_log_path", "ppo_training_steps", "ppo_rollout_size", "validation_commands"],
       "properties": {
         "id": {"enum": ["cleanrl-488-factory", "cleanrl-562-factory"]},
         "issue": {
@@ -157,18 +167,56 @@
         "status": {"$ref": "#/$defs/status"},
         "execution_profile": {"enum": ["gb10", "a100"]},
         "prompt_file": {"enum": ["benchmarks/cleanrl-gpu/prompts/issue-488.md", "benchmarks/cleanrl-gpu/prompts/issue-562.md"]},
+        "submitted_task_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "reproduction_task_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "cuda_log_path": {"enum": [".factory/benchmark/cuda-gb10.log", ".factory/benchmark/cuda-a100.log"]},
+        "focused_test_log_path": {"enum": [".factory/benchmark/issue-488-pytest.log", ".factory/benchmark/issue-562-pytest.log"]},
+        "focused_test_count": {"enum": [2, 5]},
+        "ppo_log_path": {"enum": [".factory/benchmark/issue-488-ppo.log", ".factory/benchmark/issue-562-ppo.log"]},
+        "ppo_training_steps": {"enum": [500000, 10000000]},
+        "ppo_rollout_size": {"enum": [512, 1024]},
         "validation_commands": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}}
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"id": {"const": "cleanrl-488-factory"}}, "required": ["id"]},
+          "then": {"properties": {
+            "issue": {"const": {"number": 488, "title": "Support ToyText env", "url": "https://github.com/vwxyzjn/cleanrl/issues/488"}},
+            "execution_profile": {"const": "gb10"},
+            "prompt_file": {"const": "benchmarks/cleanrl-gpu/prompts/issue-488.md"},
+            "cuda_log_path": {"const": ".factory/benchmark/cuda-gb10.log"},
+            "focused_test_log_path": {"const": ".factory/benchmark/issue-488-pytest.log"},
+            "focused_test_count": {"const": 2},
+            "ppo_log_path": {"const": ".factory/benchmark/issue-488-ppo.log"},
+            "ppo_training_steps": {"const": 500000},
+            "ppo_rollout_size": {"const": 512}
+          }}
+        },
+        {
+          "if": {"properties": {"id": {"const": "cleanrl-562-factory"}}, "required": ["id"]},
+          "then": {"properties": {
+            "issue": {"const": {"number": 562, "title": "GAE Bug for Envpool: Dummy Step Leak", "url": "https://github.com/vwxyzjn/cleanrl/issues/562"}},
+            "execution_profile": {"const": "a100"},
+            "prompt_file": {"const": "benchmarks/cleanrl-gpu/prompts/issue-562.md"},
+            "cuda_log_path": {"const": ".factory/benchmark/cuda-a100.log"},
+            "focused_test_log_path": {"const": ".factory/benchmark/issue-562-pytest.log"},
+            "focused_test_count": {"const": 5},
+            "ppo_log_path": {"const": ".factory/benchmark/issue-562-ppo.log"},
+            "ppo_training_steps": {"const": 10000000},
+            "ppo_rollout_size": {"const": 1024}
+          }}
+        }
+      ]
     },
     "rlRun": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "role", "status", "source_revision", "execution_profile", "framework", "algorithm", "environment", "seed", "training_steps", "evaluation_episodes", "gpu_required", "cuda_device", "cuda_preflight_required", "log_path", "log_signals", "command"],
+      "required": ["id", "role", "status", "source_revision", "execution_profile", "framework", "algorithm", "environment", "seed", "training_steps", "evaluation_episodes", "gpu_required", "cuda_device", "cuda_preflight_required", "log_path", "checkpoint_path", "log_signals", "command"],
       "properties": {
         "id": {"enum": ["cleanrl-c51-gb10", "cleanrl-c51-a100"]},
         "role": {"const": "product-validation"},
         "status": {"$ref": "#/$defs/status"},
-        "source_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_revision": {"const": "fe8d8a03c41a7ef5b523e2e354bd01c363e786bb"},
         "execution_profile": {"enum": ["gb10", "a100"]},
         "framework": {"const": "pytorch"},
         "algorithm": {"const": "c51"},
@@ -180,8 +228,9 @@
         "cuda_device": {"const": 0},
         "cuda_preflight_required": {"const": true},
         "log_path": {"enum": [".factory/benchmark/c51-gb10.log", ".factory/benchmark/c51-a100.log"]},
+        "checkpoint_path": {"enum": [".factory/benchmark/c51-gb10.cleanrl_model", ".factory/benchmark/c51-a100.cleanrl_model"]},
         "log_signals": {"const": ["global_step", "episodic_return", "SPS", "eval_episode"]},
-        "command": {"const": [".venv/bin/python", "cleanrl/c51.py", "--env-id", "CartPole-v1", "--seed", "1", "--total-timesteps", "500000", "--save-model"]}
+        "command": {"const": ["env", "PYTHONPATH=.", ".venv/bin/python", "cleanrl/c51.py", "--env-id", "CartPole-v1", "--seed", "1", "--total-timesteps", "500000", "--save-model"]}
       }
     }
   }

@@ -1,0 +1,1 @@
+{"metrics":{"checkpoint_bytes":115869,"checkpoint_sha256":"a1d9aed0d40e186788703a9a6331137f2c2336635eabf14bb68f9411bd17168a","evaluation_episodes":10,"evaluation_return_mean":500.0,"evaluation_return_stddev":0.0,"final_observed_step":499779,"training_sps":1830,"training_steps":500000},"run_id":"cleanrl-c51-gb10","source":"rl"}

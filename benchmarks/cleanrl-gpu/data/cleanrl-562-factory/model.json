@@ -1,0 +1,1 @@
+{"metrics":{"cache_write_input_tokens":0,"cached_input_tokens":15805888,"context_compacted_count":0,"input_tokens":16409248,"output_tokens":127927,"reasoning_output_tokens":100884,"response_count":144,"tool_started_count":126,"total_tokens":16537175},"run_id":"cleanrl-562-factory","source":"model"}

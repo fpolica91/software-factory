@@ -615,6 +615,8 @@ fn utf8_prefix(value: &str, limit: usize) -> usize {
 mod tests {
     use codex_app_server_protocol::RawResponseCompletedNotification;
     use codex_app_server_protocol::ReasoningTextDeltaNotification;
+    use codex_app_server_protocol::ThreadTokenUsage;
+    use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
     use codex_app_server_protocol::TokenUsageBreakdown;
 
     use super::*;
@@ -805,7 +807,61 @@ mod tests {
     }
 
     #[test]
-    fn response_without_usage_does_not_emit_metrics() {
+    fn exact_remote_compaction_usage_is_counted_once() {
+        let notification =
+            ServerNotification::RawResponseCompleted(RawResponseCompletedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-2".into(),
+                response_id: "response-compaction-1".into(),
+                usage: Some(TokenUsageBreakdown {
+                    total_tokens: 480,
+                    input_tokens: 400,
+                    cached_input_tokens: 300,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 80,
+                    reasoning_output_tokens: 0,
+                }),
+            });
+
+        let event = model_usage_event(&notification).expect("compaction usage event");
+        assert_eq!(event.deduplication_key, "model.usage:response-compaction-1");
+        assert_eq!(event.payload["totalTokens"], 480);
+        assert_eq!(event.payload["inputTokens"], 400);
+        assert_eq!(event.payload["outputTokens"], 80);
+    }
+
+    #[test]
+    fn cumulative_and_recomputed_usage_snapshots_are_not_double_counted() {
+        let notification =
+            ServerNotification::ThreadTokenUsageUpdated(ThreadTokenUsageUpdatedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-2".into(),
+                token_usage: ThreadTokenUsage {
+                    total: TokenUsageBreakdown {
+                        total_tokens: 1_000,
+                        input_tokens: 700,
+                        cached_input_tokens: 300,
+                        cache_write_input_tokens: 50,
+                        output_tokens: 300,
+                        reasoning_output_tokens: 120,
+                    },
+                    last: TokenUsageBreakdown {
+                        total_tokens: 480,
+                        input_tokens: 0,
+                        cached_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 0,
+                        reasoning_output_tokens: 0,
+                    },
+                    model_context_window: Some(950_000),
+                },
+            });
+
+        assert!(model_usage_event(&notification).is_none());
+    }
+
+    #[test]
+    fn response_without_exact_usage_does_not_emit_metrics() {
         let notification =
             ServerNotification::RawResponseCompleted(RawResponseCompletedNotification {
                 thread_id: "thread-1".into(),

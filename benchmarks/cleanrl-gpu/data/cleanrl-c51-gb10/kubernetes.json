@@ -1,0 +1,1 @@
+{"metrics":{"failed_pods":0,"isolated_workspace_pods":1,"pending_pods":0,"pod_count":1,"pod_restart_count":0,"running_pods":1,"runtime_class_pods":1,"succeeded_pods":0,"unknown_pods":0},"run_id":"cleanrl-c51-gb10","source":"kubernetes"}

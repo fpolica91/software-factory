@@ -1,0 +1,86 @@
+diff --git a/cleanrl/ppo.py b/cleanrl/ppo.py
+index edde76baef51f05a8654160dfb19a4fdb34d14d3..3c0fe5ca2a68db793e8ec4df6f30d36cd0d1601b 100644
+--- a/cleanrl/ppo.py
++++ b/cleanrl/ppo.py
+@@ -79,6 +79,25 @@ class Args:
+ 
+ 
+ def make_env(env_id, idx, capture_video, run_name):
++    """
++    ToyText envs (e.g. FrozenLake-v1) expose a Discrete observation space, which
++    PPO's fully-connected network cannot consume directly. OneHotObservation
++    converts a Discrete observation space into a one-hot Box space so the rest of
++    the algorithm runs unchanged; Box-space envs are left untouched.
++    """
++
++    class OneHotObservation(gym.ObservationWrapper):
++        def __init__(self, env):
++            super().__init__(env)
++            assert isinstance(env.observation_space, gym.spaces.Discrete)
++            self.n = env.observation_space.n
++            self.observation_space = gym.spaces.Box(0, 1, (self.n,), dtype=np.float32)
++
++        def observation(self, observation):
++            onehot = np.zeros(self.n, dtype=np.float32)
++            onehot[observation] = 1.0
++            return onehot
++
+     def thunk():
+         if capture_video and idx == 0:
+             env = gym.make(env_id, render_mode="rgb_array")
+@@ -86,6 +105,8 @@ def make_env(env_id, idx, capture_video, run_name):
+         else:
+             env = gym.make(env_id)
+         env = gym.wrappers.RecordEpisodeStatistics(env)
++        if isinstance(env.observation_space, gym.spaces.Discrete):
++            env = OneHotObservation(env)
+         return env
+ 
+     return thunk
+diff --git a/tests/test_ppo_toytext.py b/tests/test_ppo_toytext.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bdcf6ee85692888ea03615a971a93270e6adc60
+--- /dev/null
++++ b/tests/test_ppo_toytext.py
+@@ -0,0 +1,41 @@
++import subprocess
++import sys
++
++
++def test_ppo_frozenlake():
++    # Regression for issue #488: ToyText envs (FrozenLake-v1) expose a Discrete
++    # observation space that PPO must support via one-hot encoding.
++    subprocess.run(
++        [
++            sys.executable,
++            "cleanrl/ppo.py",
++            "--env-id",
++            "FrozenLake-v1",
++            "--num-envs",
++            "1",
++            "--num-steps",
++            "64",
++            "--total-timesteps",
++            "256",
++        ],
++        check=True,
++    )
++
++
++def test_ppo_box_space_unchanged():
++    # Box-space PPO (CartPole-v1) must keep working after the ToyText fix.
++    subprocess.run(
++        [
++            sys.executable,
++            "cleanrl/ppo.py",
++            "--env-id",
++            "CartPole-v1",
++            "--num-envs",
++            "1",
++            "--num-steps",
++            "64",
++            "--total-timesteps",
++            "256",
++        ],
++        check=True,
++    )

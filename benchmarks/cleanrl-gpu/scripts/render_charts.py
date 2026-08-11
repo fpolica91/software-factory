@@ -30,20 +30,13 @@ PANEL = (24, 34, 56)
 TEXT = (231, 238, 248)
 MUTED = (148, 163, 184)
 ACCENT = (45, 212, 191)
-SOURCE_COLORS = {
-    "factory": (96, 165, 250),
-    "model": (244, 114, 182),
-    "kubernetes": (167, 139, 250),
-    "gpu": (52, 211, 153),
-    "rl": (251, 191, 36),
-}
-
 # Compact 5x7 bitmap font. Each hexadecimal row stores five active bits.
 FONT = {
     " ": (0, 0, 0, 0, 0, 0, 0), "-": (0, 0, 0, 31, 0, 0, 0),
     ".": (0, 0, 0, 0, 0, 12, 12), ":": (0, 12, 12, 0, 12, 12, 0),
     "/": (1, 2, 4, 8, 16, 0, 0), "+": (0, 4, 4, 31, 4, 4, 0),
-    "%": (17, 2, 4, 8, 17, 0, 0), "?": (14, 17, 1, 2, 4, 0, 4),
+    "%": (17, 2, 4, 8, 17, 0, 0), "|": (4, 4, 4, 4, 4, 4, 4),
+    "?": (14, 17, 1, 2, 4, 0, 4),
     "0": (14, 17, 19, 21, 25, 17, 14), "1": (4, 12, 4, 4, 4, 4, 14),
     "2": (14, 17, 1, 2, 4, 8, 31), "3": (30, 1, 1, 14, 1, 1, 30),
     "4": (2, 6, 10, 18, 31, 2, 2), "5": (31, 16, 16, 30, 1, 1, 30),
@@ -65,25 +58,64 @@ FONT = {
 }
 
 
-def _metric_text(row: dict[str, Any]) -> str:
-    parts: list[str] = []
+def _metric_lines(row: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
     if "factory" in row["sources"]:
-        parts.append(f"{row['status']} / {format_number(row['wall_seconds'])}s / {row['retry_count']} retries")
+        retry_label = "retry" if row["retry_count"] == 1 else "retries"
+        lines.append(
+            f"{row['status']} | {format_number(row['wall_seconds'])}s | "
+            f"{row['completed_operations']}/{row['operation_count']} stages | "
+            f"{row['attempt_count']} attempts | {row['retry_count']} {retry_label}"
+        )
     if "model" in row["sources"]:
-        parts.append(f"{row['total_tokens']} tokens / {row['response_count']} responses")
+        lines.append(
+            f"GLM-5.2 | {row['response_count']} responses | {row['tool_started_count']} tools | "
+            f"{row['total_tokens']} tokens | {row['cached_input_tokens']} cached"
+        )
+    if "issue" in row["sources"]:
+        lines.append(
+            f"CUDA pass | {row['focused_test_count']} tests / "
+            f"{format_number(row['focused_test_seconds'])}s | "
+            f"PPO {row['ppo_completed_steps']}/{row['ppo_configured_steps']} steps | "
+            f"{row['ppo_final_sps']} SPS / "
+            f"last return {format_number(row['ppo_last_training_return'])}"
+        )
     if "kubernetes" in row["sources"]:
-        parts.append(f"{row['pod_count']} pods / {row['pod_restart_count']} restarts")
+        lines.append(
+            f"{row['isolated_workspace_pods']} isolated pod | "
+            f"{row['pod_restart_count']} restarts | "
+            f"{row['gpu_sample_count']} GPU samples / "
+            f"{format_number(row['gpu_sample_span_seconds'])}s"
+        )
     if "gpu" in row["sources"]:
-        parts.append(
-            f"GPU {format_number(row['gpu_utilization_mean_pct'])}% / "
+        memory = (
             f"{format_number(row['gpu_memory_peak_mib'])} MiB peak"
+            if "gpu_memory_peak_mib" in row
+            else "memory N/A"
+        )
+        power = (
+            f"{format_number(row['gpu_power_mean_watts'])} W mean"
+            if "gpu_power_mean_watts" in row
+            else "power N/A"
+        )
+        lines.append(
+            f"GPU {format_number(row['gpu_utilization_mean_pct'])}% mean / "
+            f"{format_number(row['gpu_utilization_max_pct'])}% max | "
+            f"{memory} | {power}"
         )
     if "rl" in row["sources"]:
-        parts.append(
-            f"return {format_number(row['evaluation_return_mean'])} +/- "
-            f"{format_number(row['evaluation_return_stddev'])}"
+        lines.append(
+            f"C51 {row['training_steps']} AT {row['training_sps']} SPS | "
+            f"{row['evaluation_episodes']} eval / return "
+            f"{format_number(row['evaluation_return_mean'])} +/- "
+            f"{format_number(row['evaluation_return_stddev'])} | "
+            f"checkpoint {row['checkpoint_bytes']} B"
         )
-    return " | ".join(parts)
+    return lines
+
+
+def _metric_text(row: dict[str, Any]) -> str:
+    return " | ".join(_metric_lines(row))
 
 
 def render_svg(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> bytes:
@@ -93,7 +125,7 @@ def render_svg(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> bytes:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" viewBox="0 0 {WIDTH} {HEIGHT}">',
         '<rect width="960" height="540" fill="#0b1020"/>',
         '<text x="48" y="56" fill="#e7eef8" font-family="system-ui,sans-serif" font-size="28" font-weight="700">CleanRL GPU benchmark</text>',
-        '<text x="48" y="84" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="14">Fixed aggregate-only summary · manifest: 2 issue jobs + 2 RL runs</text>',
+        '<text x="48" y="84" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="14">Two issue jobs and matched C51 validation across two GPU hosts</text>',
     ]
     if not rows:
         lines.extend(
@@ -117,19 +149,23 @@ def render_svg(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> bytes:
                 detail = "No aggregate observation"
                 source_text = "PLANNED"
             else:
-                detail = _metric_text(row)
+                details = _metric_lines(row)
                 source_text = " · ".join(source.upper() for source in row["sources"])
-            lines.append(
-                f'<text x="70" y="{y + 56}" fill="#94a3b8" font-family="system-ui,sans-serif" '
-                f'font-size="13">{html.escape(detail)}</text>'
-            )
+            if row is None:
+                details = [detail]
+            for line_index, detail_line in enumerate(details):
+                lines.append(
+                    f'<text x="70" y="{y + 45 + line_index * 15}" fill="#94a3b8" '
+                    f'font-family="system-ui,sans-serif" font-size="12">'
+                    f'{html.escape(detail_line)}</text>'
+                )
             lines.append(
                 f'<text x="890" y="{y + 29}" text-anchor="end" fill="#2dd4bf" '
                 f'font-family="system-ui,sans-serif" font-size="12">{html.escape(source_text)}</text>'
             )
     lines.extend(
         [
-            '<text x="48" y="516" fill="#64748b" font-family="system-ui,sans-serif" font-size="12">Only whitelisted aggregates are rendered; absence remains absence.</text>',
+            '<text x="48" y="516" fill="#64748b" font-family="system-ui,sans-serif" font-size="12">Single-seed functional evidence; not a hardware ranking.</text>',
             '</svg>',
             '',
         ]
@@ -194,17 +230,11 @@ def render_png(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> bytes:
             if row is None:
                 canvas.text(68, y + 48, "NO AGGREGATE OBSERVATION", MUTED, 1)
                 continue
-            source_x = 68
-            for source in row["sources"]:
-                canvas.rectangle(source_x, y + 47, 70, 10, SOURCE_COLORS[source])
-                source_x += 78
-            if "model" in row["sources"]:
-                canvas.text(500, y + 46, f"TOKENS {row['total_tokens']}", MUTED, 1)
-            if "gpu" in row["sources"]:
-                canvas.rectangle(690, y + 47, 180, 10, (51, 65, 85))
-                fill = round(180 * row["gpu_utilization_mean_pct"] / 100)
-                canvas.rectangle(690, y + 47, fill, 10, SOURCE_COLORS["gpu"])
-    canvas.text(48, 514, "AGGREGATES ONLY - ABSENCE REMAINS ABSENCE", MUTED, 1)
+            source_text = " / ".join(row["sources"])
+            canvas.text(700, y + 16, source_text, ACCENT, 1)
+            for line_index, detail in enumerate(_metric_lines(row)):
+                canvas.text(68, y + 38 + line_index * 15, detail, MUTED, 1)
+    canvas.text(48, 514, "SINGLE-SEED FUNCTIONAL EVIDENCE - NOT A HARDWARE RANKING", MUTED, 1)
     return _encode_png(canvas)
 
 
@@ -228,7 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         manifest, rows = _load_inputs(args.manifest, args.metrics)
-        if not rows:
+        entries = (*manifest["issue_jobs"], *manifest["rl_runs"])
+        if not rows or any(entry["status"] != "completed" for entry in entries):
             raise ContractError("no measured benchmark rows")
         svg = render_svg(manifest, rows)
         png = render_png(manifest, rows)

@@ -1,0 +1,1 @@
+{"metrics":{"gpu_count":1,"gpu_memory_mean_mib":543.0,"gpu_memory_peak_mib":543.0,"gpu_power_mean_watts":60.5455,"gpu_power_peak_watts":61.14,"gpu_sample_span_seconds":122.975,"gpu_seconds":120.0,"gpu_utilization_max_pct":24.0,"gpu_utilization_mean_pct":23.825,"sample_count":120},"run_id":"cleanrl-c51-a100","source":"gpu"}

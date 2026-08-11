@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<rect width="960" height="540" fill="#0b1020"/>
+<text x="48" y="56" fill="#e7eef8" font-family="system-ui,sans-serif" font-size="28" font-weight="700">CleanRL GPU benchmark</text>
+<text x="48" y="84" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="14">Two issue jobs and matched C51 validation across two GPU hosts</text>
+<rect x="48" y="120" width="864" height="78" rx="12" fill="#182238"/>
+<text x="70" y="149" fill="#e7eef8" font-family="ui-monospace,monospace" font-size="15" font-weight="700">cleanrl-488-factory</text>
+<text x="70" y="165" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">succeeded | 4157.332433s | 4/4 stages | 5 attempts | 1 retry</text>
+<text x="70" y="180" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">GLM-5.2 | 124 responses | 78 tools | 6941604 tokens | 6779072 cached</text>
+<text x="70" y="195" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">CUDA pass | 2 tests / 51.13s | PPO 499712/500000 steps | 4263 SPS / last return 1</text>
+<text x="890" y="149" text-anchor="end" fill="#2dd4bf" font-family="system-ui,sans-serif" font-size="12">FACTORY · MODEL · ISSUE</text>
+<rect x="48" y="216" width="864" height="78" rx="12" fill="#182238"/>
+<text x="70" y="245" fill="#e7eef8" font-family="ui-monospace,monospace" font-size="15" font-weight="700">cleanrl-562-factory</text>
+<text x="70" y="261" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">succeeded | 33743.864263s | 4/4 stages | 4 attempts | 0 retries</text>
+<text x="70" y="276" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">GLM-5.2 | 144 responses | 126 tools | 16537175 tokens | 15805888 cached</text>
+<text x="70" y="291" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">CUDA pass | 5 tests / 1.67s | PPO 9999360/10000000 steps | 332 SPS / last return 389</text>
+<text x="890" y="245" text-anchor="end" fill="#2dd4bf" font-family="system-ui,sans-serif" font-size="12">FACTORY · MODEL · ISSUE</text>
+<rect x="48" y="312" width="864" height="78" rx="12" fill="#182238"/>
+<text x="70" y="341" fill="#e7eef8" font-family="ui-monospace,monospace" font-size="15" font-weight="700">cleanrl-c51-gb10</text>
+<text x="70" y="357" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">1 isolated pod | 0 restarts | 120 GPU samples / 122.554s</text>
+<text x="70" y="372" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">GPU 23.25% mean / 29% max | memory N/A | 16.921083 W mean</text>
+<text x="70" y="387" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">C51 500000 AT 1830 SPS | 10 eval / return 500 +/- 0 | checkpoint 115869 B</text>
+<text x="890" y="341" text-anchor="end" fill="#2dd4bf" font-family="system-ui,sans-serif" font-size="12">KUBERNETES · GPU · RL</text>
+<rect x="48" y="408" width="864" height="78" rx="12" fill="#182238"/>
+<text x="70" y="437" fill="#e7eef8" font-family="ui-monospace,monospace" font-size="15" font-weight="700">cleanrl-c51-a100</text>
+<text x="70" y="453" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">1 isolated pod | 0 restarts | 120 GPU samples / 122.975s</text>
+<text x="70" y="468" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">GPU 23.825% mean / 24% max | 543 MiB peak | 60.5455 W mean</text>
+<text x="70" y="483" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="12">C51 500000 AT 787 SPS | 10 eval / return 500 +/- 0 | checkpoint 115480 B</text>
+<text x="890" y="437" text-anchor="end" fill="#2dd4bf" font-family="system-ui,sans-serif" font-size="12">KUBERNETES · GPU · RL</text>
+<text x="48" y="516" fill="#64748b" font-family="system-ui,sans-serif" font-size="12">Single-seed functional evidence; not a hardware ranking.</text>
+</svg>

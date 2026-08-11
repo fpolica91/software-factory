@@ -457,9 +457,15 @@ unplanned and must be investigated before continuing.
   cleanup after a process crash. Detached review starts in a fresh Codex thread without copying
   the parent conversation, while retaining Codex review source metadata and the
   typed parent thread, parent turn, and durable-state attachment used by
-  Factory lineage. It captures a durable semantic Git snapshot of
-  tracked, staged, and nonignored untracked content. Any review mutation is
-  restored and rejected. A mutation-detected marker is written before restore
+  Factory lineage. It captures a durable semantic Git snapshot of tracked,
+  staged, and nonignored untracked content. The top-level `.factory/` path is
+  reserved for untracked Factory artifacts. Each managed mirror preserves its
+  existing `info/exclude` contents while adding `/.factory/`, keeping artifacts
+  out of ordinary agent `git status` and `git add -A`. Repositories whose
+  current index, HEAD, or immutable workspace base tracks that path are
+  rejected during workspace materialization, review capture, and result
+  export. Any review mutation is restored and rejected. A mutation-detected
+  marker is written before restore
   and removed only after the Factory review-state rollback is durably saved,
   closing the process-death window between those operations. Ignored build and
   test artifacts are intentionally outside this read-only content gate. The
@@ -603,7 +609,11 @@ The runnable distribution switched to Rust on 2026-08-02:
   evidence harness. Its standard-library collectors, strict schemas, and
   deterministic renderer cover the GB10 and A100 runs; normalized metrics and
   rendered charts are generated only after real jobs execute, never as sample
-  or placeholder evidence.
+  or placeholder evidence. On 2026-08-11, both GLM-5.2 issue jobs and both
+  independent CUDA C51 train-checkpoint-evaluate runs completed. The four
+  normalized rows, timestamped GPU samples, exported issue patches, PNG/SVG
+  chart, and scope limitations are published under that directory; see
+  `benchmarks/cleanrl-gpu/REPORT.md` for the measured evidence.
 - `docker-compose.yml` runs PostgreSQL, Qdrant, `factoryd`, and
   `factory-worker` by default. `factoryd` sees the
   selected host repository at `/workspace/project` so the native CLI can apply

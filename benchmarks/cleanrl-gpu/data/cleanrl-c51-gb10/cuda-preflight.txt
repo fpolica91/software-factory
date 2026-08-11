@@ -1,0 +1,4 @@
+NVIDIA GB10
+weight changed
+bias changed
+CUDA PREFLIGHT PASS

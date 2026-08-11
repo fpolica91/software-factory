@@ -1,6 +1,7 @@
 {
   "$schema": "./schemas/run-manifest.schema.json",
   "benchmark": "cleanrl-gpu",
+  "factory_revision": "6e967bb67a92944ecdfa9b5884cc1924f2dbecba",
   "agent_profile": {
     "provider": "zai",
     "model": "glm-5.2",
@@ -12,6 +13,7 @@
   },
   "collection": {
     "namespace": "software-factory-execution",
+    "workspace_claim": "software-factory-workspaces",
     "pod_selector_label": "software-factory.io/job-id",
     "running_pod_command": [
       "kubectl",
@@ -30,7 +32,7 @@
     "gpu_sample_interval_seconds": 1,
     "gpu_sample_command": [
       "timeout",
-      "120s",
+      "130s",
       "kubectl",
       "--namespace",
       "software-factory-execution",
@@ -39,16 +41,16 @@
       "--",
       "sh",
       "-lc",
-      "while pgrep -f '[c]leanrl/c51.py.*--total-timesteps 500000' >/dev/null; do nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits; sleep 1; done"
+      "i=0; while [ \"$i\" -lt 120 ]; do pgrep -f '^([^ ]*/)?python([0-9]+([.][0-9]+)*)?[ ]+[c]leanrl/c51[.]py([ ]|$).*--total-timesteps[ ]+500000([ ]|$)' >/dev/null || exit 1; nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits || exit 1; i=$((i + 1)); [ \"$i\" -eq 120 ] || sleep 1; done"
     ]
   },
   "execution_profiles": {
     "gb10": {
       "base_image": "nvcr.io/nvidia/pytorch:25.08-py3",
       "execution_image": "docker.io/library/software-factory-gpu@sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557",
-      "node_local_image": "software-factory-gpu:benchmark-2b88673",
-      "node_local_content_digest": "sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557",
-      "public_image_digest": null,
+      "image_reference": "software-factory-gpu:benchmark-2b88673",
+      "resolved_image_digest": "sha256:a5e2582363acdbf172e1ebac1c5ba1de87a0fcb7420d655263b0477fa9861557",
+      "public_image_digest": "sha256:a1ee9c9920eb45cbe8362b6aa1b34c34207322b52b280b0a5428315e6d6c09a1",
       "platform": "linux/arm64",
       "gpu_class": "NVIDIA GB10",
       "gpu_name": "NVIDIA GB10",
@@ -65,21 +67,23 @@
       "dependency_lock": "benchmarks/cleanrl-gpu/requirements/gb10.txt",
       "dependency_lock_sha256": "11523ca83e7da13ef6aa7c5f45945d0e93f601f55d80348211504ccf1ac1bd47",
       "setup_commands": [
-        "python3.12 -m venv --system-site-packages .venv",
-        "uv pip install --python .venv/bin/python --require-hashes --no-deps -r .factory/benchmark/gb10.txt"
+        "python3.12 -m venv --system-site-packages --without-pip /tmp/factory-cleanrl-venv",
+        "UV_LINK_MODE=copy uv pip install --python /tmp/factory-cleanrl-venv/bin/python --require-hashes --no-deps -r .factory/benchmark/gb10.txt",
+        "ln -sfn /tmp/factory-cleanrl-venv .venv",
+        "mkdir -p /tmp/factory-runs && ln -sfn /tmp/factory-runs runs"
       ],
       "cuda_preflight_command": [
         ".venv/bin/python",
         "-c",
-        "import torch; assert torch.cuda.is_available(); torch.cuda.set_device(0); device=torch.device('cuda:0'); model=torch.nn.Linear(4, 1).to(device); assert next(model.parameters()).device.type == 'cuda'; tensor=torch.ones((1, 4), device=device); optimizer=torch.optim.SGD(model.parameters(), lr=0.01); before=[parameter.detach().clone() for parameter in model.parameters()]; optimizer.zero_grad(); loss=model(tensor).square().mean(); loss.backward(); assert all(parameter.grad is not None for parameter in model.parameters()); optimizer.step(); after=list(model.parameters()); assert any(not torch.equal(old, new) for old, new in zip(before, after)); assert torch.cuda.current_device() == 0"
+        "import torch; assert torch.cuda.is_available(); torch.cuda.set_device(0); device=torch.device('cuda:0'); gpu_name=torch.cuda.get_device_name(0); model=torch.nn.Linear(4, 1).to(device); assert next(model.parameters()).device.type == 'cuda'; torch.nn.init.constant_(model.weight, 0.25); torch.nn.init.constant_(model.bias, 0.5); tensor=torch.ones((1, 4), device=device); assert tensor.device.type == 'cuda'; optimizer=torch.optim.SGD(model.parameters(), lr=0.01); before_weight=model.weight.detach().clone(); before_bias=model.bias.detach().clone(); optimizer.zero_grad(); loss=model(tensor).square().mean(); loss.backward(); assert model.weight.grad is not None and model.bias.grad is not None; optimizer.step(); weight_changed=not torch.equal(before_weight, model.weight.detach()); bias_changed=not torch.equal(before_bias, model.bias.detach()); assert weight_changed and bias_changed; assert torch.cuda.current_device() == 0; print(f'GPU name: {gpu_name}'); print(f'weight changed: {weight_changed}'); print(f'bias changed: {bias_changed}'); print('CUDA PREFLIGHT PASS')"
       ]
     },
     "a100": {
       "base_image": "nvcr.io/nvidia/pytorch:25.08-py3",
-      "execution_image": "docker.io/library/software-factory-gpu@sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673",
-      "node_local_image": "software-factory-gpu:benchmark-2b88673",
-      "node_local_content_digest": "sha256:4d518b4a8304930a98ecd214ee580e360291c055219c1eaf0b1bef887a4b4673",
-      "public_image_digest": null,
+      "execution_image": "ghcr.io/fpolica91/software-factory@sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01",
+      "image_reference": "ghcr.io/fpolica91/software-factory@sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01",
+      "resolved_image_digest": "sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01",
+      "public_image_digest": "sha256:ae8a2aac52a5fd32489e16812113092fe21c931b2167968a2fd93811c26c2c01",
       "platform": "linux/amd64",
       "gpu_class": "NVIDIA A100",
       "gpu_name": "NVIDIA A100-SXM4-40GB",
@@ -96,13 +100,15 @@
       "dependency_lock": "uv.lock",
       "dependency_lock_sha256": "34ecd77065f7f99fabac27a8e562ba4894142e67774cb98d120ab527bb44df5b",
       "setup_commands": [
-        "uv python install 3.10.16",
-        "UV_PYTHON=3.10.16 uv sync --frozen --extra envpool --extra pytest --no-dev"
+        "UV_CACHE_DIR=/tmp/factory-uv-cache uv python install 3.10.16",
+        "UV_CACHE_DIR=/tmp/factory-uv-cache UV_PYTHON=3.10.16 UV_PROJECT_ENVIRONMENT=/tmp/factory-cleanrl-venv uv sync --frozen --extra envpool --extra pytest --no-dev",
+        "ln -sfn /tmp/factory-cleanrl-venv .venv",
+        "mkdir -p /tmp/factory-runs && ln -sfn /tmp/factory-runs runs"
       ],
       "cuda_preflight_command": [
         ".venv/bin/python",
         "-c",
-        "import torch; assert torch.cuda.is_available(); torch.cuda.set_device(0); device=torch.device('cuda:0'); model=torch.nn.Linear(4, 1).to(device); assert next(model.parameters()).device.type == 'cuda'; tensor=torch.ones((1, 4), device=device); optimizer=torch.optim.SGD(model.parameters(), lr=0.01); before=[parameter.detach().clone() for parameter in model.parameters()]; optimizer.zero_grad(); loss=model(tensor).square().mean(); loss.backward(); assert all(parameter.grad is not None for parameter in model.parameters()); optimizer.step(); after=list(model.parameters()); assert any(not torch.equal(old, new) for old, new in zip(before, after)); assert torch.cuda.current_device() == 0"
+        "import torch; assert torch.cuda.is_available(); torch.cuda.set_device(0); device=torch.device('cuda:0'); gpu_name=torch.cuda.get_device_name(0); model=torch.nn.Linear(4, 1).to(device); assert next(model.parameters()).device.type == 'cuda'; torch.nn.init.constant_(model.weight, 0.25); torch.nn.init.constant_(model.bias, 0.5); tensor=torch.ones((1, 4), device=device); assert tensor.device.type == 'cuda'; optimizer=torch.optim.SGD(model.parameters(), lr=0.01); before_weight=model.weight.detach().clone(); before_bias=model.bias.detach().clone(); optimizer.zero_grad(); loss=model(tensor).square().mean(); loss.backward(); assert model.weight.grad is not None and model.bias.grad is not None; optimizer.step(); weight_changed=not torch.equal(before_weight, model.weight.detach()); bias_changed=not torch.equal(before_bias, model.bias.detach()); assert weight_changed and bias_changed; assert torch.cuda.current_device() == 0; print(f'GPU name: {gpu_name}'); print(f'weight changed: {weight_changed}'); print(f'bias changed: {bias_changed}'); print('CUDA PREFLIGHT PASS')"
       ]
     }
   },
@@ -114,9 +120,17 @@
         "title": "Support ToyText env",
         "url": "https://github.com/vwxyzjn/cleanrl/issues/488"
       },
-      "status": "planned",
+      "status": "completed",
       "execution_profile": "gb10",
       "prompt_file": "benchmarks/cleanrl-gpu/prompts/issue-488.md",
+      "submitted_task_sha256": "fa89a85c644ea062244d0581ca55ce0c7acbf1431f4f8872be113a432aa37479",
+      "reproduction_task_sha256": "e83b4f007366f2ba25aa37fe7c3146a742a25721478cd55df80c4bff947a5730",
+      "cuda_log_path": ".factory/benchmark/cuda-gb10.log",
+      "focused_test_log_path": ".factory/benchmark/issue-488-pytest.log",
+      "focused_test_count": 2,
+      "ppo_log_path": ".factory/benchmark/issue-488-ppo.log",
+      "ppo_training_steps": 500000,
+      "ppo_rollout_size": 512,
       "validation_commands": [
         ".venv/bin/python -m pytest -q tests/test_ppo_toytext.py",
         ".venv/bin/python cleanrl/ppo.py --env-id FrozenLake-v1 --seed 1 --total-timesteps 500000"
@@ -129,9 +143,17 @@
         "title": "GAE Bug for Envpool: Dummy Step Leak",
         "url": "https://github.com/vwxyzjn/cleanrl/issues/562"
       },
-      "status": "planned",
+      "status": "completed",
       "execution_profile": "a100",
       "prompt_file": "benchmarks/cleanrl-gpu/prompts/issue-562.md",
+      "submitted_task_sha256": "0f7e9b5162daedebad4c798840dc29d7d06efacaece89deaa19bbad577c9ce3c",
+      "reproduction_task_sha256": "1098ef1a48d053fa764438d31e6364342c3429cfe19436b5252e1ee213d660fc",
+      "cuda_log_path": ".factory/benchmark/cuda-a100.log",
+      "focused_test_log_path": ".factory/benchmark/issue-562-pytest.log",
+      "focused_test_count": 5,
+      "ppo_log_path": ".factory/benchmark/issue-562-ppo.log",
+      "ppo_training_steps": 10000000,
+      "ppo_rollout_size": 1024,
       "validation_commands": [
         ".venv/bin/python -m pytest -q tests/test_ppo_atari_envpool_dummy_step.py",
         ".venv/bin/python cleanrl/ppo_atari_envpool.py --env-id Breakout-v5 --seed 1 --total-timesteps 10000000"
@@ -142,7 +164,7 @@
     {
       "id": "cleanrl-c51-gb10",
       "role": "product-validation",
-      "status": "planned",
+      "status": "completed",
       "source_revision": "fe8d8a03c41a7ef5b523e2e354bd01c363e786bb",
       "execution_profile": "gb10",
       "framework": "pytorch",
@@ -155,6 +177,7 @@
       "cuda_device": 0,
       "cuda_preflight_required": true,
       "log_path": ".factory/benchmark/c51-gb10.log",
+      "checkpoint_path": ".factory/benchmark/c51-gb10.cleanrl_model",
       "log_signals": [
         "global_step",
         "episodic_return",
@@ -162,6 +185,8 @@
         "eval_episode"
       ],
       "command": [
+        "env",
+        "PYTHONPATH=.",
         ".venv/bin/python",
         "cleanrl/c51.py",
         "--env-id",
@@ -176,7 +201,7 @@
     {
       "id": "cleanrl-c51-a100",
       "role": "product-validation",
-      "status": "planned",
+      "status": "completed",
       "source_revision": "fe8d8a03c41a7ef5b523e2e354bd01c363e786bb",
       "execution_profile": "a100",
       "framework": "pytorch",
@@ -189,6 +214,7 @@
       "cuda_device": 0,
       "cuda_preflight_required": true,
       "log_path": ".factory/benchmark/c51-a100.log",
+      "checkpoint_path": ".factory/benchmark/c51-a100.cleanrl_model",
       "log_signals": [
         "global_step",
         "episodic_return",
@@ -196,6 +222,8 @@
         "eval_episode"
       ],
       "command": [
+        "env",
+        "PYTHONPATH=.",
         ".venv/bin/python",
         "cleanrl/c51.py",
         "--env-id",

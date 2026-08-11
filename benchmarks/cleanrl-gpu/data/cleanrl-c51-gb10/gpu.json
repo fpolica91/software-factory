@@ -1,0 +1,1 @@
+{"metrics":{"gpu_count":1,"gpu_power_mean_watts":16.921083,"gpu_power_peak_watts":17.38,"gpu_sample_span_seconds":122.554,"gpu_seconds":120.0,"gpu_utilization_max_pct":29.0,"gpu_utilization_mean_pct":23.25,"sample_count":120},"run_id":"cleanrl-c51-gb10","source":"gpu"}

@@ -1,0 +1,1 @@
+{"metrics":{"cuda_optimizer_step_passed":1,"focused_test_count":5,"focused_test_seconds":1.67,"ppo_completed_steps":9999360,"ppo_completion_verified":1,"ppo_configured_steps":10000000,"ppo_final_sps":332,"ppo_last_logged_step":9995448,"ppo_last_training_return":389.0},"run_id":"cleanrl-562-factory","source":"issue"}

@@ -5,7 +5,10 @@
 
 # Build artifacts
 **/node_modules/
+**/__pycache__/
+*.py[cod]
 
 # session backups (may contain secrets) — never commit
 *.bak
 *.bak-*
+benchmarks/cleanrl-gpu/run-manifest.reproduction.json

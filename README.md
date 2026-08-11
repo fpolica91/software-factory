@@ -137,7 +137,8 @@ before selecting this profile.
 - [Codex kernel and Factory lifecycle decision](docs/adr/0001-codex-kernel-factory-extension.md)
 - [Remote execution environment decision](docs/adr/0002-codex-remote-execution-environments.md)
 - [Optional Kubernetes execution decision](docs/adr/0003-single-host-k3s-execution-profile.md)
-- [Planned CleanRL GPU evidence](benchmarks/cleanrl-gpu/README.md) (reproducible scaffold; no results yet)
+- [Measured two-host CleanRL GPU benchmark](benchmarks/cleanrl-gpu/REPORT.md)
+  (real GLM-5.2 Factory jobs and CUDA RL loops on GB10 and A100)
 
 Factory-owned Rust lives under `factory-harness/factory/`. The preserved Codex
 kernel remains upstream-shaped under `factory-harness/codex-rs/`. Contributors

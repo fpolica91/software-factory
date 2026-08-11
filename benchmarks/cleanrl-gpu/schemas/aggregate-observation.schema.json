@@ -7,7 +7,7 @@
   "required": ["run_id", "source", "metrics"],
   "properties": {
     "run_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
-    "source": {"enum": ["profile", "factory", "model", "kubernetes", "gpu", "rl"]},
+    "source": {"enum": ["profile", "factory", "model", "issue", "kubernetes", "gpu", "rl"]},
     "metrics": {"type": "object"}
   },
   "allOf": [
@@ -24,6 +24,10 @@
       "then": {"properties": {"metrics": {"$ref": "#/$defs/model"}}}
     },
     {
+      "if": {"properties": {"source": {"const": "issue"}}},
+      "then": {"properties": {"metrics": {"$ref": "#/$defs/issue"}}}
+    },
+    {
       "if": {"properties": {"source": {"const": "kubernetes"}}},
       "then": {"properties": {"metrics": {"$ref": "#/$defs/kubernetes"}}}
     },
@@ -34,6 +38,38 @@
     {
       "if": {"properties": {"source": {"const": "rl"}}},
       "then": {"properties": {"metrics": {"$ref": "#/$defs/rl"}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "run_id": {"const": "cleanrl-488-factory"},
+          "source": {"const": "issue"}
+        },
+        "required": ["run_id", "source"]
+      },
+      "then": {"properties": {"metrics": {"properties": {
+        "focused_test_count": {"const": 2},
+        "ppo_configured_steps": {"const": 500000},
+        "ppo_completed_steps": {"const": 499712},
+        "ppo_last_logged_step": {"type": "integer", "minimum": 1, "maximum": 499712},
+        "ppo_completion_verified": {"const": 1}
+      }}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "run_id": {"const": "cleanrl-562-factory"},
+          "source": {"const": "issue"}
+        },
+        "required": ["run_id", "source"]
+      },
+      "then": {"properties": {"metrics": {"properties": {
+        "focused_test_count": {"const": 5},
+        "ppo_configured_steps": {"const": 10000000},
+        "ppo_completed_steps": {"const": 9999360},
+        "ppo_last_logged_step": {"type": "integer", "minimum": 1, "maximum": 9999360},
+        "ppo_completion_verified": {"const": 1}
+      }}}}
     }
   ],
   "$defs": {
@@ -59,16 +95,18 @@
         "completed_operations",
         "stage_checkpoint_count",
         "attempt_count",
-        "retry_count"
+        "retry_count",
+        "stage_sequence_verified"
       ],
       "properties": {
-        "status": {"type": "string", "pattern": "^[a-z][a-zA-Z]*$"},
+        "status": {"const": "succeeded"},
         "wall_seconds": {"$ref": "#/$defs/nonNegativeNumber"},
-        "operation_count": {"$ref": "#/$defs/nonNegativeInteger"},
-        "completed_operations": {"$ref": "#/$defs/nonNegativeInteger"},
-        "stage_checkpoint_count": {"$ref": "#/$defs/nonNegativeInteger"},
-        "attempt_count": {"$ref": "#/$defs/nonNegativeInteger"},
-        "retry_count": {"$ref": "#/$defs/nonNegativeInteger"}
+        "operation_count": {"const": 4},
+        "completed_operations": {"const": 4},
+        "stage_checkpoint_count": {"const": 4},
+        "attempt_count": {"type": "integer", "minimum": 4},
+        "retry_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "stage_sequence_verified": {"const": 1}
       }
     },
     "model": {
@@ -86,7 +124,7 @@
         "context_compacted_count"
       ],
       "properties": {
-        "response_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "response_count": {"type": "integer", "minimum": 1},
         "total_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
         "input_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
         "cached_input_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
@@ -95,6 +133,32 @@
         "reasoning_output_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
         "tool_started_count": {"$ref": "#/$defs/nonNegativeInteger"},
         "context_compacted_count": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cuda_optimizer_step_passed",
+        "focused_test_count",
+        "focused_test_seconds",
+        "ppo_configured_steps",
+        "ppo_completed_steps",
+        "ppo_last_logged_step",
+        "ppo_completion_verified",
+        "ppo_final_sps",
+        "ppo_last_training_return"
+      ],
+      "properties": {
+        "cuda_optimizer_step_passed": {"const": 1},
+        "focused_test_count": {"enum": [2, 5]},
+        "focused_test_seconds": {"$ref": "#/$defs/nonNegativeNumber"},
+        "ppo_configured_steps": {"type": "integer", "minimum": 500000, "maximum": 10000000},
+        "ppo_completed_steps": {"type": "integer", "minimum": 499712, "maximum": 9999360},
+        "ppo_last_logged_step": {"type": "integer", "minimum": 1, "maximum": 9999360},
+        "ppo_completion_verified": {"const": 1},
+        "ppo_final_sps": {"type": "integer", "minimum": 1},
+        "ppo_last_training_return": {"type": "number"}
       }
     },
     "kubernetes": {
@@ -108,17 +172,19 @@
         "failed_pods",
         "unknown_pods",
         "pod_restart_count",
-        "runtime_class_pods"
+        "runtime_class_pods",
+        "isolated_workspace_pods"
       ],
       "properties": {
-        "pod_count": {"$ref": "#/$defs/nonNegativeInteger"},
-        "pending_pods": {"$ref": "#/$defs/nonNegativeInteger"},
-        "running_pods": {"$ref": "#/$defs/nonNegativeInteger"},
-        "succeeded_pods": {"$ref": "#/$defs/nonNegativeInteger"},
-        "failed_pods": {"$ref": "#/$defs/nonNegativeInteger"},
-        "unknown_pods": {"$ref": "#/$defs/nonNegativeInteger"},
+        "pod_count": {"const": 1},
+        "pending_pods": {"const": 0},
+        "running_pods": {"const": 1},
+        "succeeded_pods": {"const": 0},
+        "failed_pods": {"const": 0},
+        "unknown_pods": {"const": 0},
         "pod_restart_count": {"$ref": "#/$defs/nonNegativeInteger"},
-        "runtime_class_pods": {"$ref": "#/$defs/nonNegativeInteger"}
+        "runtime_class_pods": {"const": 1},
+        "isolated_workspace_pods": {"const": 1}
       }
     },
     "gpu": {
@@ -128,17 +194,23 @@
         "gpu_count",
         "sample_count",
         "gpu_seconds",
+        "gpu_sample_span_seconds",
         "gpu_utilization_mean_pct",
-        "gpu_utilization_max_pct",
-        "gpu_memory_mean_mib",
-        "gpu_memory_peak_mib"
+        "gpu_utilization_max_pct"
       ],
+      "dependentRequired": {
+        "gpu_memory_mean_mib": ["gpu_memory_peak_mib"],
+        "gpu_memory_peak_mib": ["gpu_memory_mean_mib"],
+        "gpu_power_mean_watts": ["gpu_power_peak_watts"],
+        "gpu_power_peak_watts": ["gpu_power_mean_watts"]
+      },
       "properties": {
-        "gpu_count": {"type": "integer", "minimum": 1},
-        "sample_count": {"type": "integer", "minimum": 2},
-        "gpu_seconds": {"$ref": "#/$defs/nonNegativeNumber"},
-        "gpu_utilization_mean_pct": {"$ref": "#/$defs/nonNegativeNumber"},
-        "gpu_utilization_max_pct": {"$ref": "#/$defs/nonNegativeNumber"},
+        "gpu_count": {"const": 1},
+        "sample_count": {"const": 120},
+        "gpu_seconds": {"const": 120},
+        "gpu_sample_span_seconds": {"type": "number", "minimum": 115, "maximum": 150},
+        "gpu_utilization_mean_pct": {"type": "number", "minimum": 0, "maximum": 100},
+        "gpu_utilization_max_pct": {"type": "number", "minimum": 0, "maximum": 100},
         "gpu_memory_mean_mib": {"$ref": "#/$defs/nonNegativeNumber"},
         "gpu_memory_peak_mib": {"$ref": "#/$defs/nonNegativeNumber"},
         "gpu_power_mean_watts": {"$ref": "#/$defs/nonNegativeNumber"},
@@ -150,15 +222,23 @@
       "additionalProperties": false,
       "required": [
         "training_steps",
+        "final_observed_step",
+        "training_sps",
         "evaluation_episodes",
         "evaluation_return_mean",
-        "evaluation_return_stddev"
+        "evaluation_return_stddev",
+        "checkpoint_bytes",
+        "checkpoint_sha256"
       ],
       "properties": {
-        "training_steps": {"$ref": "#/$defs/nonNegativeInteger"},
-        "evaluation_episodes": {"$ref": "#/$defs/nonNegativeInteger"},
+        "training_steps": {"const": 500000},
+        "final_observed_step": {"type": "integer", "minimum": 499500, "maximum": 499999},
+        "training_sps": {"type": "integer", "minimum": 1},
+        "evaluation_episodes": {"const": 10},
         "evaluation_return_mean": {"type": "number"},
-        "evaluation_return_stddev": {"$ref": "#/$defs/nonNegativeNumber"}
+        "evaluation_return_stddev": {"$ref": "#/$defs/nonNegativeNumber"},
+        "checkpoint_bytes": {"type": "integer", "minimum": 1},
+        "checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     }
   }

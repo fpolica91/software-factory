@@ -23,6 +23,9 @@ use uuid::Uuid;
 const REVIEW_SNAPSHOT_METADATA: &str = "snapshot.json";
 const REVIEW_SNAPSHOT_INDEX: &str = "baseline.index";
 const REVIEW_SNAPSHOT_TREE_INDEX: &str = "tree.index";
+const FACTORY_ARTIFACTS_PATHSPEC: &str = ":(top).factory";
+const FACTORY_ARTIFACTS_EXCLUSION: &str = ":(top,exclude).factory";
+const FACTORY_ARTIFACTS_IGNORE_PATTERN: &str = "/.factory/";
 const REMOTE_BRANCH_REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
 const REMOTE_TAG_REFSPEC: &str = "+refs/tags/*:refs/tags/*";
 
@@ -100,7 +103,14 @@ impl WorkspaceManager {
                 )));
             }
             if existing.state == WorkspaceState::Active && Path::new(&existing.root).is_dir() {
-                return Ok(existing.clone());
+                let worktree = self.managed_worktree_path(existing).await?;
+                let mirror = self.mirror_path(&existing.repository_id);
+                if linked_worktree_matches(&worktree, &mirror).await? {
+                    ensure_factory_artifacts_ignored(&mirror).await?;
+                    reject_tracked_factory_artifacts(&worktree, Some(&existing.base_revision))
+                        .await?;
+                    return Ok(existing.clone());
+                }
             }
         }
 
@@ -159,6 +169,18 @@ impl WorkspaceManager {
         let canonical_root = tokio::fs::canonicalize(&worktree)
             .await
             .map_err(workspace_io)?;
+        if let Err(error) = reject_tracked_factory_artifacts(&canonical_root, None).await {
+            let _ = run_git([
+                "--git-dir",
+                path_text(&mirror)?,
+                "worktree",
+                "remove",
+                "--force",
+                path_text(&canonical_root)?,
+            ])
+            .await;
+            return Err(error);
+        }
         let revision = run_git(["-C", path_text(&canonical_root)?, "rev-parse", "HEAD"]).await?;
         store
             .put_workspace(&WorkspaceBinding {
@@ -187,6 +209,7 @@ impl WorkspaceManager {
             }
             if mirror_matches_repository(&mirror, repository).await? {
                 refresh_remote(&mirror).await?;
+                ensure_factory_artifacts_ignored(&mirror).await?;
                 let revision = resolve_mirror_revision(&mirror, base_ref)
                     .await?
                     .ok_or_else(|| unresolved_base_ref(repository, base_ref))?;
@@ -212,6 +235,7 @@ impl WorkspaceManager {
         let revision = resolve_mirror_revision(&candidate, base_ref)
             .await?
             .ok_or_else(|| unresolved_base_ref(repository, base_ref))?;
+        ensure_factory_artifacts_ignored(&candidate).await?;
         tokio::fs::rename(&candidate, &mirror)
             .await
             .map_err(workspace_io)?;
@@ -282,6 +306,7 @@ impl WorkspaceManager {
         }
         let workspace = self.load(store, job_id).await?;
         let worktree = self.managed_worktree_path(&workspace).await?;
+        reject_tracked_factory_artifacts(&worktree, Some(&workspace.base_revision)).await?;
         let indexes = self.root.join("result-indexes");
         tokio::fs::create_dir_all(&indexes)
             .await
@@ -403,8 +428,11 @@ impl WorkspaceManager {
     }
 
     /// Captures the implementation content that a detached review must not
-    /// change. Tracked files and nonignored untracked files are preserved;
-    /// ignored build and test artifacts are deliberately excluded.
+    /// change. Tracked files and nonignored untracked files are preserved. A
+    /// repository whose index, current HEAD, or immutable base tracks the
+    /// reserved top-level `.factory/` path is rejected; only the untracked
+    /// Factory-owned artifact tree is excluded. Ignored build and test
+    /// artifacts are deliberately excluded.
     ///
     /// The metadata lives on the shared workspace volume so a replacement
     /// process can restore it after process loss.
@@ -419,6 +447,7 @@ impl WorkspaceManager {
             )));
         }
         let worktree = self.managed_worktree_path(workspace).await?;
+        reject_tracked_factory_artifacts(&worktree, Some(&workspace.base_revision)).await?;
         let snapshot_id = Uuid::new_v4().to_string();
         let snapshot_dir = self.review_snapshot_dir(&workspace.job_id);
         if snapshot_dir.exists() {
@@ -632,7 +661,15 @@ impl WorkspaceManager {
                 metadata.head.as_str(),
             ])
             .await?;
-            run_git(["-C", path_text(&worktree)?, "clean", "-ffd"]).await?;
+            run_git([
+                "-C",
+                path_text(&worktree)?,
+                "clean",
+                "-ffd",
+                "-e",
+                FACTORY_ARTIFACTS_IGNORE_PATTERN,
+            ])
+            .await?;
             run_git([
                 "-C",
                 path_text(&worktree)?,
@@ -845,6 +882,89 @@ async fn linked_worktree_matches(worktree: &Path, mirror: &Path) -> Result<bool>
         .await
         .map_err(workspace_io)?;
     Ok(Path::new(&top_level) == canonical_worktree && Path::new(&common_dir) == canonical_mirror)
+}
+
+async fn ensure_factory_artifacts_ignored(mirror: &Path) -> Result<()> {
+    let info = mirror.join("info");
+    tokio::fs::create_dir_all(&info)
+        .await
+        .map_err(workspace_io)?;
+    let exclude = info.join("exclude");
+    let existing = match tokio::fs::read(&exclude).await {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(workspace_io(error)),
+    };
+    if String::from_utf8_lossy(&existing)
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == FACTORY_ARTIFACTS_IGNORE_PATTERN)
+    {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with(b"\n") {
+        updated.push(b'\n');
+    }
+    updated.extend_from_slice(FACTORY_ARTIFACTS_IGNORE_PATTERN.as_bytes());
+    updated.push(b'\n');
+    let candidate = info.join(format!("exclude.partial-{}", Uuid::new_v4()));
+    tokio::fs::write(&candidate, updated)
+        .await
+        .map_err(workspace_io)?;
+    if let Err(error) = tokio::fs::rename(&candidate, &exclude).await {
+        let _ = tokio::fs::remove_file(candidate).await;
+        return Err(workspace_io(error));
+    }
+    Ok(())
+}
+
+async fn reject_tracked_factory_artifacts(
+    worktree: &Path,
+    base_revision: Option<&str>,
+) -> Result<()> {
+    let tracked_index = run_git([
+        "-C",
+        path_text(worktree)?,
+        "ls-files",
+        "--",
+        FACTORY_ARTIFACTS_PATHSPEC,
+    ])
+    .await?;
+    let tracked_head = run_git([
+        "-C",
+        path_text(worktree)?,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "HEAD",
+        "--",
+        FACTORY_ARTIFACTS_PATHSPEC,
+    ])
+    .await?;
+    let tracked_base = match base_revision {
+        Some(base_revision) => {
+            run_git([
+                "-C",
+                path_text(worktree)?,
+                "ls-tree",
+                "-r",
+                "--name-only",
+                base_revision,
+                "--",
+                FACTORY_ARTIFACTS_PATHSPEC,
+            ])
+            .await?
+        }
+        None => String::new(),
+    };
+    if tracked_index.is_empty() && tracked_head.is_empty() && tracked_base.is_empty() {
+        return Ok(());
+    }
+    Err(CoordinatorError::InvalidInput(
+        "repository tracks the reserved top-level `.factory` path; Factory owns this path for job artifacts"
+            .to_string(),
+    ))
 }
 
 fn validate_request(request: &EnsureWorkspaceRequest) -> Result<()> {
@@ -1217,6 +1337,7 @@ async fn generate_result_patch(
     base_revision: &str,
     index: &Path,
 ) -> Result<Vec<u8>> {
+    reject_tracked_factory_artifacts(worktree, Some(base_revision)).await?;
     run_git_with_index(worktree, index, ["read-tree", base_revision]).await?;
     run_git_with_index(worktree, index, ["add", "-A", "--", "."]).await?;
     run_git_bytes_with_index(
@@ -1232,6 +1353,8 @@ async fn generate_result_patch(
             "--no-textconv",
             base_revision,
             "--",
+            ".",
+            FACTORY_ARTIFACTS_EXCLUSION,
         ],
     )
     .await
@@ -1368,6 +1491,236 @@ mod tests {
             updated_at: now,
         };
         (manager, record, canonical_root)
+    }
+
+    fn assert_reserved_factory_error(error: CoordinatorError) {
+        match error {
+            CoordinatorError::InvalidInput(message) => assert_eq!(
+                message,
+                "repository tracks the reserved top-level `.factory` path; Factory owns this path for job artifacts"
+            ),
+            error => panic!("expected reserved .factory rejection, got {error}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FACTORY_COORDINATOR_TEST_DATABASE_URL"]
+    async fn workspace_ensure_guard_rejects_a_repository_that_tracks_factory_artifacts() {
+        let root = TestRoot::new();
+        tokio::fs::create_dir_all(&root.0).await.unwrap();
+        let (source, _) = create_source(&root.0, "tracked-factory-source", "source readme\n").await;
+        tokio::fs::create_dir_all(source.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(source.join(".factory/config.json"), b"{}\n")
+            .await
+            .unwrap();
+        run_git([
+            "-C",
+            path_text(&source).unwrap(),
+            "add",
+            ".factory/config.json",
+        ])
+        .await
+        .unwrap();
+        run_git([
+            "-C",
+            path_text(&source).unwrap(),
+            "commit",
+            "-m",
+            "track reserved factory path",
+        ])
+        .await
+        .unwrap();
+
+        let store = CoordinatorStore::connect(
+            &std::env::var("FACTORY_COORDINATOR_TEST_DATABASE_URL").expect(
+                "set FACTORY_COORDINATOR_TEST_DATABASE_URL to a disposable PostgreSQL database",
+            ),
+        )
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        let job = store
+            .create_job(crate::JobDefinition {
+                kind: format!("tracked-factory-ensure-test-{}", Uuid::new_v4()),
+                input: serde_json::json!({}),
+                operations: vec![crate::OperationDefinition {
+                    kind: "execute".to_string(),
+                    input: serde_json::json!({}),
+                    max_attempts: 1,
+                }],
+            })
+            .await
+            .unwrap();
+        let workspaces = root.0.join("workspaces-tracked-factory-ensure");
+        let manager = WorkspaceManager::new(&workspaces).unwrap();
+        let error = manager
+            .ensure(
+                &store,
+                &job.job.job_id,
+                EnsureWorkspaceRequest {
+                    repository_id: format!("tracked-factory-source:{}", Uuid::new_v4()),
+                    repository: path_text(&source).unwrap().to_string(),
+                    base_ref: "main".to_string(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_reserved_factory_error(error);
+        assert!(
+            store
+                .load_workspace(&job.job.job_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !workspaces
+                .join("jobs")
+                .join(job.job.job_id.as_str())
+                .exists()
+        );
+        store.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FACTORY_COORDINATOR_TEST_DATABASE_URL"]
+    async fn workspace_ensure_upgrades_an_active_mirror_missing_the_factory_exclude() {
+        let root = TestRoot::new();
+        tokio::fs::create_dir_all(&root.0).await.unwrap();
+        let (source, _) = create_source(&root.0, "exclude-upgrade-source", "source readme\n").await;
+        let store = CoordinatorStore::connect(
+            &std::env::var("FACTORY_COORDINATOR_TEST_DATABASE_URL").expect(
+                "set FACTORY_COORDINATOR_TEST_DATABASE_URL to a disposable PostgreSQL database",
+            ),
+        )
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        let job = store
+            .create_job(crate::JobDefinition {
+                kind: format!("factory-exclude-upgrade-test-{}", Uuid::new_v4()),
+                input: serde_json::json!({}),
+                operations: vec![crate::OperationDefinition {
+                    kind: "execute".to_string(),
+                    input: serde_json::json!({}),
+                    max_attempts: 1,
+                }],
+            })
+            .await
+            .unwrap();
+        let workspaces = root.0.join("workspaces-exclude-upgrade");
+        let manager = WorkspaceManager::new(&workspaces).unwrap();
+        let request = EnsureWorkspaceRequest {
+            repository_id: format!("exclude-upgrade-source:{}", Uuid::new_v4()),
+            repository: path_text(&source).unwrap().to_string(),
+            base_ref: "main".to_string(),
+        };
+        let workspace = manager
+            .ensure(&store, &job.job.job_id, request.clone())
+            .await
+            .unwrap();
+        let mirror = manager.mirror_path(&workspace.repository_id);
+        tokio::fs::write(mirror.join("info/exclude"), b"# pre-upgrade\n")
+            .await
+            .unwrap();
+        let worktree = Path::new(&workspace.root);
+        tokio::fs::create_dir_all(worktree.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/agent.log"), b"artifact\n")
+            .await
+            .unwrap();
+        assert!(
+            run_git([
+                "-C",
+                workspace.root.as_str(),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ])
+            .await
+            .unwrap()
+            .contains(".factory/agent.log")
+        );
+
+        let reused = manager
+            .ensure(&store, &job.job.job_id, request)
+            .await
+            .unwrap();
+        assert_eq!(reused.root, workspace.root);
+        assert_eq!(
+            tokio::fs::read(mirror.join("info/exclude")).await.unwrap(),
+            b"# pre-upgrade\n/.factory/\n"
+        );
+        assert!(
+            run_git([
+                "-C",
+                workspace.root.as_str(),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ])
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn managed_mirror_hides_factory_artifacts_from_status_and_add_all() {
+        let root = TestRoot::new();
+        tokio::fs::create_dir_all(&root.0).await.unwrap();
+        let (source, _) = create_source(&root.0, "factory-ignore-source", "source readme\n").await;
+        let (manager, record, worktree) =
+            create_managed_record(&root.0, &source, "factory-ignore").await;
+        let mirror = manager.mirror_path(&record.repository_id);
+        let exclude = mirror.join("info/exclude");
+        tokio::fs::write(&exclude, b"# preserve this\n*.scratch")
+            .await
+            .unwrap();
+        ensure_factory_artifacts_ignored(&mirror).await.unwrap();
+        let expected = b"# preserve this\n*.scratch\n/.factory/\n";
+        assert_eq!(tokio::fs::read(&exclude).await.unwrap(), expected);
+        ensure_factory_artifacts_ignored(&mirror).await.unwrap();
+        assert_eq!(tokio::fs::read(&exclude).await.unwrap(), expected);
+
+        tokio::fs::create_dir_all(worktree.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/agent.log"), b"artifact\n")
+            .await
+            .unwrap();
+        assert!(
+            run_git([
+                "-C",
+                record.root.as_str(),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ])
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        run_git(["-C", record.root.as_str(), "add", "-A"])
+            .await
+            .unwrap();
+        assert!(
+            run_git([
+                "-C",
+                record.root.as_str(),
+                "diff",
+                "--cached",
+                "--name-only",
+            ])
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(worktree.join(".factory/agent.log").is_file());
     }
 
     async fn quarantined_marker_exists(mirrors: &Path, marker: &str) -> bool {
@@ -1982,6 +2335,34 @@ mod tests {
         manager.validate_pristine(&record).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn review_capture_rejects_factory_artifacts_that_become_tracked() {
+        let root = TestRoot::new();
+        tokio::fs::create_dir_all(&root.0).await.unwrap();
+        let (source, _) = create_source(&root.0, "tracked-review-source", "source readme\n").await;
+        let (manager, record, worktree) =
+            create_managed_record(&root.0, &source, "tracked-factory-review").await;
+        tokio::fs::create_dir_all(worktree.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/findings.md"), b"finding\n")
+            .await
+            .unwrap();
+        run_git([
+            "-C",
+            record.root.as_str(),
+            "add",
+            "-f",
+            ".factory/findings.md",
+        ])
+        .await
+        .unwrap();
+
+        let error = manager.capture_review_snapshot(&record).await.unwrap_err();
+        assert_reserved_factory_error(error);
+        assert!(!manager.review_snapshot_dir(&record.job_id).exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn detached_review_restores_guarded_content_and_preserves_ignored_artifacts() {
@@ -2032,6 +2413,12 @@ mod tests {
         tokio::fs::write(worktree.join("baseline-new.txt"), b"baseline untracked\n")
             .await
             .unwrap();
+        tokio::fs::create_dir_all(worktree.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/evidence.log"), b"before review\n")
+            .await
+            .unwrap();
 
         let snapshot = manager.capture_review_snapshot(&record).await.unwrap();
 
@@ -2058,6 +2445,18 @@ mod tests {
         tokio::fs::write(
             worktree.join("compiler.ignored"),
             b"leave ignored artifact\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(worktree.join(".factory/evidence.log"), b"after review\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(worktree.join("nested/.factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            worktree.join("nested/.factory/review-only.log"),
+            b"remove nested review artifact\n",
         )
         .await
         .unwrap();
@@ -2090,6 +2489,13 @@ mod tests {
                 .unwrap(),
             b"baseline untracked\n"
         );
+        assert_eq!(
+            tokio::fs::read(worktree.join(".factory/evidence.log"))
+                .await
+                .unwrap(),
+            b"after review\n"
+        );
+        assert!(!worktree.join("nested/.factory").exists());
         assert!(!worktree.join("review-new.txt").exists());
         assert_eq!(
             tokio::fs::read(worktree.join("compiler.ignored"))
@@ -2160,9 +2566,18 @@ mod tests {
         let (source, _) = create_source(&root.0, "read-only-source", "source readme\n").await;
         let (manager, record, worktree) =
             create_managed_record(&root.0, &source, "review-read-only").await;
+        tokio::fs::create_dir_all(worktree.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/raw.log"), b"before review\n")
+            .await
+            .unwrap();
         let snapshot = manager.capture_review_snapshot(&record).await.unwrap();
 
         tokio::fs::write(worktree.join("README.md"), b"source readme\n")
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/raw.log"), b"after review\n")
             .await
             .unwrap();
         run_git(["-C", record.root.as_str(), "status", "--short"])
@@ -2175,12 +2590,110 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert_eq!(
+            tokio::fs::read(worktree.join(".factory/raw.log"))
+                .await
+                .unwrap(),
+            b"after review\n"
+        );
         assert!(
             !root
                 .0
                 .join("workspaces-review-read-only/review-snapshots/review-read-only")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn result_export_rejects_factory_artifacts_that_become_tracked() {
+        let root = TestRoot::new();
+        tokio::fs::create_dir_all(&root.0).await.unwrap();
+        let (source, _) = create_source(&root.0, "tracked-export-source", "source readme\n").await;
+        let (_, record, worktree) =
+            create_managed_record(&root.0, &source, "tracked-factory-export").await;
+        tokio::fs::create_dir_all(worktree.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/result.md"), b"result\n")
+            .await
+            .unwrap();
+        run_git([
+            "-C",
+            record.root.as_str(),
+            "add",
+            "-f",
+            ".factory/result.md",
+        ])
+        .await
+        .unwrap();
+
+        let error = generate_result_patch(
+            &worktree,
+            &record.base_revision,
+            &root.0.join("tracked-result.index"),
+        )
+        .await
+        .unwrap_err();
+        assert_reserved_factory_error(error);
+        assert!(!root.0.join("tracked-result.index").exists());
+    }
+
+    #[tokio::test]
+    async fn result_export_rejects_a_base_that_tracked_factory_after_head_deletes_it() {
+        let root = TestRoot::new();
+        tokio::fs::create_dir_all(&root.0).await.unwrap();
+        let (source, _) = create_source(&root.0, "base-factory-source", "source readme\n").await;
+        tokio::fs::create_dir_all(source.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(source.join(".factory/legacy.txt"), b"legacy\n")
+            .await
+            .unwrap();
+        run_git([
+            "-C",
+            path_text(&source).unwrap(),
+            "add",
+            ".factory/legacy.txt",
+        ])
+        .await
+        .unwrap();
+        run_git([
+            "-C",
+            path_text(&source).unwrap(),
+            "commit",
+            "-m",
+            "track legacy factory artifact",
+        ])
+        .await
+        .unwrap();
+        let (_, record, worktree) =
+            create_managed_record(&root.0, &source, "base-factory-export").await;
+        run_git(["-C", record.root.as_str(), "rm", "-r", ".factory"])
+            .await
+            .unwrap();
+        run_git([
+            "-C",
+            record.root.as_str(),
+            "-c",
+            "user.name=Factory Export Test",
+            "-c",
+            "user.email=factory-export@example.invalid",
+            "commit",
+            "-m",
+            "delete legacy factory artifact",
+        ])
+        .await
+        .unwrap();
+        reject_tracked_factory_artifacts(&worktree, None)
+            .await
+            .unwrap();
+
+        let index = root.0.join("base-tracked-result.index");
+        let error = generate_result_patch(&worktree, &record.base_revision, &index)
+            .await
+            .unwrap_err();
+        assert_reserved_factory_error(error);
+        assert!(!index.exists());
     }
 
     #[cfg(unix)]
@@ -2235,6 +2748,12 @@ mod tests {
         tokio::fs::write(worktree.join("new.bin"), [6_u8, 0, 5, 4])
             .await
             .unwrap();
+        tokio::fs::create_dir_all(worktree.join(".factory"))
+            .await
+            .unwrap();
+        tokio::fs::write(worktree.join(".factory/raw.log"), b"private evidence\n")
+            .await
+            .unwrap();
         let mut permissions = tokio::fs::metadata(worktree.join("mode.sh"))
             .await
             .unwrap()
@@ -2282,6 +2801,7 @@ mod tests {
             tokio::fs::read(target.join("new.bin")).await.unwrap(),
             [6_u8, 0, 5, 4]
         );
+        assert!(!target.join(".factory").exists());
         assert_ne!(
             tokio::fs::metadata(target.join("mode.sh"))
                 .await

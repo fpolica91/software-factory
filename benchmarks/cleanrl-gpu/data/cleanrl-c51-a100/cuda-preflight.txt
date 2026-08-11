@@ -1,0 +1,5 @@
+device: NVIDIA A100-SXM4-40GB
+loss: 1.379621
+param weight changed, max abs diff: 0.007483
+param bias changed, max abs diff: 0.005116
+CUDA backward + optimizer.step() PASS: parameter changed
