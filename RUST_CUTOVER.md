@@ -325,6 +325,14 @@ unplanned and must be investigated before continuing.
   renders execution Pods without `fsGroup` in `preserve` mode, while retaining
   the configured `runAsUser` and `runAsGroup`. The operator-managed filesystem
   must already permit those UID/GID values to access the required subpaths.
+  Kubernetes resource configuration remains native Pod data. A worker may
+  optionally pin all of its execution Pods to one preflighted Ready schedulable
+  node with `FACTORY_KUBERNETES_NODE_NAME`; an empty value leaves scheduling to
+  Kubernetes. `FACTORY_KUBERNETES_GPU_COUNT=0` preserves the CPU-only manifest.
+  A positive count preflights the configurable fully qualified extended
+  resource (default `nvidia.com/gpu`) against eligible node allocatable data and
+  renders equal whole-number request and limit entries. No per-job scheduling
+  protocol or Factory Pod-spec mirror was added.
   Docker and `local` mode retain the default `manage` behavior and unchanged
   Pod `fsGroup`.
   Final K3s/runc acceptance passed on ARM64 node `spark-91b3` with acceptance
@@ -578,6 +586,16 @@ The runnable distribution switched to Rust on 2026-08-02:
   no legacy client, integration, workflow, or provider script enters the
   image. `factoryd` and the provider bridge drain Axum gracefully on both
   SIGINT and the SIGTERM used by container shutdown.
+- `deploy/gpu/` is the optional multi-architecture GPU execution-image seam.
+  It copies the Factory/Codex binaries and worker entrypoint from an immutable
+  Factory image into the immutable NVIDIA PyTorch 25.08 CUDA 13.0 base already
+  exercised on GB10. Its NVIDIA index contains both AMD64 and ARM64 images for
+  the A100 and GB10 hosts. A pinned multi-architecture `uv` binary supports
+  workspace-local alternate Python versions without changing the profile. It
+  is selected only through the Kubernetes execution image setting and never
+  enlarges or replaces the default control-plane image.
+  Repo dependencies, credentials, datasets, and benchmark output remain
+  runtime workspace state and are not baked into this profile.
 - `docker-compose.yml` runs PostgreSQL, Qdrant, `factoryd`, and
   `factory-worker` by default. `factoryd` sees the
   selected host repository at `/workspace/project` so the native CLI can apply

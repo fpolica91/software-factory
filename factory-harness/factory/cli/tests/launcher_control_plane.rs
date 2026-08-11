@@ -566,6 +566,9 @@ case " $* " in
     printf 'FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=%s\n' "$FACTORY_TEST_WORKSPACE"
     printf 'FACTORY_KUBERNETES_NAMESPACE=%s\n' "$FACTORY_TEST_NAMESPACE"
     printf 'FACTORY_KUBERNETES_WORKSPACE_PVC=%s\n' "$FACTORY_TEST_PVC"
+    printf 'FACTORY_KUBERNETES_NODE_NAME=%s\n' "$FACTORY_TEST_NODE_PIN"
+    printf 'FACTORY_KUBERNETES_GPU_RESOURCE=%s\n' "$FACTORY_TEST_GPU_RESOURCE"
+    printf 'FACTORY_KUBERNETES_GPU_COUNT=%s\n' "$FACTORY_TEST_GPU_COUNT"
     ;;
 esac
 exit 0
@@ -577,6 +580,7 @@ exit 0
 printf 'kubectl %s\n' "$*" >> "$FACTORY_DOCKER_LOG"
 case " $* " in
   *" get nodes -o "*) printf '%s\n' "$FACTORY_TEST_NODES" ;;
+  *" get node "*) printf '%s' "$FACTORY_TEST_GPU_ALLOCATABLE" ;;
   *" get pvc "*)
     case "$*" in
       *'{range .spec.accessModes[*]}{@}{","}{end}'*)
@@ -615,7 +619,11 @@ exit 91
                namespace: &str,
                pvc: &str,
                nodes: &str,
-               pvc_state: &str| {
+               pvc_state: &str,
+               node_pin: &str,
+               gpu_resource: &str,
+               gpu_count: &str,
+               gpu_allocatable: &str| {
         let log = fixture.0.join(format!("existing-pvc-{name}.log"));
         let output = output_retrying_executable_file_busy(
             Command::new(&launcher)
@@ -630,7 +638,11 @@ exit 91
                 .env("FACTORY_TEST_NAMESPACE", namespace)
                 .env("FACTORY_TEST_PVC", pvc)
                 .env("FACTORY_TEST_NODES", nodes)
-                .env("FACTORY_TEST_PVC_STATE", pvc_state),
+                .env("FACTORY_TEST_PVC_STATE", pvc_state)
+                .env("FACTORY_TEST_NODE_PIN", node_pin)
+                .env("FACTORY_TEST_GPU_RESOURCE", gpu_resource)
+                .env("FACTORY_TEST_GPU_COUNT", gpu_count)
+                .env("FACTORY_TEST_GPU_ALLOCATABLE", gpu_allocatable),
         );
         (log, output)
     };
@@ -665,6 +677,10 @@ exit 91
             pvc,
             ready_nodes,
             "Bound||ReadWriteMany,",
+            "",
+            "nvidia.com/gpu",
+            "0",
+            "0",
         );
         assert!(!output.status.success(), "{name} unexpectedly passed");
         assert!(
@@ -708,6 +724,10 @@ exit 91
             "shared-workspaces",
             nodes,
             pvc_state,
+            "",
+            "nvidia.com/gpu",
+            "0",
+            "0",
         );
         assert!(!output.status.success(), "{name} unexpectedly passed");
         assert!(
@@ -721,6 +741,80 @@ exit 91
         assert!(!commands.contains(" up "));
     }
 
+    for (name, node_pin, gpu_resource, gpu_count, expected) in [
+        (
+            "invalid-node-pin",
+            "INVALID_NODE",
+            "nvidia.com/gpu",
+            "0",
+            "FACTORY_KUBERNETES_NODE_NAME must be a Kubernetes DNS subdomain",
+        ),
+        (
+            "unavailable-node-pin",
+            "missing-node",
+            "nvidia.com/gpu",
+            "0",
+            "is not Ready and schedulable",
+        ),
+        (
+            "invalid-gpu-count",
+            "",
+            "nvidia.com/gpu",
+            "-1",
+            "FACTORY_KUBERNETES_GPU_COUNT must be a non-negative integer",
+        ),
+        (
+            "invalid-gpu-resource",
+            "",
+            "gpu",
+            "1",
+            "must be a fully qualified Kubernetes extended resource",
+        ),
+    ] {
+        let (log, output) = run(
+            name,
+            &workspace_text,
+            "shared-factory",
+            "shared-workspaces",
+            ready_nodes,
+            "Bound||ReadWriteMany,",
+            node_pin,
+            gpu_resource,
+            gpu_count,
+            "2",
+        );
+        assert!(!output.status.success(), "{name} unexpectedly passed");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{name} produced unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!std::fs::read_to_string(log).unwrap().contains(" up "));
+    }
+
+    let (log, output) = run(
+        "insufficient-pinned-gpu",
+        &workspace_text,
+        "shared-factory",
+        "shared-workspaces",
+        ready_nodes,
+        "Bound||ReadWriteMany,",
+        "ready-b",
+        "nvidia.com/gpu",
+        "2",
+        "1",
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("no eligible Kubernetes node advertises at least 2")
+    );
+    assert!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .contains(r#"get node ready-b -o jsonpath={.status.allocatable.nvidia\.com/gpu}"#)
+    );
+
     let (log, output) = run(
         "valid",
         &workspace_text,
@@ -728,6 +822,10 @@ exit 91
         "shared-workspaces",
         ready_nodes,
         "Bound||ReadWriteMany,ReadWriteOnce,",
+        "ready-b",
+        "nvidia.com/gpu",
+        "2",
+        "2",
     );
     assert!(
         output.status.success(),
@@ -744,11 +842,15 @@ exit 91
         visible_output
             .contains("existing PVC shared-factory/shared-workspaces, 2 Ready schedulable node(s)")
     );
+    assert!(visible_output.contains("node ready-b, GPU nvidia.com/gpu=2"));
     assert!(!visible_output.contains(SENTINEL_KEY));
 
     let commands = std::fs::read_to_string(log).unwrap();
     assert!(commands.contains("get pvc shared-workspaces"));
     assert!(commands.contains(r#"{range .spec.accessModes[*]}{@}{","}{end}"#));
+    assert!(
+        commands.contains(r#"get node ready-b -o jsonpath={.status.allocatable.nvidia\.com/gpu}"#)
+    );
     assert!(!commands.contains(r#"{range .spec.accessModes[*]}{.}{","}{end}"#));
     assert!(commands.contains("ownership=preserve docker"));
     assert!(!commands.contains("apply -f"));
@@ -773,6 +875,16 @@ fn entrypoint_preserves_existing_pvc_workspace_ownership_and_compose_propagates_
         2,
         "the Kubernetes overlay must pass the derived policy to factoryd and factory-worker"
     );
+    for mapping in [
+        "FACTORY_KUBERNETES_NODE_NAME: ${FACTORY_KUBERNETES_NODE_NAME:-}",
+        "FACTORY_KUBERNETES_GPU_RESOURCE: ${FACTORY_KUBERNETES_GPU_RESOURCE:-nvidia.com/gpu}",
+        "FACTORY_KUBERNETES_GPU_COUNT: ${FACTORY_KUBERNETES_GPU_COUNT:-0}",
+    ] {
+        assert!(
+            compose_overlay.contains(mapping),
+            "the Kubernetes overlay must propagate {mapping}"
+        );
+    }
 
     for command in ["mkdir", "chown", "cp", "chmod", "setpriv"] {
         write_executable(

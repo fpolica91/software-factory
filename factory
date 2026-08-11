@@ -75,6 +75,7 @@ KUBECTL=()
 KUBERNETES_PREFLIGHTED=0
 KUBERNETES_WORKSPACE_MODE=''
 KUBERNETES_NODE_NAME=''
+KUBERNETES_EXECUTION_NODE_NAME=''
 KUBERNETES_SCHEDULABLE_NODE_COUNT=''
 KUBERNETES_WORKSPACE_HOST_DIR=''
 KUBERNETES_NAMESPACE=''
@@ -83,6 +84,8 @@ KUBERNETES_WORKSPACE_PV=''
 KUBERNETES_WORKSPACE_SIZE_GIB=''
 KUBERNETES_RUNTIME_CLASS=''
 KUBERNETES_RUNTIME_HANDLER=''
+KUBERNETES_GPU_RESOURCE=''
+KUBERNETES_GPU_COUNT='0'
 
 die() {
   printf 'factory: %s\n' "$*" >&2
@@ -320,6 +323,29 @@ validate_dns_subdomain() {
   done
 }
 
+validate_kubernetes_extended_resource_name() {
+  local name=$1 value=$2 prefix resource label
+  local -a labels
+  [[ "$value" == */* && "$value" != */*/* ]] ||
+    die "$name must be a fully qualified Kubernetes extended resource such as nvidia.com/gpu"
+  prefix=${value%%/*}
+  resource=${value#*/}
+  [[ ${#prefix} -le 253 && "$prefix" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] ||
+    die "$name must be a fully qualified Kubernetes extended resource such as nvidia.com/gpu"
+  IFS='.' read -r -a labels <<< "$prefix"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -le 63 && "$label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+      die "$name must be a fully qualified Kubernetes extended resource such as nvidia.com/gpu"
+  done
+  case "$prefix" in
+    kubernetes.io | *.kubernetes.io | k8s.io | *.k8s.io)
+      die "$name must use a non-Kubernetes domain prefix"
+      ;;
+  esac
+  [[ ${#resource} -le 63 && "$resource" =~ ^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$ ]] ||
+    die "$name must be a fully qualified Kubernetes extended resource such as nvidia.com/gpu"
+}
+
 validate_factory_project_name() {
   [[ "$FACTORY_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
     die 'FACTORY_PROJECT_NAME must start with a lowercase letter or digit and contain only lowercase letters, digits, underscore, and hyphen'
@@ -392,6 +418,20 @@ positive_integer() {
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
 }
 
+nonnegative_u32() {
+  local name=$1 value=$2 normalized
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer"
+  normalized=$value
+  while [[ ${#normalized} -gt 1 && ${normalized:0:1} == 0 ]]; do
+    normalized=${normalized#0}
+  done
+  if (( ${#normalized} > 10 )) ||
+    { (( ${#normalized} == 10 )) && [[ "$normalized" > 4294967295 ]]; }; then
+    die "$name must be no greater than 4294967295"
+  fi
+  printf '%s' "$normalized"
+}
+
 select_kubectl() {
   local kubeconfig=$1
   if command -v kubectl >/dev/null 2>&1; then
@@ -410,8 +450,9 @@ sed_replacement() {
 preflight_kubernetes_profile() {
   local kubeconfig image workspace_mode workspace_host_dir workspace_root namespace pvc pv
   local cpu_request memory_request cpu_limit memory_limit readiness_seconds storage_gib
-  local nodes node_rows node_count node_name kubeconfig_quoted runtime_class runtime_handler=''
+  local nodes node_rows node_count node_name node_pin kubeconfig_quoted runtime_class runtime_handler=''
   local pvc_state pvc_phase pvc_volume_mode pvc_access_modes
+  local gpu_resource gpu_count gpu_nodes gpu_jsonpath node allocatable gpu_node_found=0
 
   (( KUBERNETES_PREFLIGHTED == 0 )) || return
 
@@ -480,6 +521,21 @@ preflight_kubernetes_profile() {
   (( cpu_limit >= cpu_request )) || die 'Kubernetes CPU limit must be at least its request'
   (( memory_limit >= memory_request )) || die 'Kubernetes memory limit must be at least its request'
 
+  node_pin=$(compose_environment_value FACTORY_KUBERNETES_NODE_NAME)
+  if [[ -n "$node_pin" ]]; then
+    validate_dns_subdomain FACTORY_KUBERNETES_NODE_NAME "$node_pin"
+  fi
+  gpu_resource=$(compose_environment_value FACTORY_KUBERNETES_GPU_RESOURCE)
+  gpu_resource=${gpu_resource:-nvidia.com/gpu}
+  gpu_count=$(compose_environment_value FACTORY_KUBERNETES_GPU_COUNT)
+  gpu_count=$(nonnegative_u32 FACTORY_KUBERNETES_GPU_COUNT "${gpu_count:-0}")
+  if (( gpu_count > 0 )); then
+    validate_kubernetes_extended_resource_name FACTORY_KUBERNETES_GPU_RESOURCE "$gpu_resource"
+  fi
+  export FACTORY_KUBERNETES_NODE_NAME=$node_pin
+  export FACTORY_KUBERNETES_GPU_RESOURCE=$gpu_resource
+  export FACTORY_KUBERNETES_GPU_COUNT=$gpu_count
+
   select_kubectl "$kubeconfig"
   if [[ "$workspace_mode" == local ]]; then
     nodes=$("${KUBECTL[@]}" get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}') ||
@@ -488,6 +544,8 @@ preflight_kubernetes_profile() {
     [[ "$node_count" == 1 ]] || die "the local workspace profile requires exactly one Kubernetes node; found $node_count"
     node_name=$(printf '%s\n' "$nodes" | awk 'NF { print; exit }')
     [[ -n "$node_name" && "$node_name" != *$'\n'* ]] || die 'Kubernetes returned an invalid node name'
+    [[ -z "$node_pin" || "$node_pin" == "$node_name" ]] ||
+      die "configured Kubernetes node '$node_pin' is not the local workspace node '$node_name'"
   else
     node_rows=$("${KUBECTL[@]}" get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.spec.unschedulable}{"|"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}') ||
       die 'cannot list Kubernetes nodes with the configured kubeconfig'
@@ -495,6 +553,9 @@ preflight_kubernetes_profile() {
     node_count=$(printf '%s\n' "$nodes" | awk 'NF { count++ } END { print count + 0 }')
     (( node_count >= 1 )) || die 'the existing-pvc workspace mode requires at least one Ready schedulable Kubernetes node'
     node_name=''
+    if [[ -n "$node_pin" ]] && ! printf '%s\n' "$nodes" | grep -Fxq -- "$node_pin"; then
+      die "configured Kubernetes node '$node_pin' is not Ready and schedulable"
+    fi
 
     pvc_state=$("${KUBECTL[@]}" -n "$namespace" get pvc "$pvc" -o 'jsonpath={.status.phase}{"|"}{.spec.volumeMode}{"|"}{range .spec.accessModes[*]}{@}{","}{end}') ||
       die "cannot read existing Kubernetes workspace PVC '$namespace/$pvc'"
@@ -507,6 +568,28 @@ preflight_kubernetes_profile() {
       *,ReadWriteMany,*) ;;
       *) die "existing Kubernetes workspace PVC '$namespace/$pvc' must include ReadWriteMany access" ;;
     esac
+  fi
+
+  if (( gpu_count > 0 )); then
+    gpu_nodes=$nodes
+    if [[ -n "$node_pin" ]]; then
+      gpu_nodes=$node_pin
+    fi
+    gpu_jsonpath=${gpu_resource//./\\.}
+    while IFS= read -r node; do
+      [[ -n "$node" ]] || continue
+      allocatable=$("${KUBECTL[@]}" get node "$node" -o "jsonpath={.status.allocatable.${gpu_jsonpath}}") ||
+        die "cannot read Kubernetes extended resource '$gpu_resource' on node '$node'"
+      allocatable=${allocatable:-0}
+      [[ "$allocatable" =~ ^[0-9]+$ ]] ||
+        die "Kubernetes node '$node' returned invalid allocatable '$gpu_resource' quantity '$allocatable'"
+      if (( 10#$allocatable >= gpu_count )); then
+        gpu_node_found=1
+        break
+      fi
+    done <<< "$gpu_nodes"
+    (( gpu_node_found == 1 )) ||
+      die "no eligible Kubernetes node advertises at least $gpu_count of extended resource '$gpu_resource'"
   fi
 
   runtime_class=$(compose_environment_value FACTORY_KUBERNETES_RUNTIME_CLASS)
@@ -524,6 +607,7 @@ preflight_kubernetes_profile() {
 
   KUBERNETES_WORKSPACE_MODE=$workspace_mode
   KUBERNETES_NODE_NAME=$node_name
+  KUBERNETES_EXECUTION_NODE_NAME=$node_pin
   KUBERNETES_SCHEDULABLE_NODE_COUNT=$node_count
   KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
   KUBERNETES_NAMESPACE=$namespace
@@ -532,23 +616,32 @@ preflight_kubernetes_profile() {
   KUBERNETES_WORKSPACE_SIZE_GIB=$storage_gib
   KUBERNETES_RUNTIME_CLASS=$runtime_class
   KUBERNETES_RUNTIME_HANDLER=$runtime_handler
+  KUBERNETES_GPU_RESOURCE=$gpu_resource
+  KUBERNETES_GPU_COUNT=$gpu_count
   KUBERNETES_PREFLIGHTED=1
 }
 
 prepare_kubernetes_profile() {
-  local rendered workspace_host_dir
+  local rendered workspace_host_dir node_summary='' gpu_summary=''
 
   preflight_kubernetes_profile
   workspace_host_dir=$KUBERNETES_WORKSPACE_HOST_DIR
+  if [[ -n "$KUBERNETES_EXECUTION_NODE_NAME" ]]; then
+    printf -v node_summary ', node %s' "$KUBERNETES_EXECUTION_NODE_NAME"
+  fi
+  if (( KUBERNETES_GPU_COUNT > 0 )); then
+    printf -v gpu_summary ', GPU %s=%s' "$KUBERNETES_GPU_RESOURCE" "$KUBERNETES_GPU_COUNT"
+  fi
   if [[ "$KUBERNETES_WORKSPACE_MODE" == existing-pvc ]]; then
     export FACTORY_KUBERNETES_WORKSPACE_HOST_DIR=$workspace_host_dir
     if [[ -n "$KUBERNETES_RUNTIME_CLASS" ]]; then
-      printf 'Factory execution backend: kubernetes (worker factory-worker, existing PVC %s/%s, %s Ready schedulable node(s), RuntimeClass %s, handler %s)\n' \
+      printf 'Factory execution backend: kubernetes (worker factory-worker, existing PVC %s/%s, %s Ready schedulable node(s), RuntimeClass %s, handler %s%s%s)\n' \
         "$KUBERNETES_NAMESPACE" "$KUBERNETES_WORKSPACE_PVC" "$KUBERNETES_SCHEDULABLE_NODE_COUNT" \
-        "$KUBERNETES_RUNTIME_CLASS" "$KUBERNETES_RUNTIME_HANDLER" >&2
+        "$KUBERNETES_RUNTIME_CLASS" "$KUBERNETES_RUNTIME_HANDLER" "$node_summary" "$gpu_summary" >&2
     else
-      printf 'Factory execution backend: kubernetes (worker factory-worker, existing PVC %s/%s, %s Ready schedulable node(s), cluster-default runtime)\n' \
-        "$KUBERNETES_NAMESPACE" "$KUBERNETES_WORKSPACE_PVC" "$KUBERNETES_SCHEDULABLE_NODE_COUNT" >&2
+      printf 'Factory execution backend: kubernetes (worker factory-worker, existing PVC %s/%s, %s Ready schedulable node(s), cluster-default runtime%s%s)\n' \
+        "$KUBERNETES_NAMESPACE" "$KUBERNETES_WORKSPACE_PVC" "$KUBERNETES_SCHEDULABLE_NODE_COUNT" \
+        "$node_summary" "$gpu_summary" >&2
     fi
     return
   fi
@@ -573,11 +666,11 @@ prepare_kubernetes_profile() {
   fi
   rm -f -- "$rendered"
   if [[ -n "$KUBERNETES_RUNTIME_CLASS" ]]; then
-    printf 'Factory execution backend: kubernetes (worker factory-worker, node %s, RuntimeClass %s, handler %s)\n' \
-      "$KUBERNETES_NODE_NAME" "$KUBERNETES_RUNTIME_CLASS" "$KUBERNETES_RUNTIME_HANDLER" >&2
+    printf 'Factory execution backend: kubernetes (worker factory-worker, node %s, RuntimeClass %s, handler %s%s)\n' \
+      "$KUBERNETES_NODE_NAME" "$KUBERNETES_RUNTIME_CLASS" "$KUBERNETES_RUNTIME_HANDLER" "$gpu_summary" >&2
   else
-    printf 'Factory execution backend: kubernetes (worker factory-worker, node %s, cluster-default runtime)\n' \
-      "$KUBERNETES_NODE_NAME" >&2
+    printf 'Factory execution backend: kubernetes (worker factory-worker, node %s, cluster-default runtime%s)\n' \
+      "$KUBERNETES_NODE_NAME" "$gpu_summary" >&2
   fi
 }
 

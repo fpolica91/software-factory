@@ -139,6 +139,10 @@ struct WorkerArgs {
     #[arg(long, env = "FACTORY_KUBERNETES_RUNTIME_CLASS")]
     kubernetes_runtime_class: Option<String>,
 
+    /// Optional Kubernetes node pin shared by every execution Pod from this worker.
+    #[arg(long, env = "FACTORY_KUBERNETES_NODE_NAME")]
+    kubernetes_node_name: Option<String>,
+
     /// Time allowed for Pod creation, readiness, and normal deletion.
     #[arg(
         long,
@@ -158,6 +162,18 @@ struct WorkerArgs {
 
     #[arg(long, env = "FACTORY_KUBERNETES_MEMORY_LIMIT_MIB")]
     kubernetes_memory_limit_mib: Option<u32>,
+
+    /// Kubernetes extended resource used for GPU scheduling.
+    #[arg(
+        long,
+        env = "FACTORY_KUBERNETES_GPU_RESOURCE",
+        default_value = "nvidia.com/gpu"
+    )]
+    kubernetes_gpu_resource: String,
+
+    /// Number of GPUs requested and limited for each execution Pod; zero disables GPUs.
+    #[arg(long, env = "FACTORY_KUBERNETES_GPU_COUNT", default_value_t = 0)]
+    kubernetes_gpu_count: u32,
 }
 
 fn main() -> Result<()> {
@@ -287,25 +303,7 @@ async fn build_execution_environment_provisioner(
                 .context("discover Docker execution-environment template")?,
         )),
         KUBERNETES_EXECUTION_ENVIRONMENT_BACKEND => {
-            let config = KubernetesExecutionEnvironmentConfig {
-                namespace: args.kubernetes_namespace.clone(),
-                image: args.kubernetes_image.clone().unwrap_or_default(),
-                workspace_pvc: args.kubernetes_workspace_pvc.clone().unwrap_or_default(),
-                workspace_root: args.kubernetes_workspace_root.clone(),
-                runtime_class_name: args.kubernetes_runtime_class.clone(),
-                run_as_uid: parse_run_as_id("FACTORY_RUN_AS_UID", args.run_as_uid.as_deref())?,
-                run_as_gid: parse_run_as_id("FACTORY_RUN_AS_GID", args.run_as_gid.as_deref())?,
-                workspace_ownership_mode: parse_workspace_ownership_mode(
-                    &args.workspace_ownership_mode,
-                )?,
-                readiness_timeout: Duration::from_secs(args.kubernetes_readiness_timeout_seconds),
-                resources: KubernetesResourceConfig {
-                    cpu_request_millis: args.kubernetes_cpu_request_millis,
-                    memory_request_mib: args.kubernetes_memory_request_mib,
-                    cpu_limit_millis: args.kubernetes_cpu_limit_millis,
-                    memory_limit_mib: args.kubernetes_memory_limit_mib,
-                },
-            };
+            let config = kubernetes_execution_environment_config(args)?;
             Ok(Arc::new(
                 KubernetesExecutionEnvironmentProvisioner::discover(config)
                     .await
@@ -319,6 +317,31 @@ async fn build_execution_environment_provisioner(
             "unsupported execution-environment backend {backend}"
         )),
     }
+}
+
+fn kubernetes_execution_environment_config(
+    args: &WorkerArgs,
+) -> Result<KubernetesExecutionEnvironmentConfig> {
+    Ok(KubernetesExecutionEnvironmentConfig {
+        namespace: args.kubernetes_namespace.clone(),
+        image: args.kubernetes_image.clone().unwrap_or_default(),
+        workspace_pvc: args.kubernetes_workspace_pvc.clone().unwrap_or_default(),
+        workspace_root: args.kubernetes_workspace_root.clone(),
+        runtime_class_name: args.kubernetes_runtime_class.clone(),
+        node_name: args.kubernetes_node_name.clone(),
+        run_as_uid: parse_run_as_id("FACTORY_RUN_AS_UID", args.run_as_uid.as_deref())?,
+        run_as_gid: parse_run_as_id("FACTORY_RUN_AS_GID", args.run_as_gid.as_deref())?,
+        workspace_ownership_mode: parse_workspace_ownership_mode(&args.workspace_ownership_mode)?,
+        readiness_timeout: Duration::from_secs(args.kubernetes_readiness_timeout_seconds),
+        resources: KubernetesResourceConfig {
+            cpu_request_millis: args.kubernetes_cpu_request_millis,
+            memory_request_mib: args.kubernetes_memory_request_mib,
+            cpu_limit_millis: args.kubernetes_cpu_limit_millis,
+            memory_limit_mib: args.kubernetes_memory_limit_mib,
+            gpu_resource: Some(args.kubernetes_gpu_resource.clone()),
+            gpu_count: args.kubernetes_gpu_count,
+        },
+    })
 }
 
 fn parse_run_as_id(field: &str, value: Option<&str>) -> Result<Option<i64>> {
@@ -395,5 +418,30 @@ mod tests {
         );
         assert!(parse_workspace_ownership_mode("").is_err());
         assert!(parse_workspace_ownership_mode("existing-pvc").is_err());
+    }
+
+    #[test]
+    fn worker_threads_gpu_flags_into_kubernetes_resources() {
+        let args = WorkerArgs::try_parse_from([
+            "factory-worker",
+            "--database-url",
+            "postgresql://factory@localhost/factory",
+            "--provider",
+            "openai",
+            "--kubernetes-gpu-resource",
+            "example.com/training-gpu",
+            "--kubernetes-gpu-count",
+            "3",
+            "--kubernetes-node-name",
+            "gpu-node-a.example",
+        ])
+        .expect("worker arguments");
+        let config = kubernetes_execution_environment_config(&args).expect("Kubernetes config");
+        assert_eq!(
+            config.resources.gpu_resource.as_deref(),
+            Some("example.com/training-gpu")
+        );
+        assert_eq!(config.resources.gpu_count, 3);
+        assert_eq!(config.node_name.as_deref(), Some("gpu-node-a.example"));
     }
 }

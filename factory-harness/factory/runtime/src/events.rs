@@ -107,6 +107,13 @@ struct MappedEvent<'a> {
     payload: Value,
 }
 
+struct ModelUsageEvent<'a> {
+    thread: &'a str,
+    turn: &'a str,
+    deduplication_key: String,
+    payload: Value,
+}
+
 #[derive(Debug, Default)]
 struct StreamedContent {
     agent_messages: HashSet<String>,
@@ -170,6 +177,18 @@ impl AttemptEventWriter {
             }
             return Ok(());
         }
+        if let Some(event) = model_usage_event(notification) {
+            if self.targets(event.thread, event.turn) {
+                self.flush().await?;
+                self.persist_with_deduplication(
+                    "model.usage",
+                    event.payload,
+                    Some(event.deduplication_key),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         let Some(event) = map_event(notification) else {
             return Ok(());
         };
@@ -199,16 +218,45 @@ impl AttemptEventWriter {
     }
 
     async fn persist(&mut self, kind: &str, payload: Value) -> Result<(), CoordinatorError> {
+        self.persist_with_deduplication(kind, payload, None).await
+    }
+
+    async fn persist_with_deduplication(
+        &mut self,
+        kind: &str,
+        payload: Value,
+        deduplication_key: Option<String>,
+    ) -> Result<(), CoordinatorError> {
         let event = NewAttemptEvent {
             kind: kind.to_string(),
             payload: correlate(payload, self.active.as_ref()),
-            deduplication_key: None,
+            deduplication_key,
         };
         self.store
             .append_attempt_event(&self.fence, event)
             .await
             .map(|_| ())
     }
+}
+
+fn model_usage_event(notification: &ServerNotification) -> Option<ModelUsageEvent<'_>> {
+    let ServerNotification::RawResponseCompleted(value) = notification else {
+        return None;
+    };
+    let usage = value.usage.as_ref()?;
+    Some(ModelUsageEvent {
+        thread: &value.thread_id,
+        turn: &value.turn_id,
+        deduplication_key: format!("model.usage:{}", value.response_id),
+        payload: json!({
+            "totalTokens": usage.total_tokens,
+            "inputTokens": usage.input_tokens,
+            "cachedInputTokens": usage.cached_input_tokens,
+            "cacheWriteInputTokens": usage.cache_write_input_tokens,
+            "outputTokens": usage.output_tokens,
+            "reasoningOutputTokens": usage.reasoning_output_tokens,
+        }),
+    })
 }
 
 fn stream_delta(notification: &ServerNotification) -> Option<StreamDelta<'_>> {
@@ -565,7 +613,9 @@ fn utf8_prefix(value: &str, limit: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use codex_app_server_protocol::RawResponseCompletedNotification;
     use codex_app_server_protocol::ReasoningTextDeltaNotification;
+    use codex_app_server_protocol::TokenUsageBreakdown;
 
     use super::*;
 
@@ -716,6 +766,55 @@ mod tests {
         });
 
         assert!(stream_delta(&notification).is_none());
+    }
+
+    #[test]
+    fn exact_response_usage_maps_to_a_deduplicated_aggregate_event() {
+        let notification =
+            ServerNotification::RawResponseCompleted(RawResponseCompletedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                response_id: "response-1".into(),
+                usage: Some(TokenUsageBreakdown {
+                    total_tokens: 160,
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    cache_write_input_tokens: 10,
+                    output_tokens: 60,
+                    reasoning_output_tokens: 20,
+                }),
+            });
+
+        let event = model_usage_event(&notification).expect("model usage event");
+
+        assert_eq!(event.thread, "thread-1");
+        assert_eq!(event.turn, "turn-1");
+        assert_eq!(event.deduplication_key, "model.usage:response-1");
+        assert_eq!(
+            event.payload,
+            json!({
+                "totalTokens": 160,
+                "inputTokens": 100,
+                "cachedInputTokens": 40,
+                "cacheWriteInputTokens": 10,
+                "outputTokens": 60,
+                "reasoningOutputTokens": 20,
+            })
+        );
+        assert!(!event.payload.to_string().contains("response-1"));
+    }
+
+    #[test]
+    fn response_without_usage_does_not_emit_metrics() {
+        let notification =
+            ServerNotification::RawResponseCompleted(RawResponseCompletedNotification {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                response_id: "response-1".into(),
+                usage: None,
+            });
+
+        assert!(model_usage_event(&notification).is_none());
     }
 
     #[test]

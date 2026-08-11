@@ -47,6 +47,14 @@ mode while retaining `runAsUser` and `runAsGroup`. The Compose worker uses
 host networking and a copied, unprivileged kubeconfig; it does not receive the
 Docker socket. An optional RuntimeClass name is passed through after launcher
 preflight verifies the class and reports its handler.
+An optional deployment-level `FACTORY_KUBERNETES_NODE_NAME` pins every Pod
+created by that worker after the launcher verifies the named node is Ready and
+schedulable. Leaving it empty preserves normal Kubernetes scheduling. Optional
+GPU scheduling uses `FACTORY_KUBERNETES_GPU_RESOURCE` (default
+`nvidia.com/gpu`) and `FACTORY_KUBERNETES_GPU_COUNT` (default `0`). A positive
+count requires a device plugin to advertise enough allocatable resource on an
+eligible node; Factory writes the same whole-number quantity to the Pod request
+and limit. A zero count adds no GPU resource to the Pod.
 Kubernetes execution requires an immutable cluster-reachable
 `registry/repository@sha256:<64 lowercase hex>` reference. Its conservative
 supported subset accepts a lowercase DNS/IPv4-style registry with an optional

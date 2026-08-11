@@ -20,6 +20,8 @@ pub struct KubernetesResourceConfig {
     pub memory_request_mib: Option<u32>,
     pub cpu_limit_millis: Option<u32>,
     pub memory_limit_mib: Option<u32>,
+    pub gpu_resource: Option<String>,
+    pub gpu_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,6 +38,7 @@ pub struct KubernetesExecutionEnvironmentConfig {
     pub workspace_pvc: String,
     pub workspace_root: String,
     pub runtime_class_name: Option<String>,
+    pub node_name: Option<String>,
     pub run_as_uid: Option<i64>,
     pub run_as_gid: Option<i64>,
     pub workspace_ownership_mode: WorkspaceOwnershipMode,
@@ -66,6 +69,15 @@ impl KubernetesExecutionEnvironmentConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        self.node_name = self
+            .node_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(node_name) = self.node_name.as_deref() {
+            validate_dns_subdomain("Kubernetes node name", node_name)?;
+        }
         match (self.run_as_uid, self.run_as_gid) {
             (Some(uid), Some(gid)) => {
                 ensure!(uid >= 0 && gid >= 0, "run-as IDs must be non-negative")
@@ -109,10 +121,24 @@ impl KubernetesResourceConfig {
                 .is_none_or(|(request, limit)| request <= limit),
             "memory request cannot exceed its limit"
         );
+        self.gpu_resource = self
+            .gpu_resource
+            .take()
+            .map(|resource| resource.trim().to_string())
+            .filter(|resource| !resource.is_empty());
+        if self.gpu_count == 0 {
+            self.gpu_resource = None;
+        } else {
+            validate_extended_resource_name(
+                self.gpu_resource
+                    .as_deref()
+                    .context("GPU resource name is required when GPU count is positive")?,
+            )?;
+        }
         Ok(())
     }
 
-    fn requirements(&self) -> Option<ResourceRequirements> {
+    fn requirements(&self) -> Result<Option<ResourceRequirements>> {
         let map = |cpu: Option<u32>, memory: Option<u32>| {
             let mut values = BTreeMap::new();
             if let Some(cpu) = cpu {
@@ -128,13 +154,25 @@ impl KubernetesResourceConfig {
             }
             values
         };
-        let requests = map(self.cpu_request_millis, self.memory_request_mib);
-        let limits = map(self.cpu_limit_millis, self.memory_limit_mib);
-        (!requests.is_empty() || !limits.is_empty()).then_some(ResourceRequirements {
-            requests: (!requests.is_empty()).then_some(requests),
-            limits: (!limits.is_empty()).then_some(limits),
-            ..ResourceRequirements::default()
-        })
+        let mut requests = map(self.cpu_request_millis, self.memory_request_mib);
+        let mut limits = map(self.cpu_limit_millis, self.memory_limit_mib);
+        if self.gpu_count > 0 {
+            let resource = self
+                .gpu_resource
+                .as_deref()
+                .context("GPU resource name is required when GPU count is positive")?;
+            validate_extended_resource_name(resource)?;
+            let quantity = Quantity(self.gpu_count.to_string());
+            requests.insert(resource.to_string(), quantity.clone());
+            limits.insert(resource.to_string(), quantity);
+        }
+        Ok(
+            (!requests.is_empty() || !limits.is_empty()).then_some(ResourceRequirements {
+                requests: (!requests.is_empty()).then_some(requests),
+                limits: (!limits.is_empty()).then_some(limits),
+                ..ResourceRequirements::default()
+            }),
+        )
     }
 }
 
@@ -257,6 +295,7 @@ impl OwnedPod {
                 enable_service_links: Some(false),
                 restart_policy: Some("Never".to_string()),
                 runtime_class_name: config.runtime_class_name.clone(),
+                node_name: config.node_name.clone(),
                 security_context: config.run_as_uid.map(|uid| PodSecurityContext {
                     run_as_user: Some(uid),
                     run_as_group: config.run_as_gid,
@@ -294,7 +333,7 @@ impl OwnedPod {
                         success_threshold: Some(1),
                         ..Probe::default()
                     }),
-                    resources: config.resources.requirements(),
+                    resources: config.resources.requirements()?,
                     volume_mounts: Some(vec![
                         mount(&request.workspace_root)?,
                         mount(&request.repository_metadata_root)?,
@@ -368,6 +407,12 @@ impl OwnedPod {
             actual.runtime_class_name == expected.runtime_class_name,
             "Pod runtime class drifted"
         );
+        if expected.node_name.is_some() {
+            ensure!(
+                actual.node_name == expected.node_name,
+                "Pod node pin drifted"
+            );
+        }
         ensure!(
             actual.restart_policy.as_deref() == Some("Never"),
             "Pod restart policy drifted"
@@ -581,6 +626,43 @@ fn valid_dns_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
+fn validate_dns_subdomain(field: &str, value: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty() && value.len() <= 253 && value.split('.').all(valid_dns_label),
+        "{field} must be a Kubernetes DNS subdomain"
+    );
+    Ok(())
+}
+
+fn validate_extended_resource_name(resource: &str) -> Result<()> {
+    const EXAMPLE: &str = "nvidia.com/gpu";
+    let (prefix, name) = resource.split_once('/').with_context(|| {
+        format!("GPU resource must be a fully qualified extended resource such as {EXAMPLE}")
+    })?;
+    ensure!(
+        !name.contains('/')
+            && !prefix.is_empty()
+            && prefix.len() <= 253
+            && prefix.split('.').all(valid_dns_label)
+            && !matches!(prefix, "kubernetes.io" | "k8s.io")
+            && !prefix.ends_with(".kubernetes.io")
+            && !prefix.ends_with(".k8s.io"),
+        "GPU resource must be a fully qualified non-Kubernetes extended resource such as {EXAMPLE}"
+    );
+    let bytes = name.as_bytes();
+    ensure!(
+        !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes
+                .iter()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') }),
+        "GPU resource must be a fully qualified extended resource such as {EXAMPLE}"
+    );
+    Ok(())
+}
+
 fn valid_repository_component(component: &str) -> bool {
     let bytes = component.as_bytes();
     if bytes.is_empty()
@@ -665,9 +747,14 @@ mod tests {
             memory_request_mib: Some(1536),
             cpu_limit_millis: Some(2000),
             memory_limit_mib: Some(4096),
+            gpu_resource: Some(" nvidia.com/gpu ".to_string()),
+            gpu_count: 2,
         };
         resources.normalize().expect("resources");
-        let requirements = resources.requirements().expect("requirements");
+        let requirements = resources
+            .requirements()
+            .expect("valid requirements")
+            .expect("requirements");
         assert_eq!(
             requirements.requests.as_ref().expect("requests")["cpu"].0,
             "500m"
@@ -681,8 +768,48 @@ mod tests {
             requirements.limits.as_ref().expect("limits")["memory"].0,
             "4Gi"
         );
+        assert_eq!(
+            requirements.requests.as_ref().expect("requests")["nvidia.com/gpu"].0,
+            "2"
+        );
+        assert_eq!(
+            requirements.limits.as_ref().expect("limits")["nvidia.com/gpu"].0,
+            "2"
+        );
         resources.cpu_request_millis = Some(0);
         assert!(resources.normalize().is_err());
+    }
+
+    #[test]
+    fn zero_gpu_count_is_omitted_and_positive_counts_require_a_valid_extended_resource() {
+        let mut resources = KubernetesResourceConfig {
+            gpu_resource: Some("not-a-resource".to_string()),
+            gpu_count: 0,
+            ..KubernetesResourceConfig::default()
+        };
+        resources.normalize().expect("zero-GPU resources");
+        assert_eq!(resources.gpu_resource, None);
+        assert_eq!(resources.requirements().expect("requirements"), None);
+
+        for invalid in [
+            "",
+            "gpu",
+            "NVIDIA.com/gpu",
+            "kubernetes.io/gpu",
+            "vendor.k8s.io/gpu",
+            "nvidia.com/gpu/extra",
+            "nvidia.com/-gpu",
+        ] {
+            let mut resources = KubernetesResourceConfig {
+                gpu_resource: Some(invalid.to_string()),
+                gpu_count: 1,
+                ..KubernetesResourceConfig::default()
+            };
+            assert!(
+                resources.normalize().is_err(),
+                "invalid GPU resource accepted: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -974,6 +1101,29 @@ mod tests {
     }
 
     #[test]
+    fn configured_node_pin_is_native_and_drift_requires_replacement() {
+        let mut pinned_config = config(TEST_IMAGE);
+        pinned_config.node_name = Some("gpu-node-a.example".to_string());
+        let expected = OwnedPod::new(&pinned_config, &request()).expect("pinned Pod");
+        assert_eq!(
+            expected
+                .manifest
+                .spec
+                .as_ref()
+                .expect("spec")
+                .node_name
+                .as_deref(),
+            Some("gpu-node-a.example")
+        );
+        assert_stale(&expected, |pod| {
+            pod.spec.as_mut().expect("spec").node_name = Some("gpu-node-b.example".to_string());
+        });
+
+        pinned_config.node_name = Some("INVALID_NODE".to_string());
+        assert!(pinned_config.normalized().is_err());
+    }
+
+    #[test]
     fn pod_manifest_keeps_runtime_mount_and_exec_server_contract() {
         let expected = OwnedPod::new(&config(TEST_IMAGE), &request()).expect("Pod");
         let spec = expected.manifest.spec.as_ref().expect("spec");
@@ -1060,6 +1210,7 @@ mod tests {
             workspace_pvc: "workspaces".to_string(),
             workspace_root: "/workspaces".to_string(),
             runtime_class_name: Some("kata".to_string()),
+            node_name: None,
             run_as_uid: Some(1000),
             run_as_gid: Some(1000),
             workspace_ownership_mode: WorkspaceOwnershipMode::Manage,
@@ -1069,6 +1220,8 @@ mod tests {
                 memory_request_mib: Some(1024),
                 cpu_limit_millis: Some(2000),
                 memory_limit_mib: Some(4096),
+                gpu_resource: None,
+                gpu_count: 0,
             },
         }
         .normalized()
